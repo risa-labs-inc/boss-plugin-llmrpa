@@ -26,8 +26,34 @@ jobs:
       - name: Build plugin
         run: ./gradlew build
 
+      - name: Extract version
+        id: version
+        run: |
+          VERSION=$(grep "^version" build.gradle.kts | sed 's/version = "\(.*\)"/\1/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Extracted version: $VERSION"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: plugin-jar
           path: build/libs/*.jar
+
+      - name: Delete existing release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          gh release delete "v${{ steps.version.outputs.version }}" --yes || true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create Release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: v${{ steps.version.outputs.version }}
+          files: build/libs/*.jar
+          generate_release_notes: true
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
