@@ -10,8 +10,17 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout BossConsole
         uses: actions/checkout@v4
+        with:
+          repository: risa-labs-inc/BossConsole
+          path: BossConsole
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout Plugin
+        uses: actions/checkout@v4
+        with:
+          path: plugin
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -23,12 +32,13 @@ jobs:
         uses: gradle/actions/setup-gradle@v3
 
       - name: Build plugin
+        working-directory: plugin
         run: ./gradlew jar
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          files: build/libs/*.jar
+          files: plugin/build/libs/*.jar
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
