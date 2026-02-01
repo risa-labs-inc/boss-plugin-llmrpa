@@ -29,9 +29,9 @@ repositories {
 
 dependencies {
     // Plugin API from Maven Central
-    implementation("com.risaboss:plugin-api-desktop:1.0.0")
-    implementation("com.risaboss:plugin-ui-core-desktop:1.0.0")
-    implementation("com.risaboss:plugin-scrollbar-desktop:1.0.0")
+    implementation("com.risaboss:plugin-api-desktop:1.0.1")
+    implementation("com.risaboss:plugin-ui-core-desktop:1.0.1")
+    implementation("com.risaboss:plugin-scrollbar-desktop:1.0.1")
     
     // Compose dependencies
     implementation(compose.desktop.currentOs)
