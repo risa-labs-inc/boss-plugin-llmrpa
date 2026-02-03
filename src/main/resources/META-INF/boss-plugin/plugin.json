@@ -2,16 +2,16 @@
   "manifestVersion": 1,
   "pluginId": "ai.rever.boss.plugin.dynamic.llmrpa",
   "displayName": "LLM RPA (Dynamic)",
-  "version": "1.0.1",
-  "apiVersion": "1.0.3",
+  "version": "1.0.2",
+  "apiVersion": "1.0.5",
   "mainClass": "ai.rever.boss.plugin.dynamic.llmrpa.LlmrpaDynamicPlugin",
   "type": "panel",
-  "description": "AI-powered robotic process automation",
+  "description": "AI-powered robotic process automation with LLM integration",
   "author": "Risa Labs",
   "url": "https://github.com/risa-labs-inc/boss-plugin-llmrpa",
   "panel": {
     "position": "right_top_top",
-    "priority": 18
+    "priority": 17
   },
   "sandbox": {
     "maxThreads": 4,

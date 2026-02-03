@@ -1,91 +1,676 @@
 package ai.rever.boss.plugin.dynamic.llmrpa
 
 import ai.rever.boss.plugin.ui.BossTheme
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.*
-import androidx.compose.runtime.Composable
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material.icons.outlined.AutoAwesome
+import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.AutoAwesome
 
-/**
- * LLM RPA panel content (Dynamic Plugin - Stub)
- *
- * This is a placeholder implementation. The full functionality
- * requires host services that are not yet exposed through PluginContext.
- */
 @Composable
-fun LlmrpaContent() {
+fun LlmrpaContent(component: LlmrpaComponent) {
+    val instruction by component.currentInstruction.collectAsState()
+    val url by component.selectedUrl.collectAsState()
+    val isGenerating by component.isGenerating.collectAsState()
+    val history by component.executionHistory.collectAsState()
+    val showSettings by component.showSettings.collectAsState()
+    val errorMessage by component.errorMessage.collectAsState()
+
     BossTheme {
         Surface(
             modifier = Modifier.fillMaxSize(),
             color = MaterialTheme.colors.background
         ) {
-            Column(
+            LazyColumn(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(16.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.Center
+                verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                Icon(
-                    imageVector = Icons.Outlined.AutoAwesome,
-                    contentDescription = "LLM RPA",
-                    modifier = Modifier.size(48.dp),
-                    tint = MaterialTheme.colors.primary
-                )
-                
-                Spacer(modifier = Modifier.height(16.dp))
-                
+                // Header
+                item {
+                    HeaderSection(
+                        onSettingsClick = { component.toggleSettings() }
+                    )
+                }
+
+                // Settings Section (collapsible)
+                if (showSettings) {
+                    item {
+                        SettingsSection()
+                    }
+                }
+
+                // LLM Configuration Status
+                item {
+                    LLMConfigStatusCard()
+                }
+
+                // URL Input
+                item {
+                    UrlInputSection(
+                        url = url,
+                        onUrlChange = { component.updateUrl(it) },
+                        enabled = !isGenerating
+                    )
+                }
+
+                // Instruction Input
+                item {
+                    InstructionInputSection(
+                        instruction = instruction,
+                        onInstructionChange = { component.updateInstruction(it) },
+                        onGenerate = { component.generateActions() },
+                        isGenerating = isGenerating,
+                        onQuickExample = { component.applyQuickExample(it) }
+                    )
+                }
+
+                // Error Message
+                errorMessage?.let { error ->
+                    item {
+                        ErrorCard(error) { component.clearError() }
+                    }
+                }
+
+                // Execution History
+                if (history.isNotEmpty()) {
+                    item {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                "Generated Actions",
+                                style = MaterialTheme.typography.h6,
+                                fontWeight = FontWeight.Bold
+                            )
+                            TextButton(onClick = { component.clearHistory() }) {
+                                Text("Clear", style = MaterialTheme.typography.caption)
+                            }
+                        }
+                    }
+
+                    items(history.reversed()) { execution ->
+                        ExecutionHistoryCard(execution)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun HeaderSection(onSettingsClick: () -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(8.dp),
+        backgroundColor = MaterialTheme.colors.surface,
+        elevation = 2.dp
+    ) {
+        Row(
+            modifier = Modifier.padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                Icons.Outlined.AutoAwesome,
+                contentDescription = "LLM RPA",
+                modifier = Modifier.size(24.dp),
+                tint = MaterialTheme.colors.primary
+            )
+            Spacer(modifier = Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = "LLM RPA",
-                    fontSize = 20.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colors.onBackground
+                    "LLM RPA",
+                    style = MaterialTheme.typography.h6,
+                    fontWeight = FontWeight.Bold
                 )
-                
-                Spacer(modifier = Modifier.height(8.dp))
-                
-                Card(
-                    modifier = Modifier.padding(16.dp),
-                    shape = RoundedCornerShape(8.dp),
-                    backgroundColor = MaterialTheme.colors.surface,
-                    elevation = 4.dp
-                ) {
-                    Column(
-                        modifier = Modifier.padding(16.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally
+                Text(
+                    "AI-powered browser automation",
+                    style = MaterialTheme.typography.caption,
+                    color = MaterialTheme.colors.onSurface.copy(alpha = 0.6f)
+                )
+            }
+            IconButton(onClick = onSettingsClick) {
+                Icon(
+                    Icons.Outlined.Settings,
+                    contentDescription = "Settings",
+                    tint = MaterialTheme.colors.onSurface.copy(alpha = 0.6f)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingsSection() {
+    var selectedProvider by remember { mutableStateOf(LLMSettings.selectedProvider) }
+    var apiKey by remember { mutableStateOf(LLMSettings.getApiKey(selectedProvider) ?: "") }
+    var selectedModel by remember { mutableStateOf(LLMSettings.selectedModelId) }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(8.dp),
+        elevation = 1.dp
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text(
+                "LLM Configuration",
+                style = MaterialTheme.typography.subtitle1,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.padding(bottom = 12.dp)
+            )
+
+            // Provider Selection
+            Text(
+                "Provider",
+                style = MaterialTheme.typography.caption,
+                color = MaterialTheme.colors.onSurface.copy(alpha = 0.7f)
+            )
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                LLMProvider.entries.forEach { provider ->
+                    ProviderChip(
+                        text = provider.displayName,
+                        selected = selectedProvider == provider,
+                        onClick = {
+                            selectedProvider = provider
+                            LLMSettings.setProvider(provider)
+                            apiKey = LLMSettings.getApiKey(provider) ?: ""
+                            selectedModel = LLMSettings.selectedModelId
+                        }
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            // API Key Input
+            OutlinedTextField(
+                value = apiKey,
+                onValueChange = {
+                    apiKey = it
+                    LLMSettings.setApiKey(selectedProvider, it)
+                },
+                label = { Text("API Key") },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation()
+            )
+
+            // Model Selection (if not custom)
+            if (selectedProvider != LLMProvider.CUSTOM) {
+                Spacer(modifier = Modifier.height(12.dp))
+                Text(
+                    "Model",
+                    style = MaterialTheme.typography.caption,
+                    color = MaterialTheme.colors.onSurface.copy(alpha = 0.7f)
+                )
+
+                val models = LLMModels.getModelsForProvider(selectedProvider)
+                var expanded by remember { mutableStateOf(false) }
+
+                Box {
+                    OutlinedButton(
+                        onClick = { expanded = true },
+                        modifier = Modifier.fillMaxWidth()
                     ) {
                         Text(
-                            text = "Dynamic Plugin Stub",
-                            fontSize = 14.sp,
-                            fontWeight = FontWeight.Medium,
-                            color = MaterialTheme.colors.primary
+                            LLMModels.findModelById(selectedModel)?.name ?: selectedModel,
+                            modifier = Modifier.weight(1f)
                         )
-                        
-                        Spacer(modifier = Modifier.height(8.dp))
-                        
-                        Text(
-                            text = "This panel is loaded as a dynamic plugin.",
-                            fontSize = 12.sp,
-                            color = MaterialTheme.colors.onSurface.copy(alpha = 0.7f)
+                        Icon(Icons.Default.ArrowDropDown, "Select model")
+                    }
+
+                    DropdownMenu(
+                        expanded = expanded,
+                        onDismissRequest = { expanded = false }
+                    ) {
+                        models.forEach { model ->
+                            DropdownMenuItem(onClick = {
+                                selectedModel = model.id
+                                LLMSettings.setModel(model.id)
+                                expanded = false
+                            }) {
+                                Text(model.name)
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Custom endpoint (if custom provider)
+            if (selectedProvider == LLMProvider.CUSTOM) {
+                Spacer(modifier = Modifier.height(8.dp))
+                var endpoint by remember { mutableStateOf(LLMSettings.getCustomEndpoint()) }
+                OutlinedTextField(
+                    value = endpoint,
+                    onValueChange = {
+                        endpoint = it
+                        LLMSettings.setCustomEndpoint(it)
+                    },
+                    label = { Text("Custom Endpoint URL") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ProviderChip(text: String, selected: Boolean, onClick: () -> Unit) {
+    Surface(
+        modifier = Modifier
+            .clip(RoundedCornerShape(16.dp))
+            .clickable { onClick() },
+        color = if (selected) MaterialTheme.colors.primary.copy(alpha = 0.2f) else MaterialTheme.colors.surface,
+        border = if (selected) null else androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colors.onSurface.copy(alpha = 0.3f)),
+        shape = RoundedCornerShape(16.dp)
+    ) {
+        Text(
+            text,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+            fontSize = 12.sp,
+            color = if (selected) MaterialTheme.colors.primary else MaterialTheme.colors.onSurface
+        )
+    }
+}
+
+@Composable
+private fun LLMConfigStatusCard() {
+    val hasApiKey = LLMSettings.hasValidApiKey()
+    val provider = LLMSettings.selectedProvider
+    val modelInfo = LLMModels.findModelById(LLMSettings.selectedModelId)
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(8.dp),
+        elevation = 1.dp,
+        backgroundColor = if (hasApiKey)
+            Color(0xFF4CAF50).copy(alpha = 0.05f)
+        else
+            Color(0xFFFF9800).copy(alpha = 0.05f)
+    ) {
+        Row(
+            modifier = Modifier.padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                if (hasApiKey) Icons.Default.CheckCircle else Icons.Default.Warning,
+                contentDescription = null,
+                modifier = Modifier.size(20.dp),
+                tint = if (hasApiKey) Color(0xFF4CAF50) else Color(0xFFFF9800)
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    if (hasApiKey) "${provider.displayName} configured" else "No API key configured",
+                    style = MaterialTheme.typography.body2,
+                    fontWeight = FontWeight.Medium
+                )
+                if (hasApiKey && modelInfo != null) {
+                    Text(
+                        "Model: ${modelInfo.name}",
+                        style = MaterialTheme.typography.caption,
+                        color = MaterialTheme.colors.onSurface.copy(alpha = 0.6f)
+                    )
+                } else if (!hasApiKey) {
+                    Text(
+                        "Click settings to configure",
+                        style = MaterialTheme.typography.caption,
+                        color = MaterialTheme.colors.onSurface.copy(alpha = 0.6f)
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun UrlInputSection(
+    url: String,
+    onUrlChange: (String) -> Unit,
+    enabled: Boolean
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(8.dp),
+        elevation = 1.dp
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text(
+                "Target URL (optional)",
+                style = MaterialTheme.typography.subtitle2,
+                fontWeight = FontWeight.Medium,
+                modifier = Modifier.padding(bottom = 8.dp)
+            )
+            OutlinedTextField(
+                value = url,
+                onValueChange = onUrlChange,
+                modifier = Modifier.fillMaxWidth(),
+                placeholder = { Text("https://example.com") },
+                enabled = enabled,
+                singleLine = true,
+                leadingIcon = {
+                    Icon(
+                        Icons.Default.Language,
+                        contentDescription = null,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+            )
+        }
+    }
+}
+
+@Composable
+private fun InstructionInputSection(
+    instruction: String,
+    onInstructionChange: (String) -> Unit,
+    onGenerate: () -> Unit,
+    isGenerating: Boolean,
+    onQuickExample: (String) -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(8.dp),
+        elevation = 1.dp
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text(
+                "Natural Language Instruction",
+                style = MaterialTheme.typography.subtitle2,
+                fontWeight = FontWeight.Medium,
+                modifier = Modifier.padding(bottom = 8.dp)
+            )
+
+            OutlinedTextField(
+                value = instruction,
+                onValueChange = onInstructionChange,
+                modifier = Modifier.fillMaxWidth(),
+                placeholder = {
+                    Text(
+                        "e.g., Click the search button and type 'artificial intelligence'",
+                        style = MaterialTheme.typography.body2,
+                        color = MaterialTheme.colors.onSurface.copy(alpha = 0.5f)
+                    )
+                },
+                enabled = !isGenerating,
+                minLines = 3,
+                maxLines = 5
+            )
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            Button(
+                onClick = onGenerate,
+                modifier = Modifier.fillMaxWidth(),
+                enabled = instruction.isNotBlank() && !isGenerating,
+                colors = ButtonDefaults.buttonColors(
+                    backgroundColor = MaterialTheme.colors.primary
+                )
+            ) {
+                if (isGenerating) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(16.dp),
+                        color = Color.White,
+                        strokeWidth = 2.dp
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Generating...")
+                } else {
+                    Icon(
+                        Icons.Outlined.AutoAwesome,
+                        contentDescription = null,
+                        modifier = Modifier.size(20.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Generate RPA Actions")
+                }
+            }
+
+            // Quick examples
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                "Quick Examples:",
+                style = MaterialTheme.typography.caption,
+                color = MaterialTheme.colors.onSurface.copy(alpha = 0.6f)
+            )
+            Row(
+                modifier = Modifier.padding(top = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                QuickChip("Fill form") { onQuickExample("Fill out the contact form with test data") }
+                QuickChip("Extract data") { onQuickExample("Extract all product prices from this page") }
+                QuickChip("Navigate") { onQuickExample("Navigate to the login page") }
+            }
+        }
+    }
+}
+
+@Composable
+private fun QuickChip(text: String, onClick: () -> Unit) {
+    Surface(
+        modifier = Modifier
+            .clip(RoundedCornerShape(16.dp))
+            .clickable { onClick() },
+        color = MaterialTheme.colors.primary.copy(alpha = 0.1f)
+    ) {
+        Text(
+            text,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+            style = MaterialTheme.typography.caption,
+            color = MaterialTheme.colors.primary
+        )
+    }
+}
+
+@Composable
+private fun ErrorCard(error: String, onDismiss: () -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(8.dp),
+        backgroundColor = Color(0xFFFF5252).copy(alpha = 0.1f),
+        elevation = 1.dp
+    ) {
+        Row(
+            modifier = Modifier.padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                Icons.Default.Error,
+                contentDescription = null,
+                tint = Color(0xFFFF5252),
+                modifier = Modifier.size(20.dp)
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Text(
+                error,
+                style = MaterialTheme.typography.body2,
+                color = Color(0xFFFF5252),
+                modifier = Modifier.weight(1f)
+            )
+            IconButton(onClick = onDismiss, modifier = Modifier.size(24.dp)) {
+                Icon(Icons.Default.Close, "Dismiss", tint = Color(0xFFFF5252))
+            }
+        }
+    }
+}
+
+@Composable
+private fun ExecutionHistoryCard(execution: LLMExecutionState) {
+    val statusColor = when (execution.status) {
+        LLMExecutionStatus.GENERATING -> Color(0xFFFF9800)
+        LLMExecutionStatus.READY -> Color(0xFF4CAF50)
+        LLMExecutionStatus.COMPLETED -> Color(0xFF4CAF50)
+        LLMExecutionStatus.ERROR -> Color(0xFFFF5252)
+    }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(8.dp),
+        elevation = 1.dp,
+        backgroundColor = statusColor.copy(alpha = 0.05f)
+    ) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.Top
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        execution.instruction,
+                        style = MaterialTheme.typography.body2,
+                        fontWeight = FontWeight.Medium
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            when (execution.status) {
+                                LLMExecutionStatus.GENERATING -> Icons.Default.Autorenew
+                                LLMExecutionStatus.READY -> Icons.Default.CheckCircle
+                                LLMExecutionStatus.COMPLETED -> Icons.Default.CheckCircle
+                                LLMExecutionStatus.ERROR -> Icons.Default.Error
+                            },
+                            contentDescription = null,
+                            modifier = Modifier.size(14.dp),
+                            tint = statusColor
                         )
-                        
-                        Spacer(modifier = Modifier.height(4.dp))
-                        
+                        Spacer(modifier = Modifier.width(4.dp))
                         Text(
-                            text = "Full functionality pending PluginContext expansion.",
-                            fontSize = 12.sp,
-                            color = MaterialTheme.colors.onSurface.copy(alpha = 0.7f)
+                            execution.status.name.lowercase().replaceFirstChar { it.uppercase() },
+                            style = MaterialTheme.typography.caption,
+                            color = statusColor
+                        )
+                    }
+                }
+
+                Text(
+                    formatTimestamp(execution.timestamp),
+                    style = MaterialTheme.typography.caption,
+                    color = MaterialTheme.colors.onSurface.copy(alpha = 0.5f)
+                )
+            }
+
+            // Show error if any
+            execution.error?.let { error ->
+                Spacer(modifier = Modifier.height(8.dp))
+                Surface(
+                    color = Color(0xFFFF5252).copy(alpha = 0.1f),
+                    shape = RoundedCornerShape(4.dp)
+                ) {
+                    Text(
+                        error,
+                        style = MaterialTheme.typography.caption,
+                        color = Color(0xFFFF5252),
+                        modifier = Modifier.padding(8.dp)
+                    )
+                }
+            }
+
+            // Show generated actions
+            if (execution.generatedActions.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    "Generated ${execution.generatedActions.size} actions:",
+                    style = MaterialTheme.typography.caption,
+                    fontWeight = FontWeight.Medium,
+                    color = MaterialTheme.colors.primary
+                )
+
+                execution.generatedActions.forEachIndexed { index, action ->
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        color = MaterialTheme.colors.surface,
+                        shape = RoundedCornerShape(4.dp)
+                    ) {
+                        Column(modifier = Modifier.padding(8.dp)) {
+                            Text(
+                                "${index + 1}. ${action.type.uppercase()}: ${action.name}",
+                                style = MaterialTheme.typography.caption,
+                                fontWeight = FontWeight.Medium
+                            )
+                            if (action.selector.value != null) {
+                                Text(
+                                    "Selector: ${action.selector.type} = ${action.selector.value}",
+                                    style = MaterialTheme.typography.caption,
+                                    fontFamily = FontFamily.Monospace,
+                                    fontSize = 10.sp,
+                                    color = MaterialTheme.colors.onSurface.copy(alpha = 0.7f)
+                                )
+                            }
+                            if (!action.value.isNullOrEmpty()) {
+                                Text(
+                                    "Value: ${action.value}",
+                                    style = MaterialTheme.typography.caption,
+                                    color = MaterialTheme.colors.onSurface.copy(alpha = 0.7f)
+                                )
+                            }
+                        }
+                    }
+                }
+
+                // Note about execution
+                Spacer(modifier = Modifier.height(8.dp))
+                Surface(
+                    color = Color(0xFF2196F3).copy(alpha = 0.1f),
+                    shape = RoundedCornerShape(4.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            Icons.Default.Info,
+                            contentDescription = null,
+                            modifier = Modifier.size(14.dp),
+                            tint = Color(0xFF2196F3)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            "Actions ready for manual execution or integration",
+                            style = MaterialTheme.typography.caption,
+                            color = Color(0xFF2196F3)
                         )
                     }
                 }
             }
         }
+    }
+}
+
+private fun formatTimestamp(timestamp: Long): String {
+    val now = System.currentTimeMillis()
+    val diff = now - timestamp
+
+    return when {
+        diff < 60000 -> "just now"
+        diff < 3600000 -> "${diff / 60000}m ago"
+        diff < 86400000 -> "${diff / 3600000}h ago"
+        else -> "${diff / 86400000}d ago"
     }
 }
