@@ -8,7 +8,7 @@ plugins {
 }
 
 group = "ai.rever.boss.plugin.dynamic"
-version = "1.0.3"
+version = "1.0.4"
 
 java {
     toolchain {
@@ -23,6 +23,7 @@ kotlin {
 }
 
 repositories {
+    mavenLocal()
     google()
     mavenCentral()
     maven("https://maven.pkg.jetbrains.space/public/p/compose/dev")
@@ -30,7 +31,7 @@ repositories {
 
 dependencies {
     // Plugin API from Maven Central
-    implementation("com.risaboss:plugin-api-desktop:1.0.5")
+    implementation("com.risaboss:plugin-api-desktop:1.0.10")
     implementation("com.risaboss:plugin-ui-core-desktop:1.0.4")
     implementation("com.risaboss:plugin-scrollbar-desktop:1.0.4")
 

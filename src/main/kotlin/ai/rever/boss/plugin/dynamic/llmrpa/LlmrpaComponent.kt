@@ -1,5 +1,6 @@
 package ai.rever.boss.plugin.dynamic.llmrpa
 
+import ai.rever.boss.plugin.api.ActiveTabData
 import ai.rever.boss.plugin.api.ActiveTabsProvider
 import ai.rever.boss.plugin.api.PanelComponentWithUI
 import ai.rever.boss.plugin.api.PanelInfo
@@ -12,12 +13,14 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 
 /**
  * LLM RPA panel component (Dynamic Plugin)
  *
  * Provides AI-powered RPA automation with LLM integration.
+ * Uses ActiveTabsProvider to list available browser tabs for targeting.
  */
 class LlmrpaComponent(
     ctx: ComponentContext,
@@ -38,8 +41,12 @@ class LlmrpaComponent(
     private val _currentInstruction = MutableStateFlow("")
     val currentInstruction: StateFlow<String> = _currentInstruction
 
-    private val _selectedUrl = MutableStateFlow("")
-    val selectedUrl: StateFlow<String> = _selectedUrl
+    // Browser tab state (like bundled plugin)
+    private val _availableTabs = MutableStateFlow<List<ActiveTabData>>(emptyList())
+    val availableTabs: StateFlow<List<ActiveTabData>> = _availableTabs
+
+    private val _selectedTab = MutableStateFlow<ActiveTabData?>(null)
+    val selectedTab: StateFlow<ActiveTabData?> = _selectedTab
 
     private val _errorMessage = MutableStateFlow<String?>(null)
     val errorMessage: StateFlow<String?> = _errorMessage
@@ -51,6 +58,28 @@ class LlmrpaComponent(
     init {
         // Load settings on init
         LLMSettings.loadSettings()
+
+        // Collect active tabs from provider
+        activeTabsProvider?.let { provider ->
+            scope.launch {
+                provider.activeTabs.collectLatest { tabs ->
+                    // Filter to only browser tabs (those with URLs)
+                    val browserTabs = tabs.filter { it.url != null }
+                    _availableTabs.value = browserTabs
+
+                    // If selected tab is no longer available, clear selection
+                    val currentSelected = _selectedTab.value
+                    if (currentSelected != null && browserTabs.none { it.tabId == currentSelected.tabId }) {
+                        _selectedTab.value = null
+                    }
+
+                    // Auto-select first tab if no tab is selected and tabs are available
+                    if (_selectedTab.value == null && browserTabs.isNotEmpty()) {
+                        _selectedTab.value = browserTabs.first()
+                    }
+                }
+            }
+        }
 
         lifecycle.doOnDestroy {
             scope.cancel()
@@ -67,8 +96,11 @@ class LlmrpaComponent(
         _currentInstruction.value = instruction
     }
 
-    fun updateUrl(url: String) {
-        _selectedUrl.value = url
+    /**
+     * Select a browser tab for RPA targeting.
+     */
+    fun selectTab(tab: ActiveTabData) {
+        _selectedTab.value = tab
     }
 
     fun toggleSettings() {
@@ -101,9 +133,12 @@ class LlmrpaComponent(
 
         scope.launch {
             try {
+                // Use selected tab's URL or fallback
+                val sourceUrl = _selectedTab.value?.url ?: "https://example.com"
+
                 val request = LLMRpaRequest(
                     actions = listOf(LLMAction(instruction)),
-                    sourceUrl = _selectedUrl.value.ifBlank { "https://example.com" }
+                    sourceUrl = sourceUrl
                 )
 
                 val response = apiClient.callLLMApi(request)

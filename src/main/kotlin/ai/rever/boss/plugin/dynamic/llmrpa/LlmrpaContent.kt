@@ -1,5 +1,6 @@
 package ai.rever.boss.plugin.dynamic.llmrpa
 
+import ai.rever.boss.plugin.api.ActiveTabData
 import ai.rever.boss.plugin.ui.BossTheme
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -20,13 +21,15 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
 @Composable
 fun LlmrpaContent(component: LlmrpaComponent) {
     val instruction by component.currentInstruction.collectAsState()
-    val url by component.selectedUrl.collectAsState()
+    val availableTabs by component.availableTabs.collectAsState()
+    val selectedTab by component.selectedTab.collectAsState()
     val isGenerating by component.isGenerating.collectAsState()
     val history by component.executionHistory.collectAsState()
     val showSettings by component.showSettings.collectAsState()
@@ -62,11 +65,12 @@ fun LlmrpaContent(component: LlmrpaComponent) {
                     LLMConfigStatusCard()
                 }
 
-                // URL Input
+                // Browser Tab Selection (like bundled plugin)
                 item {
-                    UrlInputSection(
-                        url = url,
-                        onUrlChange = { component.updateUrl(it) },
+                    TabSelectionSection(
+                        availableTabs = availableTabs,
+                        selectedTab = selectedTab,
+                        onTabSelected = { component.selectTab(it) },
                         enabled = !isGenerating
                     )
                 }
@@ -78,6 +82,7 @@ fun LlmrpaContent(component: LlmrpaComponent) {
                         onInstructionChange = { component.updateInstruction(it) },
                         onGenerate = { component.generateActions() },
                         isGenerating = isGenerating,
+                        hasSelectedTab = selectedTab != null,
                         onQuickExample = { component.applyQuickExample(it) }
                     )
                 }
@@ -143,7 +148,7 @@ private fun HeaderSection(onSettingsClick: () -> Unit) {
                     fontWeight = FontWeight.Bold
                 )
                 Text(
-                    "AI-powered browser automation",
+                    "Natural language automation powered by AI",
                     style = MaterialTheme.typography.caption,
                     color = MaterialTheme.colors.onSurface.copy(alpha = 0.6f)
                 )
@@ -154,6 +159,137 @@ private fun HeaderSection(onSettingsClick: () -> Unit) {
                     contentDescription = "Settings",
                     tint = MaterialTheme.colors.onSurface.copy(alpha = 0.6f)
                 )
+            }
+        }
+    }
+}
+
+@Composable
+private fun TabSelectionSection(
+    availableTabs: List<ActiveTabData>,
+    selectedTab: ActiveTabData?,
+    onTabSelected: (ActiveTabData) -> Unit,
+    enabled: Boolean
+) {
+    var expanded by remember { mutableStateOf(false) }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(8.dp),
+        elevation = 1.dp
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp)
+        ) {
+            Text(
+                "Browser Tab",
+                style = MaterialTheme.typography.subtitle2,
+                fontWeight = FontWeight.Medium,
+                modifier = Modifier.padding(bottom = 8.dp)
+            )
+
+            Box {
+                Surface(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable(enabled = enabled && availableTabs.isNotEmpty()) {
+                            expanded = true
+                        }
+                        .border(
+                            1.dp,
+                            if (selectedTab != null)
+                                MaterialTheme.colors.primary.copy(alpha = 0.5f)
+                            else
+                                MaterialTheme.colors.onSurface.copy(alpha = 0.3f),
+                            RoundedCornerShape(4.dp)
+                        ),
+                    shape = RoundedCornerShape(4.dp),
+                    color = MaterialTheme.colors.surface
+                ) {
+                    Row(
+                        modifier = Modifier.padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            Icons.Default.Language,
+                            contentDescription = null,
+                            modifier = Modifier.size(20.dp),
+                            tint = if (selectedTab != null)
+                                MaterialTheme.colors.primary
+                            else
+                                MaterialTheme.colors.onSurface.copy(alpha = 0.6f)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = selectedTab?.title ?: if (availableTabs.isEmpty())
+                                    "No browser tabs available"
+                                else
+                                    "Select a browser tab...",
+                                style = MaterialTheme.typography.body1,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            if (selectedTab?.url != null) {
+                                Text(
+                                    text = selectedTab.url!!,
+                                    style = MaterialTheme.typography.caption,
+                                    color = MaterialTheme.colors.onSurface.copy(alpha = 0.6f),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
+                        Icon(
+                            if (expanded) Icons.Default.ArrowDropUp else Icons.Default.ArrowDropDown,
+                            contentDescription = "Dropdown",
+                            tint = MaterialTheme.colors.onSurface.copy(alpha = 0.6f)
+                        )
+                    }
+                }
+
+                DropdownMenu(
+                    expanded = expanded && availableTabs.isNotEmpty(),
+                    onDismissRequest = { expanded = false }
+                ) {
+                    availableTabs.forEach { tab ->
+                        DropdownMenuItem(
+                            onClick = {
+                                onTabSelected(tab)
+                                expanded = false
+                            }
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    Icons.Default.Language,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        tab.title,
+                                        style = MaterialTheme.typography.body2,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    tab.url?.let { url ->
+                                        Text(
+                                            url,
+                                            style = MaterialTheme.typography.caption,
+                                            color = MaterialTheme.colors.onSurface.copy(alpha = 0.6f),
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -326,7 +462,7 @@ private fun LLMConfigStatusCard() {
             Spacer(modifier = Modifier.width(8.dp))
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    if (hasApiKey) "${provider.displayName} configured" else "No API key configured",
+                    if (hasApiKey) "LLM Provider: ${provider.displayName}" else "No API key configured",
                     style = MaterialTheme.typography.body2,
                     fontWeight = FontWeight.Medium
                 )
@@ -338,7 +474,7 @@ private fun LLMConfigStatusCard() {
                     )
                 } else if (!hasApiKey) {
                     Text(
-                        "Click settings to configure",
+                        "Configure in Settings > LLM Providers",
                         style = MaterialTheme.typography.caption,
                         color = MaterialTheme.colors.onSurface.copy(alpha = 0.6f)
                     )
@@ -349,48 +485,12 @@ private fun LLMConfigStatusCard() {
 }
 
 @Composable
-private fun UrlInputSection(
-    url: String,
-    onUrlChange: (String) -> Unit,
-    enabled: Boolean
-) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(8.dp),
-        elevation = 1.dp
-    ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Text(
-                "Target URL (optional)",
-                style = MaterialTheme.typography.subtitle2,
-                fontWeight = FontWeight.Medium,
-                modifier = Modifier.padding(bottom = 8.dp)
-            )
-            OutlinedTextField(
-                value = url,
-                onValueChange = onUrlChange,
-                modifier = Modifier.fillMaxWidth(),
-                placeholder = { Text("https://example.com") },
-                enabled = enabled,
-                singleLine = true,
-                leadingIcon = {
-                    Icon(
-                        Icons.Default.Language,
-                        contentDescription = null,
-                        modifier = Modifier.size(20.dp)
-                    )
-                }
-            )
-        }
-    }
-}
-
-@Composable
 private fun InstructionInputSection(
     instruction: String,
     onInstructionChange: (String) -> Unit,
     onGenerate: () -> Unit,
     isGenerating: Boolean,
+    hasSelectedTab: Boolean,
     onQuickExample: (String) -> Unit
 ) {
     Card(
@@ -412,7 +512,7 @@ private fun InstructionInputSection(
                 modifier = Modifier.fillMaxWidth(),
                 placeholder = {
                     Text(
-                        "e.g., Click the search button and type 'artificial intelligence'",
+                        "e.g., Click on the search button and type 'artificial intelligence'",
                         style = MaterialTheme.typography.body2,
                         color = MaterialTheme.colors.onSurface.copy(alpha = 0.5f)
                     )
@@ -427,7 +527,7 @@ private fun InstructionInputSection(
             Button(
                 onClick = onGenerate,
                 modifier = Modifier.fillMaxWidth(),
-                enabled = instruction.isNotBlank() && !isGenerating,
+                enabled = instruction.isNotBlank() && hasSelectedTab && !isGenerating,
                 colors = ButtonDefaults.buttonColors(
                     backgroundColor = MaterialTheme.colors.primary
                 )
@@ -442,16 +542,16 @@ private fun InstructionInputSection(
                     Text("Generating...")
                 } else {
                     Icon(
-                        Icons.Outlined.AutoAwesome,
-                        contentDescription = null,
+                        Icons.Default.PlayArrow,
+                        contentDescription = "Execute",
                         modifier = Modifier.size(20.dp)
                     )
                     Spacer(modifier = Modifier.width(8.dp))
-                    Text("Generate RPA Actions")
+                    Text("Execute Instruction")
                 }
             }
 
-            // Quick examples
+            // Quick action examples
             Spacer(modifier = Modifier.height(8.dp))
             Text(
                 "Quick Examples:",
@@ -459,12 +559,14 @@ private fun InstructionInputSection(
                 color = MaterialTheme.colors.onSurface.copy(alpha = 0.6f)
             )
             Row(
-                modifier = Modifier.padding(top = 4.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 4.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 QuickChip("Fill form") { onQuickExample("Fill out the contact form with test data") }
                 QuickChip("Extract data") { onQuickExample("Extract all product prices from this page") }
-                QuickChip("Navigate") { onQuickExample("Navigate to the login page") }
+                QuickChip("Navigate") { onQuickExample("Navigate to the login page and sign in") }
             }
         }
     }
