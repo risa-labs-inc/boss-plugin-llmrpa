@@ -3,7 +3,7 @@
   "pluginId": "ai.rever.boss.plugin.dynamic.llmrpa",
   "displayName": "LLM RPA (Dynamic)",
   "version": "1.0.5",
-  "apiVersion": "1.0.18",
+  "apiVersion": "1.0.20",
   "minBossVersion": "8.16.30",
   "mainClass": "ai.rever.boss.plugin.dynamic.llmrpa.LlmrpaDynamicPlugin",
   "type": "panel",
