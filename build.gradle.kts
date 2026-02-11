@@ -86,6 +86,15 @@ tasks.register<Jar>("buildPluginJar") {
     from("src/main/resources")
 }
 
+// Sync version from build.gradle.kts into plugin.json (single source of truth)
+tasks.processResources {
+    filesMatching("**/plugin.json") {
+        filter { line ->
+            line.replace(Regex(""""version"\s*:\s*"[^"]*""""), """"version": "\$version"""")
+        }
+    }
+}
+
 tasks.build {
     dependsOn("buildPluginJar")
 }
