@@ -2,7 +2,7 @@
   "manifestVersion": 1,
   "pluginId": "ai.rever.boss.plugin.dynamic.llmrpa",
   "displayName": "LLM RPA (Dynamic)",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "apiVersion": "1.0.20",
   "minBossVersion": "8.16.30",
   "mainClass": "ai.rever.boss.plugin.dynamic.llmrpa.LlmrpaDynamicPlugin",
@@ -18,5 +18,8 @@
     "maxThreads": 4,
     "maxRestartAttempts": 3,
     "heartbeatIntervalMs": 5000
-  }
+  },
+  "isolationMode": "out-of-process",
+  "fallback": "in-process",
+  "stateHolderClass": "ai.rever.boss.plugin.runtime.stateholders.RpaStateHolder"
 }
