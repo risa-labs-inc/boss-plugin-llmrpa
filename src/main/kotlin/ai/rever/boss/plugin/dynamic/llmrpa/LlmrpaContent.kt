@@ -2,6 +2,7 @@ package ai.rever.boss.plugin.dynamic.llmrpa
 
 import ai.rever.boss.plugin.api.ActiveTabData
 import ai.rever.boss.plugin.ui.BossTheme
+import ai.rever.boss.plugin.ui.BossThemeColors
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -445,9 +446,9 @@ private fun LLMConfigStatusCard() {
         shape = RoundedCornerShape(8.dp),
         elevation = 1.dp,
         backgroundColor = if (hasApiKey)
-            Color(0xFF4CAF50).copy(alpha = 0.05f)
+            BossThemeColors.SuccessColor.copy(alpha = 0.05f)
         else
-            Color(0xFFFF9800).copy(alpha = 0.05f)
+            BossThemeColors.WarningColor.copy(alpha = 0.05f)
     ) {
         Row(
             modifier = Modifier.padding(12.dp),
@@ -457,7 +458,7 @@ private fun LLMConfigStatusCard() {
                 if (hasApiKey) Icons.Default.CheckCircle else Icons.Default.Warning,
                 contentDescription = null,
                 modifier = Modifier.size(20.dp),
-                tint = if (hasApiKey) Color(0xFF4CAF50) else Color(0xFFFF9800)
+                tint = if (hasApiKey) BossThemeColors.SuccessColor else BossThemeColors.WarningColor
             )
             Spacer(modifier = Modifier.width(8.dp))
             Column(modifier = Modifier.weight(1f)) {
@@ -594,7 +595,7 @@ private fun ErrorCard(error: String, onDismiss: () -> Unit) {
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(8.dp),
-        backgroundColor = Color(0xFFFF5252).copy(alpha = 0.1f),
+        backgroundColor = BossThemeColors.ErrorColor.copy(alpha = 0.1f),
         elevation = 1.dp
     ) {
         Row(
@@ -604,18 +605,18 @@ private fun ErrorCard(error: String, onDismiss: () -> Unit) {
             Icon(
                 Icons.Default.Error,
                 contentDescription = null,
-                tint = Color(0xFFFF5252),
+                tint = BossThemeColors.ErrorColor,
                 modifier = Modifier.size(20.dp)
             )
             Spacer(modifier = Modifier.width(8.dp))
             Text(
                 error,
                 style = MaterialTheme.typography.body2,
-                color = Color(0xFFFF5252),
+                color = BossThemeColors.ErrorColor,
                 modifier = Modifier.weight(1f)
             )
             IconButton(onClick = onDismiss, modifier = Modifier.size(24.dp)) {
-                Icon(Icons.Default.Close, "Dismiss", tint = Color(0xFFFF5252))
+                Icon(Icons.Default.Close, "Dismiss", tint = BossThemeColors.ErrorColor)
             }
         }
     }
@@ -624,10 +625,10 @@ private fun ErrorCard(error: String, onDismiss: () -> Unit) {
 @Composable
 private fun ExecutionHistoryCard(execution: LLMExecutionState) {
     val statusColor = when (execution.status) {
-        LLMExecutionStatus.GENERATING -> Color(0xFFFF9800)
-        LLMExecutionStatus.READY -> Color(0xFF4CAF50)
-        LLMExecutionStatus.COMPLETED -> Color(0xFF4CAF50)
-        LLMExecutionStatus.ERROR -> Color(0xFFFF5252)
+        LLMExecutionStatus.GENERATING -> BossThemeColors.WarningColor
+        LLMExecutionStatus.READY -> BossThemeColors.SuccessColor
+        LLMExecutionStatus.COMPLETED -> BossThemeColors.SuccessColor
+        LLMExecutionStatus.ERROR -> BossThemeColors.ErrorColor
     }
 
     Card(
@@ -681,13 +682,13 @@ private fun ExecutionHistoryCard(execution: LLMExecutionState) {
             execution.error?.let { error ->
                 Spacer(modifier = Modifier.height(8.dp))
                 Surface(
-                    color = Color(0xFFFF5252).copy(alpha = 0.1f),
+                    color = BossThemeColors.ErrorColor.copy(alpha = 0.1f),
                     shape = RoundedCornerShape(4.dp)
                 ) {
                     Text(
                         error,
                         style = MaterialTheme.typography.caption,
-                        color = Color(0xFFFF5252),
+                        color = BossThemeColors.ErrorColor,
                         modifier = Modifier.padding(8.dp)
                     )
                 }
@@ -739,7 +740,7 @@ private fun ExecutionHistoryCard(execution: LLMExecutionState) {
                 // Note about execution
                 Spacer(modifier = Modifier.height(8.dp))
                 Surface(
-                    color = Color(0xFF2196F3).copy(alpha = 0.1f),
+                    color = BossThemeColors.AccentColor.copy(alpha = 0.1f),
                     shape = RoundedCornerShape(4.dp)
                 ) {
                     Row(
@@ -750,13 +751,13 @@ private fun ExecutionHistoryCard(execution: LLMExecutionState) {
                             Icons.Default.Info,
                             contentDescription = null,
                             modifier = Modifier.size(14.dp),
-                            tint = Color(0xFF2196F3)
+                            tint = BossThemeColors.AccentColor
                         )
                         Spacer(modifier = Modifier.width(4.dp))
                         Text(
                             "Actions ready for manual execution or integration",
                             style = MaterialTheme.typography.caption,
-                            color = Color(0xFF2196F3)
+                            color = BossThemeColors.AccentColor
                         )
                     }
                 }
