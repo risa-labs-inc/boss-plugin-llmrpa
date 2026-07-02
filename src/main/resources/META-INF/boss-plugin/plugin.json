@@ -4,7 +4,7 @@
   "displayName": "LLM RPA (Dynamic)",
   "version": "1.0.6",
   "apiVersion": "1.0.20",
-  "minBossVersion": "8.16.30",
+  "minBossVersion": "9.2.20",
   "mainClass": "ai.rever.boss.plugin.dynamic.llmrpa.LlmrpaDynamicPlugin",
   "type": "panel",
   "description": "AI-powered robotic process automation with LLM integration",
