@@ -57,13 +57,13 @@ fun LlmrpaContent(component: LlmrpaComponent) {
                 // Settings Section (collapsible)
                 if (showSettings) {
                     item {
-                        SettingsSection()
+                        SettingsSection(component)
                     }
                 }
 
                 // LLM Configuration Status
                 item {
-                    LLMConfigStatusCard()
+                    LLMConfigStatusCard(component)
                 }
 
                 // Browser Tab Selection (like bundled plugin)
@@ -297,10 +297,10 @@ private fun TabSelectionSection(
 }
 
 @Composable
-private fun SettingsSection() {
-    var selectedProvider by remember { mutableStateOf(LLMSettings.selectedProvider) }
-    var apiKey by remember { mutableStateOf(LLMSettings.getApiKey(selectedProvider) ?: "") }
-    var selectedModel by remember { mutableStateOf(LLMSettings.selectedModelId) }
+private fun SettingsSection(component: LlmrpaComponent) {
+    // Read on each composition rather than remembered: LlmProvider has no change signal, so a
+    // remembered snapshot would keep showing a provider the user has since changed or removed.
+    val config = component.llmConfig()
 
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -309,143 +309,75 @@ private fun SettingsSection() {
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
             Text(
-                "LLM Configuration",
+                "AI Provider",
                 style = MaterialTheme.typography.subtitle1,
                 fontWeight = FontWeight.Bold,
                 modifier = Modifier.padding(bottom = 12.dp)
             )
 
-            // Provider Selection
+            if (config != null) {
+                SettingRow("Provider", config.displayName)
+                SettingRow("Model", config.modelId)
+                SettingRow("Max tokens", config.maxTokens.toString())
+                SettingRow("Temperature", config.temperature.toString())
+            } else {
+                Text(
+                    "No AI provider is configured.",
+                    style = MaterialTheme.typography.body2
+                )
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
             Text(
-                "Provider",
+                "Keys, endpoints and models are managed centrally in Settings → AI Providers, " +
+                    "so every plugin shares one set of credentials. This panel holds none of " +
+                    "its own.",
                 style = MaterialTheme.typography.caption,
                 color = MaterialTheme.colors.onSurface.copy(alpha = 0.7f)
             )
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(vertical = 8.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                LLMProvider.entries.forEach { provider ->
-                    ProviderChip(
-                        text = provider.displayName,
-                        selected = selectedProvider == provider,
-                        onClick = {
-                            selectedProvider = provider
-                            LLMSettings.setProvider(provider)
-                            apiKey = LLMSettings.getApiKey(provider) ?: ""
-                            selectedModel = LLMSettings.selectedModelId
-                        }
-                    )
-                }
-            }
 
-            Spacer(modifier = Modifier.height(8.dp))
-
-            // API Key Input
-            OutlinedTextField(
-                value = apiKey,
-                onValueChange = {
-                    apiKey = it
-                    LLMSettings.setApiKey(selectedProvider, it)
-                },
-                label = { Text("API Key") },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true,
-                visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation()
-            )
-
-            // Model Selection (if not custom)
-            if (selectedProvider != LLMProvider.CUSTOM) {
+            if (component.canOpenProviderSettings()) {
                 Spacer(modifier = Modifier.height(12.dp))
-                Text(
-                    "Model",
-                    style = MaterialTheme.typography.caption,
-                    color = MaterialTheme.colors.onSurface.copy(alpha = 0.7f)
-                )
-
-                val models = LLMModels.getModelsForProvider(selectedProvider)
-                var expanded by remember { mutableStateOf(false) }
-
-                Box {
-                    OutlinedButton(
-                        onClick = { expanded = true },
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text(
-                            LLMModels.findModelById(selectedModel)?.name ?: selectedModel,
-                            modifier = Modifier.weight(1f)
-                        )
-                        Icon(Icons.Default.ArrowDropDown, "Select model")
-                    }
-
-                    DropdownMenu(
-                        expanded = expanded,
-                        onDismissRequest = { expanded = false }
-                    ) {
-                        models.forEach { model ->
-                            DropdownMenuItem(onClick = {
-                                selectedModel = model.id
-                                LLMSettings.setModel(model.id)
-                                expanded = false
-                            }) {
-                                Text(model.name)
-                            }
-                        }
-                    }
+                OutlinedButton(onClick = { component.openProviderSettings() }) {
+                    Text("Open AI Providers settings")
                 }
-            }
-
-            // Custom endpoint (if custom provider)
-            if (selectedProvider == LLMProvider.CUSTOM) {
-                Spacer(modifier = Modifier.height(8.dp))
-                var endpoint by remember { mutableStateOf(LLMSettings.getCustomEndpoint()) }
-                OutlinedTextField(
-                    value = endpoint,
-                    onValueChange = {
-                        endpoint = it
-                        LLMSettings.setCustomEndpoint(it)
-                    },
-                    label = { Text("Custom Endpoint URL") },
-                    modifier = Modifier.fillMaxWidth(),
-                    singleLine = true
-                )
             }
         }
     }
 }
 
 @Composable
-private fun ProviderChip(text: String, selected: Boolean, onClick: () -> Unit) {
-    Surface(
-        modifier = Modifier
-            .clip(RoundedCornerShape(16.dp))
-            .clickable { onClick() },
-        color = if (selected) MaterialTheme.colors.primary.copy(alpha = 0.2f) else MaterialTheme.colors.surface,
-        border = if (selected) null else androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colors.onSurface.copy(alpha = 0.3f)),
-        shape = RoundedCornerShape(16.dp)
+private fun SettingRow(label: String, value: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp),
+        verticalAlignment = Alignment.CenterVertically
     ) {
         Text(
-            text,
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
-            fontSize = 12.sp,
-            color = if (selected) MaterialTheme.colors.primary else MaterialTheme.colors.onSurface
+            label,
+            style = MaterialTheme.typography.caption,
+            color = MaterialTheme.colors.onSurface.copy(alpha = 0.7f),
+            modifier = Modifier.width(96.dp)
+        )
+        Text(
+            value,
+            style = MaterialTheme.typography.body2,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
         )
     }
 }
 
 @Composable
-private fun LLMConfigStatusCard() {
-    val hasApiKey = LLMSettings.hasValidApiKey()
-    val provider = LLMSettings.selectedProvider
-    val modelInfo = LLMModels.findModelById(LLMSettings.selectedModelId)
+private fun LLMConfigStatusCard(component: LlmrpaComponent) {
+    // Re-read per composition, not remembered — see SettingsSection.
+    val config = component.llmConfig()
+    val configured = config != null
 
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(8.dp),
         elevation = 1.dp,
-        backgroundColor = if (hasApiKey)
+        backgroundColor = if (configured)
             BossThemeColors.SuccessColor.copy(alpha = 0.05f)
         else
             BossThemeColors.WarningColor.copy(alpha = 0.05f)
@@ -455,30 +387,29 @@ private fun LLMConfigStatusCard() {
             verticalAlignment = Alignment.CenterVertically
         ) {
             Icon(
-                if (hasApiKey) Icons.Default.CheckCircle else Icons.Default.Warning,
+                if (configured) Icons.Default.CheckCircle else Icons.Default.Warning,
                 contentDescription = null,
                 modifier = Modifier.size(20.dp),
-                tint = if (hasApiKey) BossThemeColors.SuccessColor else BossThemeColors.WarningColor
+                tint = if (configured) BossThemeColors.SuccessColor else BossThemeColors.WarningColor
             )
             Spacer(modifier = Modifier.width(8.dp))
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    if (hasApiKey) "LLM Provider: ${provider.displayName}" else "No API key configured",
+                    if (config != null) "AI Provider: ${config.displayName}" else "No AI provider configured",
                     style = MaterialTheme.typography.body2,
                     fontWeight = FontWeight.Medium
                 )
-                if (hasApiKey && modelInfo != null) {
-                    Text(
-                        "Model: ${modelInfo.name}",
-                        style = MaterialTheme.typography.caption,
-                        color = MaterialTheme.colors.onSurface.copy(alpha = 0.6f)
-                    )
-                } else if (!hasApiKey) {
-                    Text(
-                        "Configure in Settings > LLM Providers",
-                        style = MaterialTheme.typography.caption,
-                        color = MaterialTheme.colors.onSurface.copy(alpha = 0.6f)
-                    )
+                Text(
+                    config?.let { "Model: ${it.modelId}" } ?: "Configure in Settings → AI Providers",
+                    style = MaterialTheme.typography.caption,
+                    color = MaterialTheme.colors.onSurface.copy(alpha = 0.6f),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            if (!configured && component.canOpenProviderSettings()) {
+                TextButton(onClick = { component.openProviderSettings() }) {
+                    Text("Configure", style = MaterialTheme.typography.caption)
                 }
             }
         }
