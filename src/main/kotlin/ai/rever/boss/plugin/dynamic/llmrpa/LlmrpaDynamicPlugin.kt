@@ -23,9 +23,27 @@ class LlmrpaDynamicPlugin : DynamicPlugin {
 
     override fun register(context: PluginContext) {
         val activeTabsProvider = context.activeTabsProvider
+        // Credentials, endpoint and model all come from the secret-manager plugin. Captured
+        // here rather than per-panel because the relay itself is stable; what changes is the
+        // config behind it, which is why every caller re-reads activeConfig() instead of
+        // caching an LlmConfig. Null when the provider plugin is absent or disabled, and under
+        // BOSS_MODE=KERNEL, where the microkernel's RemotePluginContext has no llmProvider
+        // proxy yet.
+        val llmProvider = context.llmProvider
+        // So the panel can send the user straight to where keys now live. Both may be null;
+        // the panel falls back to naming the path in text.
+        val settingsProvider = context.settingsProvider
+        val windowId = context.windowId
 
         context.panelRegistry.registerPanel(LlmrpaInfo) { ctx, panelInfo ->
-            LlmrpaComponent(ctx, panelInfo, activeTabsProvider).also { comp ->
+            LlmrpaComponent(
+                ctx,
+                panelInfo,
+                activeTabsProvider,
+                llmProvider,
+                settingsProvider,
+                windowId,
+            ).also { comp ->
                 lastComponent = comp
                 // Clear on panel close: a destroyed component's scope is cancelled,
                 // so MCP tools driving it would silently no-op with false success.
