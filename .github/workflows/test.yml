@@ -1,0 +1,51 @@
+name: Tests
+
+# build.yml only fires on push to main and delegates to the release workflow,
+# so nothing compiled this plugin before a merge landed. This runs on every
+# pull request, which is what makes it usable as a required status check.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # The API is compileOnly at runtime because the host classloader provides
+      # it, but compiling and testing happen outside the host, so the jar has to
+      # be on the classpath here. Resolution mirrors plugin-release.yml so CI
+      # and the release build agree on which API they are building against.
+      - name: Download boss-plugin-api
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          API_VERSION: 'latest'
+        run: |
+          set -euo pipefail
+          if [ "$API_VERSION" = "latest" ]; then
+            API_VERSION=$(gh api repos/risa-labs-inc/boss-plugin-api/releases/latest --jq '.tag_name' | sed 's/^v//')
+            echo "Resolved latest boss-plugin-api: $API_VERSION"
+          fi
+          mkdir -p build/downloaded-deps
+          # -f so an HTTP error is a failure rather than an error page silently
+          # written to the jar path and a confusing compile error later.
+          curl -fsSL -o build/downloaded-deps/boss-plugin-api.jar \
+            "https://github.com/risa-labs-inc/boss-plugin-api/releases/download/v${API_VERSION}/boss-plugin-api-${API_VERSION}.jar"
+          ls -l build/downloaded-deps/
+
+      # CI=true switches build.gradle.kts off the sibling-checkout jar and onto
+      # the one downloaded above. Actions sets it anyway; set explicitly so the
+      # dependency is visible rather than inherited.
+      - name: Compile and run tests
+        run: ./gradlew test --no-daemon
+        env:
+          CI: 'true'
