@@ -34,13 +34,13 @@ class LlmrpaComponent(
     ctx: ComponentContext,
     override val panelInfo: PanelInfo,
     private val activeTabsProvider: ActiveTabsProvider?,
-    private val llmProvider: LlmProvider? = null,
+    private val aiGateway: () -> ai.rever.boss.plugin.api.AiGatewayAPI? = { null },
     private val settingsProvider: SettingsProvider? = null,
     private val windowId: String? = null
 ) : PanelComponentWithUI, ComponentContext by ctx {
 
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
-    private val apiClient = LlmApiClient()
+    private val apiClient = LlmApiClient(aiGateway)
 
     /**
      * The provider config to use right now, or null when nothing is configured.
@@ -50,7 +50,15 @@ class LlmrpaComponent(
      * and a null can equally mean "the provider plugin has not finished its async credential
      * load yet", which only a later read can tell apart from "nothing configured".
      */
-    fun llmConfig(): LlmConfig? = llmProvider?.activeConfig()?.takeIf { it.apiKey.isNotBlank() }
+    fun aiAvailable(): Boolean = aiModel() != null
+
+    /**
+     * The provider and model a request would use, for display. Null when AI is unavailable.
+     *
+     * Read fresh at every call rather than cached: there is no change signal, so a snapshot
+     * would keep naming a provider the user has since changed or removed.
+     */
+    fun aiModel(): ai.rever.boss.plugin.api.AiModelInfo? = aiGateway()?.activeModel()
 
     /**
      * Open Settings → AI Providers, where keys and models are configured.
@@ -118,7 +126,9 @@ class LlmrpaComponent(
 
         lifecycle.doOnDestroy {
             scope.cancel()
-            apiClient.dispose()
+            // No apiClient.dispose(): it no longer owns an HTTP client. The transport
+            // belongs to the AI Gateway plugin now, which the host unloads with its own
+            // classloader.
         }
     }
 
@@ -176,7 +186,7 @@ class LlmrpaComponent(
                     sourceUrl = sourceUrl
                 )
 
-                val response = apiClient.callLLMApi(llmConfig(), request)
+                val response = apiClient.callLLMApi(request)
 
                 if (response.status == "success" || response.status == "error") {
                     updateExecutionStatus(
