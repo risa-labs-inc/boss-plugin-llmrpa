@@ -8,38 +8,47 @@ AI-powered robotic process automation with LLM integration
 
 - **Plugin ID**: `ai.rever.boss.plugin.dynamic.llmrpa`
 - **Main Class**: `ai.rever.boss.plugin.dynamic.llmrpa.LlmrpaDynamicPlugin`
-- **API Version**: 1.0.20 · **minApiVersion**: 1.0.71 · **minBossVersion**: 9.2.63
+- **API Version**: 1.0.20 · **minApiVersion**: 1.0.74 · **minBossVersion**: 9.2.63
 
-## AI credentials: this plugin owns none
+## AI: this plugin owns no credentials and no wire formats
 
-Keys, endpoints, models and sampling parameters all come from the **secret-manager** plugin
-(Settings → AI Providers), read through `PluginContext.llmProvider`. `LlmApiClient` is driven
-entirely by the `LlmConfig` handed to `callLLMApi`.
+Requests go through the shared **AI Gateway** plugin (`AiGatewayAPI`), reached with
+`context.getPluginAPI(...)`. Keys, endpoints, models and sampling parameters are the gateway's
+problem, resolved from Settings → AI Providers per call.
 
-Before this, `LLMSettings` kept four provider keys in **plaintext** in
+`LlmApiClient` keeps only what is this plugin's own work: building the RPA prompt and parsing
+the model's reply back into `LLMRpaResponse`. It went from 298 lines to about 150 when the
+transport and the four per-format request builders left, and **Ktor left with them** - all four
+artifacts, because they were bundled purely for that client.
+
+Before any of this, `LLMSettings` kept four provider keys in **plaintext** in
 `~/.boss/config/llm-settings.json` and rewrote the file on every keystroke of the panel's own
 "API Key" field, alongside a hardcoded provider enum and a model list that had drifted years
-out of date (`claude-3-5-sonnet-20240620`) — while its own status card told users to
-"Configure in Settings > LLM Providers" and then ignored them. `LlmSettings.kt` and the
-`LLMProvider`/`LLMModels` types are gone; do not reintroduce a local key field. secret-manager
-v1.2.9+ imports that file on first run and renames it to `.migrated`.
+out of date (`claude-3-5-sonnet-20240620`) - while its own status card told users to "Configure
+in Settings > LLM Providers" and then ignored them. Do not reintroduce a local key field.
+secret-manager v1.2.9+ imports that file on first run and renames it to `.migrated`.
 
 Three things to keep right:
 
-- **Re-read `llmConfig()`, never cache it.** `LlmProvider` exposes no change signal, so a
-  remembered snapshot keeps showing a provider the user has since changed or removed. The
-  composables call it per composition for the same reason.
-- **`callProvider`'s `when` must keep its `else`.** `LlmApiFormat` is an open set the host can
-  extend ahead of this plugin; made exhaustive, a new constant throws
-  `NoWhenBranchMatchedException` mid-request (the bug that shipped in jupyter-notebook v1.0.12).
-- **`CUSTOM` is an OpenAI-compatible chat endpoint now.** The old custom branch POSTed a raw
-  `LLMRpaRequest` and expected an `LLMRpaResponse` back — a bespoke RPA protocol, not an LLM
-  call. The provider registry defines `CUSTOM` as "Custom (OpenAI-compatible)", so it goes
-  through the chat path like the others.
+- **Resolve the gateway lazily, per call.** It is held as a `() -> AiGatewayAPI?` lambda, not a
+  resolved instance, because plugin load order is not guaranteed and `getPluginAPI` at
+  `register()` would cache a null forever. Neither `LlmApiClient.gateway` nor
+  `LlmrpaComponent.aiGateway` has a **default**: a call site that forgot to pass it would
+  otherwise be indistinguishable at runtime from "no gateway installed", and the panel would
+  serve example responses forever.
+- **Guard calls across the boundary.** `aiModel()` wraps its call, because a gateway built
+  against a different api revision raises `NoSuchMethodError` rather than returning null, and it
+  is read from composition.
+- **`activeModel()` is display-only.** `aiAvailable()` derives from it, and the composables read
+  it per composition, because there is no change signal - a remembered snapshot keeps naming a
+  provider the user has since changed or removed.
 
-Under `BOSS_MODE=KERNEL` this plugin runs out-of-process, and the microkernel's
-`RemotePluginContext` has no `llmProvider` proxy — so the config is null there and the panel
-shows its unconfigured state. Tracked against `boss-microkernel-runtime`, not fixable here.
+There are no wire formats here any more, so the `else`-branch rule that used to matter is the
+gateway's problem. The api floor is **1.0.74**.
+
+Under `BOSS_MODE=KERNEL` this plugin runs out-of-process and the microkernel's
+`RemotePluginContext` has no plugin-API proxy, so the gateway is null there and the panel shows
+its unconfigured state. Tracked against `boss-microkernel-runtime`, not fixable here.
 
 ### The api jar must never be pinned by filename
 
@@ -82,6 +91,8 @@ build.gradle.kts   → Build config + version (single source of truth)
 - **Compose Desktop**: UI framework
 - **Decompose**: Navigation and component lifecycle
 - **Coroutines**: Async operations
+- **No HTTP client.** AI goes through the AI Gateway plugin. The host deliberately excludes the
+  Ktor stack, so a plugin carrying its own copy is a loader-constraint hazard.
 
 ## Version Management
 

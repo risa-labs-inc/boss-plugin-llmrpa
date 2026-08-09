@@ -1,5 +1,6 @@
 package ai.rever.boss.plugin.dynamic.llmrpa
 
+import ai.rever.boss.plugin.api.AiGatewayAPI
 import ai.rever.boss.plugin.api.DynamicPlugin
 import ai.rever.boss.plugin.api.PluginContext
 import com.arkivanov.essenty.lifecycle.doOnDestroy
@@ -28,7 +29,7 @@ class LlmrpaDynamicPlugin : DynamicPlugin {
         // load order is not guaranteed, so reading it here would cache whatever was
         // registered at this moment - usually null. Also null under BOSS_MODE=KERNEL,
         // where the microkernel's RemotePluginContext has no plugin-API proxy yet.
-        val aiGateway = { context.getPluginAPI(ai.rever.boss.plugin.api.AiGatewayAPI::class.java) }
+        val aiGateway = { context.getPluginAPI(AiGatewayAPI::class.java) }
         // So the panel can send the user straight to where keys now live. Both may be null;
         // the panel falls back to naming the path in text.
         val settingsProvider = context.settingsProvider

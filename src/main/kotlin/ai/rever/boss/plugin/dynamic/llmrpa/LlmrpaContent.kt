@@ -402,7 +402,7 @@ private fun LLMConfigStatusCard(component: LlmrpaComponent) {
                 )
                 Text(
                     component.aiModel()?.let { "Model: ${it.modelId}" }
-                        ?: "Configure in Settings, AI Providers",
+                        ?: "Configure in Settings → AI Providers",
                     style = MaterialTheme.typography.caption,
                     color = MaterialTheme.colors.onSurface.copy(alpha = 0.6f),
                     maxLines = 1,

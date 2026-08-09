@@ -22,7 +22,10 @@ import kotlinx.serialization.json.Json
  * resolving the API once would cache a null forever.
  */
 class LlmApiClient(
-    private val gateway: () -> AiGatewayAPI? = { null },
+    // No default. A call site that forgets to pass the gateway would otherwise be
+    // indistinguishable at runtime from "no gateway installed" - the panel would serve
+    // example responses forever - so the compiler enforces the wiring instead.
+    private val gateway: () -> AiGatewayAPI?,
 ) {
     private val json =
         Json {
@@ -143,7 +146,6 @@ Provide only the JSON response without additional text.
             message = "Example response — configure an AI provider to generate real actions"
         )
     }
-
 
     private companion object {
         const val SYSTEM_PROMPT =

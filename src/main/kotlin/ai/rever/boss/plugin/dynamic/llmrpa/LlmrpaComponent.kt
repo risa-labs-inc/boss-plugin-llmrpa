@@ -2,8 +2,8 @@ package ai.rever.boss.plugin.dynamic.llmrpa
 
 import ai.rever.boss.plugin.api.ActiveTabData
 import ai.rever.boss.plugin.api.ActiveTabsProvider
-import ai.rever.boss.plugin.api.LlmConfig
-import ai.rever.boss.plugin.api.LlmProvider
+import ai.rever.boss.plugin.api.AiGatewayAPI
+import ai.rever.boss.plugin.api.AiModelInfo
 import ai.rever.boss.plugin.api.PanelComponentWithUI
 import ai.rever.boss.plugin.api.PanelInfo
 import ai.rever.boss.plugin.api.SettingsProvider
@@ -27,14 +27,14 @@ private const val AI_PROVIDERS_SETTINGS_SECTION = "LLM_PROVIDERS"
  * Provides AI-powered RPA automation with LLM integration.
  * Uses ActiveTabsProvider to list available browser tabs for targeting.
  *
- * Holds no credentials: the key, endpoint and model all come from the secret-manager plugin
- * via [llmConfig].
+ * Holds no credentials and speaks no wire format: requests go through the shared AI Gateway
+ * plugin, which resolves the active provider itself.
  */
 class LlmrpaComponent(
     ctx: ComponentContext,
     override val panelInfo: PanelInfo,
     private val activeTabsProvider: ActiveTabsProvider?,
-    private val aiGateway: () -> ai.rever.boss.plugin.api.AiGatewayAPI? = { null },
+    private val aiGateway: () -> AiGatewayAPI?,
     private val settingsProvider: SettingsProvider? = null,
     private val windowId: String? = null
 ) : PanelComponentWithUI, ComponentContext by ctx {
@@ -42,23 +42,23 @@ class LlmrpaComponent(
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private val apiClient = LlmApiClient(aiGateway)
 
-    /**
-     * The provider config to use right now, or null when nothing is configured.
-     *
-     * Resolved fresh at every read rather than cached: [LlmProvider] exposes no change signal,
-     * so a key or provider changed in Settings → AI Providers only shows up on the next read —
-     * and a null can equally mean "the provider plugin has not finished its async credential
-     * load yet", which only a later read can tell apart from "nothing configured".
-     */
+    /** Whether AI can be used right now. See [aiModel] for why this is never cached. */
     fun aiAvailable(): Boolean = aiModel() != null
 
     /**
      * The provider and model a request would use, for display. Null when AI is unavailable.
      *
      * Read fresh at every call rather than cached: there is no change signal, so a snapshot
-     * would keep naming a provider the user has since changed or removed.
+     * keeps naming a provider the user has since changed or removed — and a null can equally
+     * mean "the gateway or provider plugin has not finished loading yet", which only a later
+     * read can tell apart from "nothing configured". The composables call it per composition
+     * for the same reason.
+     *
+     * Guarded, because this crosses a plugin classloader boundary: a gateway built against a
+     * different api revision raises `NoSuchMethodError` rather than returning null, and this
+     * is read from composition where that would take the panel down.
      */
-    fun aiModel(): ai.rever.boss.plugin.api.AiModelInfo? = aiGateway()?.activeModel()
+    fun aiModel(): AiModelInfo? = runCatching { aiGateway()?.activeModel() }.getOrNull()
 
     /**
      * Open Settings → AI Providers, where keys and models are configured.
