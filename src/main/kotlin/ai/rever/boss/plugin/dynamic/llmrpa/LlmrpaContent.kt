@@ -298,9 +298,9 @@ private fun TabSelectionSection(
 
 @Composable
 private fun SettingsSection(component: LlmrpaComponent) {
-    // Read on each composition rather than remembered: LlmProvider has no change signal, so a
+    // Read on each composition rather than remembered: there is no change signal, so a
     // remembered snapshot would keep showing a provider the user has since changed or removed.
-    val config = component.llmConfig()
+    val model = component.aiModel()
 
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -315,11 +315,12 @@ private fun SettingsSection(component: LlmrpaComponent) {
                 modifier = Modifier.padding(bottom = 12.dp)
             )
 
-            if (config != null) {
-                SettingRow("Provider", config.displayName)
-                SettingRow("Model", config.modelId)
-                SettingRow("Max tokens", config.maxTokens.toString())
-                SettingRow("Temperature", config.temperature.toString())
+            if (model != null) {
+                SettingRow("Provider", model.providerName)
+                SettingRow("Model", model.modelId)
+                // Max tokens and temperature are not shown any more: they are the user's
+                // generation defaults, they live in Settings, AI Providers, and a second
+                // copy here could only go stale or disagree.
             } else {
                 Text(
                     "No AI provider is configured.",
@@ -369,9 +370,8 @@ private fun SettingRow(label: String, value: String) {
 
 @Composable
 private fun LLMConfigStatusCard(component: LlmrpaComponent) {
-    // Re-read per composition, not remembered — see SettingsSection.
-    val config = component.llmConfig()
-    val configured = config != null
+    // Re-read per composition, not remembered - see SettingsSection.
+    val configured = component.aiAvailable()
 
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -395,12 +395,14 @@ private fun LLMConfigStatusCard(component: LlmrpaComponent) {
             Spacer(modifier = Modifier.width(8.dp))
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    if (config != null) "AI Provider: ${config.displayName}" else "No AI provider configured",
+                    component.aiModel()?.let { "AI Provider: ${it.providerName}" }
+                        ?: "No AI provider configured",
                     style = MaterialTheme.typography.body2,
                     fontWeight = FontWeight.Medium
                 )
                 Text(
-                    config?.let { "Model: ${it.modelId}" } ?: "Configure in Settings → AI Providers",
+                    component.aiModel()?.let { "Model: ${it.modelId}" }
+                        ?: "Configure in Settings → AI Providers",
                     style = MaterialTheme.typography.caption,
                     color = MaterialTheme.colors.onSurface.copy(alpha = 0.6f),
                     maxLines = 1,

@@ -84,11 +84,9 @@ dependencies {
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
 
-    // Ktor for HTTP client
-    implementation("io.ktor:ktor-client-core:3.0.3")
-    implementation("io.ktor:ktor-client-cio:3.0.3")
-    implementation("io.ktor:ktor-client-content-negotiation:3.0.3")
-    implementation("io.ktor:ktor-serialization-kotlinx-json:3.0.3")
+    // No HTTP client. AI requests go through the AI Gateway plugin, so the four Ktor
+    // artifacts that used to be bundled here are gone - which also removes a
+    // loader-constraint hazard, since the host deliberately excludes the ktor stack.
 
     // Serialization
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.8.0")

@@ -1,5 +1,6 @@
 package ai.rever.boss.plugin.dynamic.llmrpa
 
+import ai.rever.boss.plugin.api.AiGatewayAPI
 import ai.rever.boss.plugin.api.DynamicPlugin
 import ai.rever.boss.plugin.api.PluginContext
 import com.arkivanov.essenty.lifecycle.doOnDestroy
@@ -23,13 +24,12 @@ class LlmrpaDynamicPlugin : DynamicPlugin {
 
     override fun register(context: PluginContext) {
         val activeTabsProvider = context.activeTabsProvider
-        // Credentials, endpoint and model all come from the secret-manager plugin. Captured
-        // here rather than per-panel because the relay itself is stable; what changes is the
-        // config behind it, which is why every caller re-reads activeConfig() instead of
-        // caching an LlmConfig. Null when the provider plugin is absent or disabled, and under
-        // BOSS_MODE=KERNEL, where the microkernel's RemotePluginContext has no llmProvider
-        // proxy yet.
-        val llmProvider = context.llmProvider
+        // AI goes through the shared AI Gateway plugin, which owns the wire formats and
+        // resolves the active provider itself. A lambda, not a resolved instance: plugin
+        // load order is not guaranteed, so reading it here would cache whatever was
+        // registered at this moment - usually null. Also null under BOSS_MODE=KERNEL,
+        // where the microkernel's RemotePluginContext has no plugin-API proxy yet.
+        val aiGateway = { context.getPluginAPI(AiGatewayAPI::class.java) }
         // So the panel can send the user straight to where keys now live. Both may be null;
         // the panel falls back to naming the path in text.
         val settingsProvider = context.settingsProvider
@@ -40,7 +40,7 @@ class LlmrpaDynamicPlugin : DynamicPlugin {
                 ctx,
                 panelInfo,
                 activeTabsProvider,
-                llmProvider,
+                aiGateway,
                 settingsProvider,
                 windowId,
             ).also { comp ->
