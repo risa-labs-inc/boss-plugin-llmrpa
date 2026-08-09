@@ -41,6 +41,11 @@ class LlmrpaDynamicPlugin : DynamicPlugin {
                 panelInfo,
                 activeTabsProvider,
                 aiGateway,
+                // The dialog that names whichever thing is missing and opens the fix.
+                { feature ->
+                    ai.rever.boss.plugin.api.AiAvailability.promptToFix(context, feature) ==
+                        ai.rever.boss.plugin.api.AiReadiness.READY
+                },
                 settingsProvider,
                 windowId,
             ).also { comp ->

@@ -35,6 +35,13 @@ class LlmrpaComponent(
     override val panelInfo: PanelInfo,
     private val activeTabsProvider: ActiveTabsProvider?,
     private val aiGateway: () -> AiGatewayAPI?,
+    /**
+     * Explains why AI is unavailable and offers the fix; returns true when AI is usable.
+     *
+     * A lambda for the same reason [aiGateway] is one: it keeps `AiAvailability`, which
+     * needs the whole `PluginContext`, out of this class and its call sites' tests.
+     */
+    private val promptAiFix: suspend (feature: String) -> Boolean = { false },
     private val settingsProvider: SettingsProvider? = null,
     private val windowId: String? = null
 ) : PanelComponentWithUI, ComponentContext by ctx {
@@ -163,6 +170,14 @@ class LlmrpaComponent(
         val instruction = _currentInstruction.value
         if (instruction.isBlank()) {
             _errorMessage.value = "Please enter an instruction"
+            return
+        }
+
+        // Ask about AI before generating. Without this the panel quietly returned its
+        // example response, which reads as a working feature producing a useless answer -
+        // the user has no way to tell that from a model that did badly.
+        if (!aiAvailable()) {
+            scope.launch { if (promptAiFix("Generating RPA actions")) generateActions() }
             return
         }
 
