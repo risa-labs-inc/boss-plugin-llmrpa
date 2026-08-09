@@ -46,6 +46,18 @@ Three things to keep right:
 There are no wire formats here any more, so the `else`-branch rule that used to matter is the
 gateway's problem. The api floor is **1.0.74**.
 
+### The gateway is an *optional* declared dependency
+
+`plugin.json` lists `ai.rever.boss.plugin.dynamic.aigateway` with `"optional": true`. Declaring it
+is what makes the host's one existing check work - `DynamicPluginManager.checkCanUnload` refuses to
+uninstall a plugin a loaded plugin depends on, so the gateway cannot be removed from under this one
+silently. Nothing reads `dependencies` at *install* time (no resolver, no prompt), so installing
+this plugin without the gateway still just shows the unconfigured state.
+
+`optional: true` is truthful: the panel deliberately serves an example response rather than an
+error when no gateway or provider is available, so the plugin genuinely works without one. A hard
+dependency would make it refuse to load the moment load-time enforcement is wired up.
+
 Under `BOSS_MODE=KERNEL` this plugin runs out-of-process and the microkernel's
 `RemotePluginContext` has no plugin-API proxy, so the gateway is null there and the panel shows
 its unconfigured state. Tracked against `boss-microkernel-runtime`, not fixable here.

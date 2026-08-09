@@ -6,6 +6,13 @@
   "apiVersion": "1.0.20",
   "minApiVersion": "1.0.74",
   "minBossVersion": "9.2.63",
+  "dependencies": [
+    {
+      "pluginId": "ai.rever.boss.plugin.dynamic.aigateway",
+      "version": ">=1.0.3",
+      "optional": true
+    }
+  ],
   "mainClass": "ai.rever.boss.plugin.dynamic.llmrpa.LlmrpaDynamicPlugin",
   "type": "panel",
   "description": "AI-powered robotic process automation with LLM integration",
