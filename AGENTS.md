@@ -286,3 +286,26 @@ unanchored, so it rewrote the *dependency's* constraint too: the jar declared th
 host's install-time dependency check reads. Anchored on the top-level two-space indent.
 (`apiVersion`/`minApiVersion` escaped only because the regex needs a quote immediately before
 `version`.) Verify by reading `plugin.json` out of the built jar, not the source file.
+
+### Sixth review round
+
+- **`status` was the same required-nullable shape one level up.** A reply of
+  `{"configuration":[...ten good actions...],"message":"..."}` with no `status` key threw and the
+  whole plan was discarded. Defaulted to `"success"`, which `runnablePlan()` already tolerates.
+  `configuration` stays **required**, and that is load-bearing: defaulted, a braced aside like
+  `{"foo":1}` would decode cleanly under `ignoreUnknownKeys` and be returned as the first
+  "successful" candidate - an empty plan.
+- **`runnablePlan()`'s failure set has to cover what a *model* says**, not only the two statuses this
+  plugin sets. `"status":"failed"` with a partial or apologetic action list was runnable: written to
+  disk under the user's instruction with the card saying ready to run.
+- **The candidate loop advanced one character**, so the budget was spent on the failed object's own
+  nested braces - its actions and selectors - and eight candidates was effectively one for the case
+  it exists for. It advances past the whole candidate, skips asides with no `"configuration"` key,
+  and keeps the **first** error, since an error about a nested `{"type":"none"}` is the
+  diagnosability failure this plugin keeps fixing.
+- The staging file is deleted in a `finally`: the earlier `catch` only wrapped the move, and
+  `writeText` throwing (full disk, quota) left the `.part` sibling behind on exactly the paths that
+  repeat.
+- `EngineAction.meta` is never omitted, so a stricter reader on the other side cannot break on a
+  missing key. The durable half of that is in rpaengine, which now defaults `selector` and has a test
+  decoding the shapes this writer produces.

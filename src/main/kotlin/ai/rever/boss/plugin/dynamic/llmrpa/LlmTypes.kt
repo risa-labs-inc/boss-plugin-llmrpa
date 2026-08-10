@@ -27,8 +27,15 @@ data class LLMRpaRequest(
  */
 @Serializable
 data class LLMRpaResponse(
+    // Stays REQUIRED, deliberately: it is what makes the candidate loop in `decodeFirstObject`
+    // discriminate. Defaulted, a braced aside like `{"foo":1}` would decode cleanly under
+    // ignoreUnknownKeys and be returned as the first "successful" candidate - an empty plan.
     val configuration: List<RpaActionConfig>,
-    val status: String,
+    // Defaulted for the same reason SelectorInfo's fields are: a reply of
+    // `{"configuration":[...ten good actions...],"message":"..."}` with no status key threw
+    // MissingFieldException and the whole plan was discarded. runnablePlan() is already built to
+    // tolerate a status it does not recognise.
+    val status: String = "success",
     val message: String? = null
 )
 
@@ -48,8 +55,15 @@ internal fun LLMRpaResponse.runnablePlan(): List<RpaActionConfig>? =
     // premise, so the failure statuses are the closed set, not the success one.
     configuration.takeIf { status !in NON_RUNNABLE_STATUSES && it.isNotEmpty() }
 
-/** Statuses this plugin itself sets to mean "there is no plan here". */
-private val NON_RUNNABLE_STATUSES = setOf("error", LlmApiClient.STATUS_EXAMPLE)
+/**
+ * Statuses that mean "there is no plan here".
+ *
+ * Two of these the plugin sets itself; the rest are what a model says when it could not do what was
+ * asked. Without them a reply of `"status":"failed"` with a partial or apologetic action list was
+ * runnable - written to disk under the user's instruction, with the card saying ready to run.
+ */
+private val NON_RUNNABLE_STATUSES =
+    setOf("error", LlmApiClient.STATUS_EXAMPLE, "failed", "failure", "unable", "invalid", "refused")
 
 /**
  * RPA Action Configuration

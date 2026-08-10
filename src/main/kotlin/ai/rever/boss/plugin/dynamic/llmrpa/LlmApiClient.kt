@@ -172,7 +172,10 @@ Provide only the JSON response without additional text.
          */
         private fun decodeFirstObject(content: String): LLMRpaResponse {
             var from = 0
-            var lastError: Exception? = null
+            // The FIRST error, not the last: the first candidate is the one most likely to be the
+            // real reply, and reporting an error about a nested `{"type":"none"}` instead is the
+            // diagnosability failure this plugin keeps fixing elsewhere.
+            var firstError: Exception? = null
             repeat(MAX_JSON_CANDIDATES) {
                 val start = content.indexOf('{', from)
                 if (start < 0) return@repeat
@@ -181,15 +184,21 @@ Provide only the JSON response without additional text.
                     from = start + 1
                     return@repeat
                 }
+                // Past the whole candidate, not one character in. Advancing by one spent the budget
+                // on the failed object's own nested braces - its actions and selectors - so eight
+                // candidates was effectively one for the case this loop exists for.
+                from = start + candidate.length
+                // An aside cannot be the reply if it does not carry the key the reply is about.
+                if (!candidate.contains("\"configuration\"")) return@repeat
                 try {
                     return json.decodeFromString<LLMRpaResponse>(candidate)
                 } catch (e: Exception) {
-                    lastError = e
-                    from = start + 1
+                    if (firstError == null) firstError = e
                 }
             }
-            // No candidate decoded: let the whole reply produce the real parse error to report.
-            return lastError?.let { throw it } ?: json.decodeFromString<LLMRpaResponse>(content)
+            // No candidate decoded: report the first real failure, else let the whole reply produce
+            // the parse error.
+            return firstError?.let { throw it } ?: json.decodeFromString<LLMRpaResponse>(content)
         }
 
         /** How many opening braces to try before giving up. */

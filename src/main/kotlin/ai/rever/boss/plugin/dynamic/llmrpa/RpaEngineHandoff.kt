@@ -82,7 +82,10 @@ internal object RpaEngineHandoff {
         // A rename there does change the on-disk format, so it is a deliberate coupling.
         val selector: SelectorInfo,
         val value: String? = null,
-        val meta: Map<String, String>? = null,
+        // Never omitted. explicitNulls = false drops a null key entirely, and if the engine ever
+        // declares `meta` without a default, an action the model left it off would make the whole
+        // configuration unreadable - the user sees an empty config rather than an error.
+        val meta: Map<String, String> = emptyMap(),
     )
 
     /**
@@ -116,8 +119,12 @@ internal object RpaEngineHandoff {
             // half-written file into place - exactly the interleaving the atomic move rules out,
             // in the case named right above as the likely one.
             val staging = Files.createTempFile(dir.toPath(), file.name, ".part").toFile()
-            staging.writeText(json.encodeToString(EngineConfiguration.serializer(), config))
+            // finally, not just a catch around the move: encodeToString and writeText can throw
+            // too (full disk, quota, permissions) and those are exactly the paths that repeat, so
+            // the .part sibling would accumulate in the user's engine directory. After a successful
+            // move the delete is a no-op.
             try {
+                staging.writeText(json.encodeToString(EngineConfiguration.serializer(), config))
                 Files.move(
                     staging.toPath(),
                     file.toPath(),
@@ -128,11 +135,8 @@ internal object RpaEngineHandoff {
                 // Real on some macOS and Windows volumes. A non-atomic replace is worse than an
                 // atomic one and far better than "could not save" forever on that machine.
                 Files.move(staging.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING)
-            } catch (e: Throwable) {
-                // Otherwise the .part file stays in the user's engine directory and the failing
-                // path (permissions, full disk) accumulates litter instead of clearing itself.
-                staging.delete()
-                throw e
+            } finally {
+                if (staging.exists()) staging.delete()
             }
             file
         }.onFailure { error ->
@@ -156,7 +160,7 @@ internal object RpaEngineHandoff {
             type = type,
             selector = selector,
             value = value,
-            meta = meta,
+            meta = meta ?: emptyMap(),
         )
 
     /**
