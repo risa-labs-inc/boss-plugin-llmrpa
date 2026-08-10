@@ -104,6 +104,15 @@ class LlmrpaComponent(
     private val _errorMessage = MutableStateFlow<String?>(null)
     val errorMessage: StateFlow<String?> = _errorMessage
 
+    /**
+     * Where the last generated plan was written for the RPA Engine, or null.
+     *
+     * Surfaced so the panel can say the plan is ready to run rather than leaving the user to
+     * guess whether anything left this plugin.
+     */
+    private val _handoffPath = MutableStateFlow<String?>(null)
+    val handoffPath: StateFlow<String?> = _handoffPath
+
     // Settings state
     private val _showSettings = MutableStateFlow(false)
     val showSettings: StateFlow<Boolean> = _showSettings
@@ -213,6 +222,17 @@ class LlmrpaComponent(
                     )
 
                     if (response.configuration.isNotEmpty()) {
+                        // Hand the plan to the RPA Engine, which loads configurations from disk.
+                        // Without this the actions were generated and then had no consumer at
+                        // all - the button said Execute and nothing could run what it produced.
+                        val written = RpaEngineHandoff.write(instruction, response.configuration)
+                        _handoffPath.value = written?.absolutePath
+                        _errorMessage.value =
+                            if (written != null) {
+                                null
+                            } else {
+                                "Generated the actions but could not save them for the RPA Engine."
+                            }
                         _currentInstruction.value = ""
                     }
                 } else {

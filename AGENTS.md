@@ -126,3 +126,34 @@ Pushes to `main` trigger the release workflow which:
 3. Publishes to the BOSS Plugin Store
 
 The workflow is defined in `.github/workflows/build.yml` and delegates to the shared workflow in `risa-labs-inc/BossConsole-Releases`.
+
+## Handoff to the RPA Engine
+
+Generating a plan was the whole plugin: the result was rendered and then dropped. `RpaEngineHandoff`
+writes it to `~/.boss/config/rpaengine/llm-rpa-<slug>.json`, which the RPA Engine scans, so
+`rpa_load` + `rpa_run` can execute it.
+
+The envelope must match the engine's `RpaConfiguration`: `name`, `description`, `actions`, and each
+action's `actionType` (**not** `action_type` - that is the field name in the LLM's JSON, and the
+engine will not read it).
+
+`write()` takes `configDir` as a parameter with a default. That is not gratuitous: the tests
+originally wrote into the real `~/.boss/config/rpaengine` and left junk configurations in the
+user's engine list.
+
+## Selector guidance in the prompt is load-bearing
+
+The prompt's selector rules are what make a generated plan runnable, and each one was added after
+watching a run fail:
+
+- **Attribute-only CSS, never tag-qualified.** The model emitted `input[name='q']`; Google's search
+  box is a `textarea`. The tag is the part most often wrong, the attribute holds. (The engine also
+  retries with the tag stripped, and logs it - but the plan should be right.)
+- **`text` selectors for links and tabs, never `href*=` on query parameters.** The model emitted
+  `a[href*='tbm=isch']` for Google Images, which has used `udm=2` for some time. A visible label
+  does not change on Google's schedule.
+- **No site-internal `data-*` attributes; prefer ARIA landmarks.** `[data-ils]` matched nothing;
+  `[role='main'] img` is the first image result.
+
+Verify a prompt change by generating and *running*, not by reading the plan. Both a stale-URL
+selector and a wrapper-element click produce a plan that looks entirely reasonable on disk.

@@ -90,6 +90,14 @@ dependencies {
 
     // Serialization
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.8.0")
+
+    // The api is compileOnly, so the test source set brings it back itself; slf4j because
+    // BossLogger binds it at class-init and every class holding a logger would otherwise fail
+    // with NoClassDefFoundError.
+    testImplementation(kotlin("test"))
+    testImplementation(files(newestApiJar))
+    testImplementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
+    testRuntimeOnly("org.slf4j:slf4j-simple:2.0.17")
 }
 
 // Task to build plugin JAR with compiled classes only
@@ -137,4 +145,8 @@ tasks.register<Jar>("shadowJar") {
     from(configurations.runtimeClasspath.get().map { if (it.isDirectory) it else zipTree(it) })
     from(sourceSets.main.get().output)
     from("src/main/resources")
+}
+
+tasks.test {
+    useJUnitPlatform()
 }

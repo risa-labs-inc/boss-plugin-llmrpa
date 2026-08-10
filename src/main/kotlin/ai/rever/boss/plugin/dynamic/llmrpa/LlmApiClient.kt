@@ -94,13 +94,27 @@ Return the response as a JSON object with the following structure:
     "message": "Explanation of what the actions do"
 }
 
-Available action types: navigate, click, input, wait, scroll, screenshot, extract, select, hover, rightClick, keypress, submit
+Available action types: navigate, click, input, select, wait, scroll, keypress, submit, assert, run_script
+
+Use ONLY those types. The RPA Engine that executes this plan implements exactly these; anything
+else fails the step.
 
 Selector guidelines:
-- For search fields, prefer name or id attributes
+- Selector "type" must be one of: css, xpath, id, text, none
 - Use CSS selectors over XPath when possible
+- Write attribute-only CSS, not tag-qualified: [name='q'], never input[name='q'].
+  The tag is the part most often wrong (a search box may be a textarea, not an input),
+  while the attribute holds.
+- For a link, tab or button identified by its visible label, use a "text" selector with the
+  label as the value. Do NOT match on URL query parameters (href*='...'): those change
+  without notice, and the visible label does not.
+- Never target a site's internal data-* attributes (data-ils, data-ved, data-atf and the like).
+  They are build artifacts and change constantly. Prefer ARIA landmarks and roles: the first
+  image in a results page is [role='main'] img, not a data-* guess.
+- For search fields, prefer name or id attributes
 - Use "input" type for typing text
-- Use "keypress" with value "Enter" for form submission
+- To run a search, use "keypress" with value "Enter" on the search field, or "submit" on it
+- Follow any navigation or submit with a "wait" action before selecting from the new page
 
 Provide only the JSON response without additional text.
         """.trimIndent()
