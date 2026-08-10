@@ -125,3 +125,71 @@ class ParseRobustnessTest {
         assertTrue(response.configuration.isEmpty())
     }
 }
+
+/**
+ * Fields a model plausibly omits must not discard the plan.
+ *
+ * kotlinx treats a nullable field with no default as **required**, so `"selector":{"type":"none"}`
+ * or an action with no `selector` at all threw `MissingFieldException` and the reply - carrying a
+ * complete, correct plan - was reported as a parse error.
+ */
+class MissingFieldToleranceTest {
+
+    private fun parse(actionJson: String) =
+        LlmApiClient.parseReply("""{"configuration":[$actionJson],"status":"success","message":"ok"}""")
+
+    @Test
+    fun `a selector with only a type is accepted`() {
+        val response = parse("""{"name":"Wait","type":"wait","selector":{"type":"none"},"value":"1000"}""")
+
+        assertEquals("success", response.status)
+        assertEquals(1, response.configuration.size)
+        assertTrue(response.runnablePlan() != null)
+    }
+
+    @Test
+    fun `an action with no selector at all is accepted`() {
+        // Normal output for navigate, wait and submit.
+        val response = parse("""{"name":"Go","type":"navigate","value":"https://example.com"}""")
+
+        assertEquals(1, response.configuration.size)
+        assertEquals("none", response.configuration.first().selector.type)
+    }
+
+    @Test
+    fun `an action with no name is accepted`() {
+        val response = parse("""{"type":"wait","value":"500"}""")
+
+        assertEquals(1, response.configuration.size)
+    }
+
+    @Test
+    fun `an action with no type is still a parse error`() {
+        // The verb is the one field an action cannot do without.
+        val response = parse("""{"name":"Mystery","value":"1000"}""")
+
+        assertEquals("error", response.status)
+        assertTrue(response.configuration.isEmpty())
+    }
+
+    @Test
+    fun `an unrecognised success-ish status is runnable`() {
+        // "ok", "completed", "done" are all plausible from a model told to write "success".
+        listOf("ok", "completed", "done").forEach { status ->
+            val response = LlmApiClient.parseReply(
+                """{"configuration":[{"name":"Go","type":"navigate","value":"https://a.example"}],""" +
+                    """"status":"$status","message":"m"}""",
+            )
+            assertTrue(response.runnablePlan() != null, "status '$status' lost the plan")
+        }
+    }
+
+    @Test
+    fun `a failure status is still not runnable`() {
+        val response = LlmApiClient.parseReply(
+            """{"configuration":[{"name":"Go","type":"navigate","value":"https://a.example"}],""" +
+                """"status":"error","message":"m"}""",
+        )
+        assertEquals(null, response.runnablePlan())
+    }
+}

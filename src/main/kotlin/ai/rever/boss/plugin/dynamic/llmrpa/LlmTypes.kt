@@ -42,17 +42,28 @@ data class LLMRpaResponse(
  * cannot disagree.
  */
 internal fun LLMRpaResponse.runnablePlan(): List<RpaActionConfig>? =
-    configuration.takeIf { status == "success" && it.isNotEmpty() }
+    // Inverted deliberately: anything that is not a known *failure* and carries actions is
+    // runnable. Requiring exactly "success" meant "ok", "completed" or "done" - all plausible from
+    // a model told to write "success" - discarded a perfect plan. Status drift is this plugin's
+    // premise, so the failure statuses are the closed set, not the success one.
+    configuration.takeIf { status !in NON_RUNNABLE_STATUSES && it.isNotEmpty() }
+
+/** Statuses this plugin itself sets to mean "there is no plan here". */
+private val NON_RUNNABLE_STATUSES = setOf("error", LlmApiClient.STATUS_EXAMPLE)
 
 /**
  * RPA Action Configuration
  */
 @Serializable
 data class RpaActionConfig(
-    val name: String,
+    val name: String = "",
     val action_type: String = "default",
+    // `type` stays required: it is the verb, and an action without one is genuinely not an action.
     val type: String,
-    val selector: SelectorInfo,
+    // Defaulted for the same reason as SelectorInfo's fields - an action with no selector at all
+    // (navigate, wait, submit) is normal output, and nothing in the prompt makes a model emit a
+    // key it has nothing to put in.
+    val selector: SelectorInfo = SelectorInfo(),
     val value: String? = null,
     val meta: Map<String, String>? = null
 )
@@ -62,8 +73,12 @@ data class RpaActionConfig(
  */
 @Serializable
 data class SelectorInfo(
-    val type: String,
-    val value: String?,
+    // Defaults on every field, because kotlinx treats a nullable field with no default as
+    // REQUIRED. `"selector":{"type":"none"}` - a plausible thing for a model to emit for navigate
+    // or wait - threw MissingFieldException, so a reply carrying a perfectly good plan was
+    // reported as a parse error and discarded. Same failure class as the greedy-brace bug.
+    val type: String = "none",
+    val value: String? = null,
     val isUnique: Boolean = true
 )
 

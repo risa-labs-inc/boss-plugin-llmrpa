@@ -16,6 +16,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.flow.updateAndGet
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
@@ -177,18 +178,21 @@ class LlmrpaComponent(
     /**
      * Generate RPA actions from natural language instruction
      */
-    fun generateActions() {
-        if (_isGenerating.value) {
-            // Two concurrent generations collide in several places at once: the second clears
-            // _handoffPath right after the first published it, and the appended history index is
-            // resolved by size so both runs can end up writing the same entry.
-            _errorMessage.value = "A generation is already in progress"
-            return
-        }
+    /**
+     * Start a generation, reporting why not when it does not start.
+     *
+     * Returned Unit and routed all three refusals into `_errorMessage`, so `llmrpa_run` answered
+     * "Generating..." regardless and an agent then polled `llmrpa_status` and read the *previous*
+     * run's result.
+     */
+    fun generateActions(): String? {
+        // compareAndSet, not a check then a set: llmrpa_run also calls this, and the MCP handler
+        // thread is not guaranteed to be the UI thread - two calls could both pass a plain check,
+        // lose one history append, resolve the same index and race on _handoffPath.
         val instruction = _currentInstruction.value
         if (instruction.isBlank()) {
             _errorMessage.value = "Please enter an instruction"
-            return
+            return "Please enter an instruction"
         }
 
         // Ask about AI before generating. Without this the panel quietly returned its
@@ -196,10 +200,19 @@ class LlmrpaComponent(
         // the user has no way to tell that from a model that did badly.
         if (!aiAvailable()) {
             scope.launch { if (promptAiFix("Generating RPA actions")) generateActions() }
-            return
+            return "No AI provider is configured"
         }
 
-        _isGenerating.value = true
+        // Last, and with compareAndSet rather than a check then a set: llmrpa_run also calls this
+        // and the MCP handler thread is not guaranteed to be the UI thread, so two calls could both
+        // pass a plain check, lose one history append, resolve the same index and race on
+        // _handoffPath. It is taken *after* the refusals above, because those return without
+        // starting anything and must not leave the flag latched - and because the aiAvailable path
+        // re-enters this function.
+        if (!_isGenerating.compareAndSet(expect = false, update = true)) {
+            return "A generation is already in progress"
+        }
+
         _errorMessage.value = null
         // The previous plan is not this run's result. Without this, a generation that fails or
         // returns an unparseable reply leaves the card pointing at the *earlier* instruction's
@@ -210,8 +223,9 @@ class LlmrpaComponent(
             instruction = instruction,
             status = LLMExecutionStatus.GENERATING
         )
-        _executionHistory.value = _executionHistory.value + executionState
-        val historyIndex = _executionHistory.value.size - 1
+        // updateAndGet, so the append and the index that addresses it cannot disagree: reading
+        // .value, concatenating, assigning back and then taking size - 1 is three separate steps.
+        val historyIndex = _executionHistory.updateAndGet { it + executionState }.size - 1
 
         scope.launch {
             try {
@@ -229,7 +243,9 @@ class LlmrpaComponent(
                 // still has actions to show, so it belongs on this branch rather than the
                 // error-only one below. Listed explicitly, so an unrecognised status keeps
                 // falling through to the else rather than being treated as showable.
-                if (response.status in SHOWABLE_STATUSES) {
+                // Everything with a status we recognise or actions to show goes here; the else
+                // is for a response that is neither, which is nothing this plugin produces today.
+                if (response.status in SHOWABLE_STATUSES || response.configuration.isNotEmpty()) {
                     val plan = response.runnablePlan()
                     updateExecutionStatus(
                         historyIndex,
@@ -282,6 +298,8 @@ class LlmrpaComponent(
                 _isGenerating.value = false
             }
         }
+        // Started: nothing to report.
+        return null
     }
 
     private fun updateExecutionStatus(

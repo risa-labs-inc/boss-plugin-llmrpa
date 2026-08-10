@@ -131,8 +131,13 @@ tasks.register<Jar>("buildPluginJar") {
 // Sync version from build.gradle.kts into plugin.json (single source of truth)
 tasks.processResources {
     filesMatching("**/plugin.json") {
+        // Anchored to the top-level key's two-space indent. The filter is per-line and used to be
+        // unanchored, so it also rewrote the *dependency's* constraint: the shipped manifest
+        // declared the AI Gateway as "version": "1.2.0" instead of ">=1.0.3" - a constraint no
+        // gateway release satisfies. ("apiVersion"/"minApiVersion" escaped only because the regex
+        // needs a quote immediately before `version`.)
         filter { line ->
-            line.replace(Regex(""""version"\s*:\s*"[^"]*""""), """"version": "\$version"""")
+            line.replace(Regex("""^  "version"\s*:\s*"[^"]*""""), """  "version": "\$version"""")
         }
     }
 }

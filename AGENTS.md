@@ -8,7 +8,7 @@ AI-powered robotic process automation with LLM integration
 
 - **Plugin ID**: `ai.rever.boss.plugin.dynamic.llmrpa`
 - **Main Class**: `ai.rever.boss.plugin.dynamic.llmrpa.LlmrpaDynamicPlugin`
-- **API Version**: 1.0.20 · **minApiVersion**: 1.0.74 · **minBossVersion**: 9.2.63
+- **API Version**: 1.0.20 · **minApiVersion**: 1.0.75 · **minBossVersion**: 9.2.63
 
 ## AI: this plugin owns no credentials and no wire formats
 
@@ -44,7 +44,7 @@ Three things to keep right:
   provider the user has since changed or removed.
 
 There are no wire formats here any more, so the `else`-branch rule that used to matter is the
-gateway's problem. The api floor is **1.0.74**.
+gateway's problem. The api floor is **1.0.75** (the manifest is the source of truth).
 
 ### The gateway is an *optional* declared dependency
 
@@ -259,3 +259,30 @@ CI (`test.yml`, cherry-picked from `ci/add-test-workflow`) tracks api `latest`, 
 verifies the `minApiVersion` floor the manifest declares - a matrix over floor and latest would get
 both. One observed flake: `dl.google.com` failed to serve three androidx artifacts mid-run, which
 looked exactly like a resolution bug; they returned 200 immediately after and a re-run was green.
+
+### Fifth review round
+
+- **kotlinx treats a nullable field with no default as REQUIRED.** `"selector":{"type":"none"}`, or
+  an action with no `selector` at all - normal output for `navigate`, `wait`, `submit` - threw
+  `MissingFieldException`, so a reply carrying a complete plan was reported as a parse error. Every
+  field on `SelectorInfo` and all but `type` on `RpaActionConfig` have defaults now. `type` stays
+  required: an action without a verb is not an action.
+- **`status == "success"` was still exact.** Case was normalised, but `"ok"`, `"completed"` and
+  `"done"` still lost the plan. The test is inverted: the *failure* statuses are the closed set, so
+  anything unrecognised carrying actions is runnable. Status drift is this plugin's premise.
+- **The re-entrancy guard was check-then-set**, and `llmrpa_run` calls `generateActions` from a
+  thread that is not guaranteed to be the UI thread. `compareAndSet`, taken *after* the refusals so
+  a refusal cannot latch the flag, and the history append is one `updateAndGet` so the index cannot
+  disagree with the list.
+- **`llmrpa_run` reported "Generating..." for a generation that never started.** `generateActions`
+  returns the refusal and the tool relays it with `isError`.
+- The staging file is deleted when the move fails, and `AtomicMoveNotSupportedException` falls back
+  to a plain replace - a real outcome on some macOS and Windows volumes, where the alternative is
+  "could not save" forever on that machine.
+
+**`processResources` was corrupting the shipped manifest.** The filter is per-line and was
+unanchored, so it rewrote the *dependency's* constraint too: the jar declared the AI Gateway as
+`"version": "1.2.0"` instead of `">=1.0.3"` - a constraint no gateway release satisfies, which the
+host's install-time dependency check reads. Anchored on the top-level two-space indent.
+(`apiVersion`/`minApiVersion` escaped only because the regex needs a quote immediately before
+`version`.) Verify by reading `plugin.json` out of the built jar, not the source file.

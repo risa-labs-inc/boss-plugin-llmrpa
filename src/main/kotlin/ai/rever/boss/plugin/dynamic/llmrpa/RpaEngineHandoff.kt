@@ -3,6 +3,7 @@ package ai.rever.boss.plugin.dynamic.llmrpa
 import ai.rever.boss.plugin.logging.BossLogger
 import ai.rever.boss.plugin.logging.LogCategory
 import java.io.File
+import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import kotlinx.serialization.SerialName
@@ -116,12 +117,23 @@ internal object RpaEngineHandoff {
             // in the case named right above as the likely one.
             val staging = Files.createTempFile(dir.toPath(), file.name, ".part").toFile()
             staging.writeText(json.encodeToString(EngineConfiguration.serializer(), config))
-            Files.move(
-                staging.toPath(),
-                file.toPath(),
-                StandardCopyOption.ATOMIC_MOVE,
-                StandardCopyOption.REPLACE_EXISTING,
-            )
+            try {
+                Files.move(
+                    staging.toPath(),
+                    file.toPath(),
+                    StandardCopyOption.ATOMIC_MOVE,
+                    StandardCopyOption.REPLACE_EXISTING,
+                )
+            } catch (e: AtomicMoveNotSupportedException) {
+                // Real on some macOS and Windows volumes. A non-atomic replace is worse than an
+                // atomic one and far better than "could not save" forever on that machine.
+                Files.move(staging.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING)
+            } catch (e: Throwable) {
+                // Otherwise the .part file stays in the user's engine directory and the failing
+                // path (permissions, full disk) accumulates litter instead of clearing itself.
+                staging.delete()
+                throw e
+            }
             file
         }.onFailure { error ->
             // Inside its own guard: `logger` is lazy precisely so an api mismatch degrades rather

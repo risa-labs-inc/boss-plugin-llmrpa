@@ -52,8 +52,14 @@ internal class LlmrpaMcpToolProvider(
                 val instruction = args.string("instruction")
                     ?: return@McpToolHandler McpToolResult("Missing required argument: instruction", isError = true)
                 c.updateInstruction(instruction)
-                c.generateActions()
-                McpToolResult("Generating RPA actions for: $instruction")
+                // Relay the refusal. This reported "Generating..." unconditionally, so an agent
+                // then polled llmrpa_status and read the *previous* run's result.
+                val refusal = c.generateActions()
+                if (refusal == null) {
+                    McpToolResult("Generating RPA actions for: $instruction")
+                } else {
+                    McpToolResult(refusal, isError = true)
+                }
             },
         ),
     )
