@@ -1,15 +1,23 @@
 name: Tests
 
-# build.yml only fires on push to main and delegates to the release workflow,
-# so nothing compiled this plugin before a merge landed. This runs on every
-# pull request, which is what makes it usable as a required status check.
+# build.yml only fires on push to main and delegates to the release workflow, so nothing
+# compiled this plugin before a merge landed. This runs on every pull request, which is what
+# makes it usable as a required status check - and only there, since build.yml already gates
+# the release and triggering on push too compiled every merge twice.
 on:
   pull_request:
-  push:
-    branches: [main]
+
+# The job reads the repo and the api repo's public releases; nothing else.
+permissions:
+  contents: read
+
+# A PR push supersedes its own in-flight run rather than queueing behind it.
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  test:
+  build-and-test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
