@@ -32,6 +32,18 @@ data class LLMRpaResponse(
     val message: String? = null
 )
 
+
+/**
+ * The actions this response can actually be run as, or null when it cannot.
+ *
+ * Both halves matter and both were once missing. A parse failure reports `status = "error"` while
+ * still carrying whatever it managed to salvage, and callers that checked only for a non-empty
+ * list treated that as a plan: the panel showed READY and the plan was written to disk as a
+ * runnable configuration. One predicate, so the panel state, the error text and what reaches disk
+ * cannot disagree.
+ */
+fun LLMRpaResponse.runnablePlan(): List<RpaActionConfig>? =
+    configuration.takeIf { status == "success" && it.isNotEmpty() }
 /**
  * RPA Action Configuration
  */

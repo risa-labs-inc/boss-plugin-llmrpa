@@ -36,8 +36,8 @@ class RpaEngineHandoffTest {
     private val configDir: File = java.nio.file.Files.createTempDirectory("rpa-handoff").toFile()
 
     private fun written(instruction: String, actions: List<RpaActionConfig>): File {
-        val file = RpaEngineHandoff.write(instruction, actions, configDir)
-        return assertNotNull(file, "the handoff wrote nothing")
+        val result = RpaEngineHandoff.writeResult(instruction, actions, configDir)
+        return assertNotNull(result.getOrNull(), "the handoff wrote nothing: ${result.exceptionOrNull()}")
     }
 
     @kotlin.test.AfterTest
@@ -180,7 +180,10 @@ class RpaEngineHandoffTest {
 
         assertTrue(result.isFailure, "writing into a file-as-directory should not succeed")
         assertNotNull(result.exceptionOrNull(), "no cause to report to the user")
-        assertEquals(null, RpaEngineHandoff.write("anything", listOf(action("wait", null, "1")), blocker))
+        assertEquals(
+            null,
+            RpaEngineHandoff.writeResult("anything", listOf(action("wait", null, "1")), blocker).getOrNull(),
+        )
     }
 }
 
@@ -196,7 +199,7 @@ class ParseFailureTest {
 
     @Test
     fun `an unparseable reply produces no actions`() {
-        val response = LlmApiClient.parseForTest("this is not json at all")
+        val response = LlmApiClient.parseReply("this is not json at all")
 
         assertEquals("error", response.status)
         assertTrue(
@@ -213,10 +216,50 @@ class ParseFailureTest {
             "value":"https://example.com","meta":{}}],"status":"success","message":"ok"}
         """.trimIndent()
 
-        val response = LlmApiClient.parseForTest(reply)
+        val response = LlmApiClient.parseReply(reply)
 
         assertEquals("success", response.status)
         assertEquals(1, response.configuration.size)
         assertEquals("navigate", response.configuration.first().type)
+    }
+}
+
+/**
+ * [runnablePlan] is the single predicate deciding panel state, error text and what reaches disk.
+ *
+ * It exists because those three were spelled out separately and disagreed: a parse failure
+ * reported `status = "error"` while still carrying a salvaged action, and a caller checking only
+ * for a non-empty list wrote it to disk as a runnable configuration.
+ */
+class RunnablePlanTest {
+
+    private fun response(status: String, actions: Int) = LLMRpaResponse(
+        configuration = List(actions) {
+            RpaActionConfig(
+                name = "Step",
+                action_type = "default",
+                type = "wait",
+                selector = SelectorInfo(type = "none", value = null, isUnique = true),
+                value = "100",
+            )
+        },
+        status = status,
+        message = "m",
+    )
+
+    @Test
+    fun `a successful response with actions is runnable`() {
+        assertEquals(1, response("success", 1).runnablePlan()?.size)
+    }
+
+    @Test
+    fun `an error status is not runnable even when it carries actions`() {
+        // The exact shape the old fabricated `wait 1000` produced.
+        assertEquals(null, response("error", 1).runnablePlan())
+    }
+
+    @Test
+    fun `a successful response with no actions is not runnable`() {
+        assertEquals(null, response("success", 0).runnablePlan())
     }
 }

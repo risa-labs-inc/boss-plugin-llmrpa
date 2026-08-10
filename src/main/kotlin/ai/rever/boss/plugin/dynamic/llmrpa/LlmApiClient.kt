@@ -45,7 +45,7 @@ class LlmApiClient(
                     messages = listOf(AiMessage.user(buildPrompt(request))),
                 ),
             ).fold(
-                onSuccess = { reply -> parseRpaResponse(reply.text) },
+                onSuccess = { reply -> parseReply(reply.text) },
                 onFailure = { error ->
                     LLMRpaResponse(
                         configuration = emptyList(),
@@ -58,6 +58,16 @@ class LlmApiClient(
             )
     }
 
+    /**
+     * Build the generation prompt.
+     *
+     * **The verb list and the selector-type set below are a cross-repo contract.** They mirror
+     * `ActionTypes` and `SelectorTypes` in boss-plugin-rpaengine
+     * (`RpaEngineTypes.kt`, read at rpaengine 1.2.0) and its `executeRealAction` dispatch. Nothing
+     * here can pin them: when the engine gains a verb this prompt silently keeps withholding it,
+     * and when it renames one, plans fail that step inside the *other* plugin. Check that file
+     * when either list looks wrong.
+     */
     private fun buildPrompt(request: LLMRpaRequest): String {
         val instructions = request.actions.joinToString("\n") { "- ${it.instruction}" }
 
@@ -115,7 +125,6 @@ Provide only the JSON response without additional text.
         """.trimIndent()
     }
 
-    private fun parseRpaResponse(content: String): LLMRpaResponse = parseReply(content)
 
     private fun createUnconfiguredResponse(request: LLMRpaRequest): LLMRpaResponse {
         val instruction = request.actions.firstOrNull()?.instruction ?: "wait"
@@ -162,9 +171,6 @@ Provide only the JSON response without additional text.
                     message = "Failed to parse LLM response: ${e.message}",
                 )
             }
-
-        /** Test seam for [parseReply]. */
-        internal fun parseForTest(content: String): LLMRpaResponse = parseReply(content)
 
         const val SYSTEM_PROMPT =
             "You are an RPA assistant that generates browser automation actions."

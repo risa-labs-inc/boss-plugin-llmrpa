@@ -193,6 +193,10 @@ class LlmrpaComponent(
 
         _isGenerating.value = true
         _errorMessage.value = null
+        // The previous plan is not this run's result. Without this, a generation that fails or
+        // returns an unparseable reply leaves the card pointing at the *earlier* instruction's
+        // file, so the user opens the engine and runs the wrong plan believing it is the new one.
+        _handoffPath.value = null
 
         val executionState = LLMExecutionState(
             instruction = instruction,
@@ -214,23 +218,16 @@ class LlmrpaComponent(
                 val response = apiClient.callLLMApi(request)
 
                 if (response.status == "success" || response.status == "error") {
+                    val plan = response.runnablePlan()
                     updateExecutionStatus(
                         historyIndex,
-                        if (response.status == "success" && response.configuration.isNotEmpty()) {
-                            LLMExecutionStatus.READY
-                        } else {
-                            LLMExecutionStatus.ERROR
-                        },
+                        if (plan != null) LLMExecutionStatus.READY else LLMExecutionStatus.ERROR,
                         generatedActions = response.configuration,
-                        error = if (response.status == "success" && response.configuration.isNotEmpty()) {
-                            null
-                        } else {
-                            response.message
-                        },
+                        error = if (plan == null) response.message else null,
                         message = response.message
                     )
 
-                    if (response.status == "success" && response.configuration.isNotEmpty()) {
+                    if (plan != null) {
                         // Gated on the status too, not only on there being actions: a failed parse
                         // reports "error" and anything it still carries is not a plan the user
                         // asked for, so it must never reach disk as a runnable configuration.
@@ -240,7 +237,7 @@ class LlmrpaComponent(
                         // On Dispatchers.IO: scope is Main, and this is mkdirs + a file write.
                         val handoff =
                             withContext(Dispatchers.IO) {
-                                RpaEngineHandoff.writeResult(instruction, response.configuration)
+                                RpaEngineHandoff.writeResult(instruction, plan)
                             }
                         _handoffPath.value = handoff.getOrNull()?.absolutePath
                         _errorMessage.value =

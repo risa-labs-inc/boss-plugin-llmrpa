@@ -98,12 +98,12 @@ fun LlmrpaContent(component: LlmrpaComponent) {
 
                 // Where the plan went. Without this the panel gave no sign that anything left
                 // the plugin: the button says Execute, and the actions land in a directory the
-                // user was never told about.
-                if (errorMessage == null) {
-                    handoffPath?.let { path ->
-                        item {
-                            HandoffCard(path)
-                        }
+                // user was never told about. Not gated on errorMessage: the flow is cleared at
+                // the start of every generation, so it is never stale, and an unrelated error
+                // (provider settings, say) must not hide a valid plan.
+                handoffPath?.let { path ->
+                    item {
+                        HandoffCard(path)
                     }
                 }
 

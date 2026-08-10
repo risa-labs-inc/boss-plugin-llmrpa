@@ -182,3 +182,20 @@ selector and a wrapper-element click produce a plan that looks entirely reasonab
 A fixture can silently fail to discriminate. The truncation test only holds if the 40-character
 cut lands *exactly* on a separator - with any other instruction, trim-before-take and
 take-before-trim produce the same name and the test passes on the mutation it names.
+
+### Second review round
+
+- **`_handoffPath` is cleared at the start of every generation.** It was only ever written on a
+  successful write, so a following generation that failed left the card pointing at the *previous*
+  instruction's file: a green check saying "ready to run" for a plan the user did not ask for. Once
+  it is per-run, the card no longer needs gating on `errorMessage` (which also hid a valid card
+  whenever an unrelated error was showing).
+- **`LLMRpaResponse.runnablePlan()` is the single predicate** behind panel state, error text and
+  what reaches disk. Those three were spelled out separately and disagreed - which is how an
+  `"error"` response still got written as a runnable configuration.
+- The verb list and selector-type set in the prompt are a **cross-repo contract** with the engine's
+  `ActionTypes`/`SelectorTypes`. Nothing here can pin them: a new engine verb is silently withheld,
+  a renamed one fails inside the *other* plugin. The KDoc on the prompt builder names the file and
+  the version it was read from - keep it current.
+- One entry point per side effect: `write` was dropped in favour of `writeResult`, and the
+  `parseForTest`/`parseRpaResponse` aliases removed. Two doors to the same effect drift.
