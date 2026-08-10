@@ -68,7 +68,7 @@ class LlmApiClient(
      * and when it renames one, plans fail that step inside the *other* plugin. Check that file
      * when either list looks wrong.
      */
-    private fun buildPrompt(request: LLMRpaRequest): String {
+    internal fun buildPrompt(request: LLMRpaRequest): String {
         val instructions = request.actions.joinToString("\n") { "- ${it.instruction}" }
 
         return """
@@ -125,7 +125,6 @@ Provide only the JSON response without additional text.
         """.trimIndent()
     }
 
-
     private fun createUnconfiguredResponse(request: LLMRpaRequest): LLMRpaResponse {
         val instruction = request.actions.firstOrNull()?.instruction ?: "wait"
 
@@ -140,12 +139,22 @@ Provide only the JSON response without additional text.
                     meta = mapOf("note" to "Configure a provider in Settings > AI Providers")
                 )
             ),
-            status = "success",
-            message = "Example response — configure an AI provider to generate real actions"
+            // NOT "success": runnablePlan() is the sole authority for "write this to the engine's
+            // directory and tell the user it is ready to run", and this satisfied it. A plan named
+            // after the user's instruction landed on disk, the green card said "open it to load and
+            // run this plan", and running it waited one second and reported success - the same
+            // failure the fabricated parse-error action was removed for. Reaching it needs the
+            // gateway or provider to disappear between generateActions' aiAvailable() check and
+            // this call, which is a TOCTOU window rather than an impossibility.
+            status = STATUS_EXAMPLE,
+            message = "Example response - configure an AI provider to generate real actions"
         )
     }
 
     companion object {
+        /** Status of the placeholder response served when no provider is configured. */
+        internal const val STATUS_EXAMPLE = "example"
+
         private val json =
             Json {
                 ignoreUnknownKeys = true
@@ -160,10 +169,44 @@ Provide only the JSON response without additional text.
          * treated that as a plan: the panel showed READY and the handoff wrote it to disk as a
          * configuration the engine would run.
          */
+        /**
+         * The first complete JSON object in [content], or null if there is none.
+         *
+         * The previous `\{[\s\S]*\}` ran from the first brace to the **last** one in the whole
+         * reply. Reasoning models routinely close the JSON, close a code fence, and keep talking -
+         * GLM produced `...}\n```\n\nHmm, wait. Let me reconsider...` - so the greedy match
+         * swallowed the trailing prose and the parse died at the far end of it. Every action was
+         * present and correct and the whole generation was thrown away.
+         *
+         * Counts braces at depth, skipping anything inside a string literal (and whatever follows a
+         * backslash there), so a brace in a selector value cannot end the object early.
+         */
+        internal fun firstJsonObject(content: String): String? {
+            val start = content.indexOf('{')
+            if (start < 0) return null
+            var depth = 0
+            var inString = false
+            var escaped = false
+            for (i in start until content.length) {
+                val c = content[i]
+                when {
+                    escaped -> escaped = false
+                    inString && c == '\\' -> escaped = true
+                    c == '"' -> inString = !inString
+                    inString -> Unit
+                    c == '{' -> depth++
+                    c == '}' -> {
+                        depth--
+                        if (depth == 0) return content.substring(start, i + 1)
+                    }
+                }
+            }
+            return null
+        }
+
         internal fun parseReply(content: String): LLMRpaResponse =
             try {
-                val jsonMatch = Regex("""\{[\s\S]*\}""").find(content)
-                json.decodeFromString<LLMRpaResponse>(jsonMatch?.value ?: content)
+                json.decodeFromString<LLMRpaResponse>(firstJsonObject(content) ?: content)
             } catch (e: Exception) {
                 LLMRpaResponse(
                     configuration = emptyList(),

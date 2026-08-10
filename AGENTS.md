@@ -199,3 +199,32 @@ take-before-trim produce the same name and the test passes on the mutation it na
   the version it was read from - keep it current.
 - One entry point per side effect: `write` was dropped in favour of `writeResult`, and the
   `parseForTest`/`parseRpaResponse` aliases removed. Two doors to the same effect drift.
+
+### Third review round
+
+- **The JSON extraction must stop at the first *complete* object.** `\{[\s\S]*\}` ran from the
+  first brace to the last one in the whole reply, and a reasoning model closes the JSON, closes a
+  code fence and keeps talking - GLM produced `...}\n```\n\nHmm, wait. Let me reconsider...` - so
+  the match swallowed the prose and the parse died at the far end of it. Every action was present
+  and correct and the generation was thrown away. `firstJsonObject` counts braces at depth,
+  skipping string literals and escapes. This was found by *running* a generation, not by review:
+  it looked like an ordinary model failure until `llmrpa_status` reported the real reason.
+- **The unconfigured example response is not `"success"`.** It is a single `wait 1000` and it
+  satisfied `runnablePlan()`, so it landed on disk named after the user's instruction and the card
+  offered to run it. It carries `STATUS_EXAMPLE` now. Reaching it needs the provider to disappear
+  between `aiAvailable()` and the call, which is a TOCTOU window rather than an impossibility.
+- **`llmrpa_status` reports the last history entry, not just `_errorMessage`.** The latter only
+  carries a *save* failure, so a generation that produced nothing runnable reported `error=none` and
+  an agent polling it could not tell anything had gone wrong. This is what surfaced the extraction
+  bug above.
+- **The write is atomic** (`.part` sibling plus `ATOMIC_MOVE`). The engine scans that directory on
+  its own schedule, and `writeText` truncates first - so a scan landing mid-write reads half a file,
+  most likely exactly when re-running an instruction overwrites in place.
+- **The `onFailure` logger call has its own guard.** `logger` is lazy so an api mismatch degrades,
+  but the initialiser first runs inside `onFailure`, which is *outside* the `runCatching` - a
+  `NoSuchMethodError` there defeated the whole arrangement and slipped past the caller's
+  `catch (e: Exception)`.
+- `actionType` is pinned because the file must *parse*; the verb that decides what runs travels in
+  `type`, whose name agrees on both sides. The doc used to emphasise only the first.
+- `buildPrompt` is `internal` and `PromptRulesTest` asserts each selector rule and every verb is
+  still being sent. It cannot prove a rule works - only that a stray edit did not delete one.

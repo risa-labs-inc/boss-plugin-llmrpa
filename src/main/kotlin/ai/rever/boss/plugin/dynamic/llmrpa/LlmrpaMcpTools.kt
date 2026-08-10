@@ -22,12 +22,22 @@ internal class LlmrpaMcpToolProvider(
     override fun tools(): List<McpToolDefinition> = listOf(
         McpToolDefinition(
             name = "llmrpa_status",
-            description = "Report LLM RPA status (generating?, current instruction, history size, last error).",
+            description =
+                "Report LLM RPA status: whether it is generating, the last generation's outcome " +
+                    "and where its plan was written, the current instruction and history size.",
             handler = McpToolHandler {
                 val c = component() ?: return@McpToolHandler notOpen()
+                // The last history entry, not just errorMessage. errorMessage only carries a
+                // *save* failure, so a generation that produced nothing runnable reported
+                // "error=none" - an agent polling this could not tell it had failed at all.
+                val last = c.executionHistory.value.lastOrNull()
                 McpToolResult(
                     "generating=${c.isGenerating.value} history=${c.executionHistory.value.size} " +
-                        "error=${c.errorMessage.value ?: "none"}\ninstruction=${c.currentInstruction.value}"
+                        "last=${last?.status?.name ?: "none"} " +
+                        "actions=${last?.generatedActions?.size ?: 0}\n" +
+                        "plan=${c.handoffPath.value ?: "not written"}\n" +
+                        "error=${last?.error ?: c.errorMessage.value ?: "none"}\n" +
+                        "instruction=${c.currentInstruction.value}"
                 )
             },
         ),

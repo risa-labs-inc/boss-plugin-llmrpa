@@ -217,7 +217,11 @@ class LlmrpaComponent(
 
                 val response = apiClient.callLLMApi(request)
 
-                if (response.status == "success" || response.status == "error") {
+                // The example response carries its own status so runnablePlan() excludes it; it
+                // still has actions to show, so it belongs on this branch rather than the
+                // error-only one below. Listed explicitly, so an unrecognised status keeps
+                // falling through to the else rather than being treated as showable.
+                if (response.status in SHOWABLE_STATUSES) {
                     val plan = response.runnablePlan()
                     updateExecutionStatus(
                         historyIndex,
@@ -296,5 +300,10 @@ class LlmrpaComponent(
 
     fun applyQuickExample(example: String) {
         _currentInstruction.value = example
+    }
+
+    private companion object {
+        /** Statuses that carry something worth showing in the panel. */
+        val SHOWABLE_STATUSES = setOf("success", "error", LlmApiClient.STATUS_EXAMPLE)
     }
 }

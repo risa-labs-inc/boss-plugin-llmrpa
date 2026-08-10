@@ -32,7 +32,6 @@ data class LLMRpaResponse(
     val message: String? = null
 )
 
-
 /**
  * The actions this response can actually be run as, or null when it cannot.
  *
@@ -42,7 +41,7 @@ data class LLMRpaResponse(
  * runnable configuration. One predicate, so the panel state, the error text and what reaches disk
  * cannot disagree.
  */
-fun LLMRpaResponse.runnablePlan(): List<RpaActionConfig>? =
+internal fun LLMRpaResponse.runnablePlan(): List<RpaActionConfig>? =
     configuration.takeIf { status == "success" && it.isNotEmpty() }
 /**
  * RPA Action Configuration

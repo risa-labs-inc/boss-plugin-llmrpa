@@ -19,6 +19,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -566,12 +567,17 @@ private fun HandoffCard(path: String) {
                     style = MaterialTheme.typography.body2,
                     color = BossThemeColors.SuccessColor
                 )
-                Text(
-                    path,
-                    style = MaterialTheme.typography.caption,
-                    color = BossThemeColors.SuccessColor.copy(alpha = 0.8f),
-                    maxLines = 2
-                )
+                // Selectable and ellipsised: the entire point of this line is telling the user
+                // where the file is, and a long path with maxLines alone hard-clips mid-name.
+                SelectionContainer {
+                    Text(
+                        path,
+                        style = MaterialTheme.typography.caption,
+                        color = BossThemeColors.SuccessColor.copy(alpha = 0.8f),
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
             }
         }
     }

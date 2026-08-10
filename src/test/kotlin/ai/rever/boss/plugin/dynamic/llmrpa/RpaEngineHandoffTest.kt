@@ -263,3 +263,74 @@ class RunnablePlanTest {
         assertEquals(null, response("success", 0).runnablePlan())
     }
 }
+
+/**
+ * The placeholder served when no AI provider is configured must not look like a plan.
+ *
+ * It is a single `wait 1000` action, and it was labelled `status = "success"` - so it satisfied
+ * [runnablePlan], landed on disk named after the user's instruction, and the panel offered to run
+ * it. That is the fabricated-action failure again, by a different route.
+ */
+class ExampleResponseTest {
+
+    @Test
+    fun `the unconfigured example is not runnable`() {
+        val response = LlmApiClient { null }.let { client ->
+            kotlinx.coroutines.runBlocking {
+                client.callLLMApi(
+                    LLMRpaRequest(
+                        actions = listOf(LLMAction("open gmail")),
+                        sourceUrl = "https://example.com",
+                    ),
+                )
+            }
+        }
+
+        assertEquals(LlmApiClient.STATUS_EXAMPLE, response.status)
+        assertEquals(null, response.runnablePlan(), "the example would be written to disk as a plan")
+        assertTrue(response.configuration.isNotEmpty(), "it should still have something to show")
+    }
+}
+
+/** The write must be all-or-nothing, because the engine scans that directory on its own schedule. */
+class AtomicWriteTest {
+
+    private val configDir = java.nio.file.Files.createTempDirectory("atomic").toFile()
+
+    @kotlin.test.AfterTest
+    fun cleanUp() {
+        configDir.deleteRecursively()
+    }
+
+    @Test
+    fun `no staging file is left behind`() {
+        val action = RpaActionConfig(
+            name = "Step",
+            action_type = "default",
+            type = "wait",
+            selector = SelectorInfo(type = "none", value = null, isUnique = true),
+            value = "100",
+        )
+        RpaEngineHandoff.writeResult("open gmail", listOf(action), configDir).getOrThrow()
+
+        val leftovers = configDir.listFiles()?.filter { it.name.endsWith(".part") } ?: emptyList()
+        assertTrue(leftovers.isEmpty(), "left staging files: ${leftovers.map { it.name }}")
+    }
+
+    @Test
+    fun `an overwrite never leaves a truncated file`() {
+        val action = RpaActionConfig(
+            name = "Step",
+            action_type = "default",
+            type = "navigate",
+            selector = SelectorInfo(type = "none", value = null, isUnique = true),
+            value = "https://b.example",
+        )
+        repeat(3) { RpaEngineHandoff.writeResult("open gmail", listOf(action), configDir).getOrThrow() }
+
+        val file = configDir.listFiles()!!.single { it.name.endsWith(".json") }
+        // Parses, i.e. the final content is whole rather than half of a previous write.
+        val root = Json.parseToJsonElement(file.readText()).jsonObject
+        assertEquals(1, root["actions"]!!.jsonArray.size)
+    }
+}
