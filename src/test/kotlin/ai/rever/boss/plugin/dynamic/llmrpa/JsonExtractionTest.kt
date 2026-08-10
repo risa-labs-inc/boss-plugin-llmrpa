@@ -81,3 +81,47 @@ class JsonExtractionTest {
         assertTrue(response.runnablePlan() != null, "the plan should be runnable")
     }
 }
+
+/**
+ * Two more ways a correct plan used to be discarded.
+ *
+ * Both are the same shape as the greedy-brace bug: the reply contains everything needed, and a
+ * detail of how it is read throws it away.
+ */
+class ParseRobustnessTest {
+
+    private fun reply(status: String, before: String = "") = """
+        $before{"configuration":[{"name":"Go","action_type":"default","type":"navigate",
+        "selector":{"type":"none","value":null,"isUnique":true},
+        "value":"https://example.com","meta":{}}],"status":"$status","message":"ok"}
+    """.trimIndent()
+
+    @Test
+    fun `a capitalised status is still a success`() {
+        // The prompt asks for "success", but a reasoning model drifts - which is the premise of
+        // the extraction fix. Downstream compares exactly, so "Success" discarded the whole plan.
+        listOf("success", "Success", "SUCCESS", " success ").forEach { spelling ->
+            val response = LlmApiClient.parseReply(reply(spelling))
+            assertEquals("success", response.status, "status '$spelling' was not normalised")
+            assertTrue(response.runnablePlan() != null, "plan lost for status '$spelling'")
+        }
+    }
+
+    @Test
+    fun `braced prose before the json does not lose the plan`() {
+        // firstJsonObject anchors on the first brace anywhere, so an aside like this used to hand
+        // back a slice that cannot decode.
+        val response = LlmApiClient.parseReply(reply("success", "Let me think about {this} first.\n\n"))
+
+        assertEquals("success", response.status)
+        assertEquals(1, response.configuration.size)
+    }
+
+    @Test
+    fun `an unparseable reply still reports a parse error`() {
+        val response = LlmApiClient.parseReply("{not json} and {also not json}")
+
+        assertEquals("error", response.status)
+        assertTrue(response.configuration.isEmpty())
+    }
+}

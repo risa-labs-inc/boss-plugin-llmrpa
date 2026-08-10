@@ -162,13 +162,39 @@ Provide only the JSON response without additional text.
             }
 
         /**
-         * Parse an LLM reply into a response, yielding **no actions** when it cannot be read.
+         * Decode the first object in [content] that actually parses.
          *
-         * On the companion so a test can reach it without constructing a client (which needs a
-         * gateway). It used to fabricate a single `wait 1000` step on failure, and every caller
-         * treated that as a plan: the panel showed READY and the handoff wrote it to disk as a
-         * configuration the engine would run.
+         * "First balanced object" is not the contract callers want: [firstJsonObject] anchors on
+         * the first `{` anywhere in the reply, so a braced aside *before* the fenced JSON - which
+         * these models do produce - hands back a slice that cannot decode, and a perfectly good
+         * plan is discarded one brace early. Advancing to the next opening brace and retrying a
+         * bounded number of times makes it "the first decodable object" instead.
          */
+        private fun decodeFirstObject(content: String): LLMRpaResponse {
+            var from = 0
+            var lastError: Exception? = null
+            repeat(MAX_JSON_CANDIDATES) {
+                val start = content.indexOf('{', from)
+                if (start < 0) return@repeat
+                val candidate = firstJsonObject(content, start)
+                if (candidate == null) {
+                    from = start + 1
+                    return@repeat
+                }
+                try {
+                    return json.decodeFromString<LLMRpaResponse>(candidate)
+                } catch (e: Exception) {
+                    lastError = e
+                    from = start + 1
+                }
+            }
+            // No candidate decoded: let the whole reply produce the real parse error to report.
+            return lastError?.let { throw it } ?: json.decodeFromString<LLMRpaResponse>(content)
+        }
+
+        /** How many opening braces to try before giving up. */
+        private const val MAX_JSON_CANDIDATES = 8
+
         /**
          * The first complete JSON object in [content], or null if there is none.
          *
@@ -181,8 +207,8 @@ Provide only the JSON response without additional text.
          * Counts braces at depth, skipping anything inside a string literal (and whatever follows a
          * backslash there), so a brace in a selector value cannot end the object early.
          */
-        internal fun firstJsonObject(content: String): String? {
-            val start = content.indexOf('{')
+        internal fun firstJsonObject(content: String, from: Int = 0): String? {
+            val start = content.indexOf('{', from)
             if (start < 0) return null
             var depth = 0
             var inString = false
@@ -204,9 +230,21 @@ Provide only the JSON response without additional text.
             return null
         }
 
+        /**
+         * Parse an LLM reply into a response, yielding **no actions** when it cannot be read.
+         *
+         * On the companion so a test can reach it without constructing a client (which needs a
+         * gateway). It used to fabricate a single `wait 1000` step on failure, and every caller
+         * treated that as a plan: the panel showed READY and the handoff wrote it to disk as a
+         * configuration the engine would run.
+         */
         internal fun parseReply(content: String): LLMRpaResponse =
             try {
-                json.decodeFromString<LLMRpaResponse>(firstJsonObject(content) ?: content)
+                // Normalised once, here. Downstream compares against "success", and a model
+                // answering "Success" or "SUCCESS" - drift being the whole premise of the
+                // extraction fix below - would otherwise produce a complete, correct action list
+                // that is reported as an error and never reaches disk.
+                decodeFirstObject(content).let { it.copy(status = it.status.trim().lowercase()) }
             } catch (e: Exception) {
                 LLMRpaResponse(
                     configuration = emptyList(),

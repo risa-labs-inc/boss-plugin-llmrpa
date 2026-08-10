@@ -110,7 +110,11 @@ internal object RpaEngineHandoff {
             // schedule, so a plain writeText - which truncates first - lets a scan landing mid-write
             // read half a file, and re-running the same instruction overwrites in place by design,
             // which is exactly when that collision is likely.
-            val staging = File(dir, "${file.name}.part")
+            // A unique staging file per write. Derived from the instruction it was the *same*
+            // path for two concurrent runs of the same instruction, so one could move a
+            // half-written file into place - exactly the interleaving the atomic move rules out,
+            // in the case named right above as the likely one.
+            val staging = Files.createTempFile(dir.toPath(), file.name, ".part").toFile()
             staging.writeText(json.encodeToString(EngineConfiguration.serializer(), config))
             Files.move(
                 staging.toPath(),

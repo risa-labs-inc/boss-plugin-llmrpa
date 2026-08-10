@@ -43,6 +43,7 @@ data class LLMRpaResponse(
  */
 internal fun LLMRpaResponse.runnablePlan(): List<RpaActionConfig>? =
     configuration.takeIf { status == "success" && it.isNotEmpty() }
+
 /**
  * RPA Action Configuration
  */
@@ -74,6 +75,8 @@ data class LLMExecutionState(
     val status: LLMExecutionStatus,
     val generatedActions: List<RpaActionConfig> = emptyList(),
     val error: String? = null,
+    /** The model's own explanation of what the plan does. Was passed around and then discarded. */
+    val message: String? = null,
     val timestamp: Long = System.currentTimeMillis()
 )
 

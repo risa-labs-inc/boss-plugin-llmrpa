@@ -1,6 +1,7 @@
 package ai.rever.boss.plugin.dynamic.llmrpa
 
 import kotlin.test.Test
+import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 /**
@@ -20,13 +21,25 @@ class PromptRulesTest {
         )
 
     @Test
-    fun `every verb the engine implements is offered`() {
-        listOf(
-            "navigate", "click", "input", "select", "wait", "scroll", "keypress", "submit",
-            "assert", "run_script",
-        ).forEach {
-            assertTrue(prompt.contains(it), "verb '$it' is not offered to the model")
-        }
+    fun `the offered verbs are exactly the ones the engine implements`() {
+        // Set equality on the "Available action types:" line, not `contains` over the whole
+        // prompt. `contains("select")` matches "CSS selectors", `contains("submit")` matches the
+        // submit rule, `contains("input")` matches the typing rule - so deleting those from the
+        // verb list left the test green. It survived the mutation it was named for.
+        val line =
+            prompt.lineSequence()
+                .first { it.startsWith("Available action types:") }
+                .removePrefix("Available action types:")
+        val offered = line.split(",").map { it.trim() }.filter { it.isNotEmpty() }.toSet()
+
+        assertEquals(
+            setOf(
+                "navigate", "click", "input", "select", "wait", "scroll", "keypress", "submit",
+                "assert", "run_script",
+            ),
+            offered,
+            "the verb list no longer matches the engine's dispatch table",
+        )
     }
 
     @Test

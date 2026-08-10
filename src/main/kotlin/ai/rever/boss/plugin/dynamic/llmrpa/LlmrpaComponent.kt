@@ -15,6 +15,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
@@ -177,6 +178,13 @@ class LlmrpaComponent(
      * Generate RPA actions from natural language instruction
      */
     fun generateActions() {
+        if (_isGenerating.value) {
+            // Two concurrent generations collide in several places at once: the second clears
+            // _handoffPath right after the first published it, and the appended history index is
+            // resolved by size so both runs can end up writing the same entry.
+            _errorMessage.value = "A generation is already in progress"
+            return
+        }
         val instruction = _currentInstruction.value
         if (instruction.isBlank()) {
             _errorMessage.value = "Please enter an instruction"
@@ -283,14 +291,28 @@ class LlmrpaComponent(
         error: String? = null,
         message: String? = null
     ) {
-        val history = _executionHistory.value.toMutableList()
-        if (index < history.size) {
-            history[index] = history[index].copy(
-                status = status,
-                generatedActions = if (generatedActions.isNotEmpty()) generatedActions else history[index].generatedActions,
-                error = error ?: history[index].error
-            )
-            _executionHistory.value = history
+        // update, not read-modify-write on .value: two interleaved callers could otherwise lose
+        // an append and then both write the same index.
+        _executionHistory.update { current ->
+            if (index >= current.size) {
+                current
+            } else {
+                current.toMutableList().also { history ->
+                    history[index] = history[index].copy(
+                        status = status,
+                        generatedActions =
+                            if (generatedActions.isNotEmpty()) {
+                                generatedActions
+                            } else {
+                                history[index].generatedActions
+                            },
+                        error = error ?: history[index].error,
+                        // Was accepted and dropped on the floor, so the model's explanation of
+                        // what the plan does never reached the panel or llmrpa_status.
+                        message = message ?: history[index].message,
+                    )
+                }
+            }
         }
     }
 

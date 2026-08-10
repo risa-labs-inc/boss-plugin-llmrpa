@@ -228,3 +228,34 @@ take-before-trim produce the same name and the test passes on the mutation it na
   `type`, whose name agrees on both sides. The doc used to emphasise only the first.
 - `buildPrompt` is `internal` and `PromptRulesTest` asserts each selector rule and every verb is
   still being sent. It cannot prove a rule works - only that a stray edit did not delete one.
+
+### Fourth review round
+
+Three more routes by which a complete, correct plan was thrown away. That is the failure mode of
+this plugin; assume any new comparison or extraction is another instance until shown otherwise.
+
+- **Status was compared exactly.** `status == "success"` against a model that answers `"Success"`.
+  Normalised once at the parse boundary (`trim().lowercase()`), because doing it at each comparison
+  is what `runnablePlan()` exists to prevent.
+- **The extraction anchored on the first `{` anywhere.** A braced aside before the fenced JSON
+  handed back an undecodable slice. The contract is now "the first *decodable* object": advance to
+  the next opening brace and retry, bounded.
+- **`updateExecutionStatus`'s `message` was accepted and dropped**, so the model's explanation never
+  reached the panel or `llmrpa_status`.
+
+Also: `generateActions` refuses a second concurrent run - two of them collide on the staging file,
+on `_handoffPath`, and on a history index resolved by `size` after a non-atomic append (now
+`update`). The staging file is `Files.createTempFile` per write, since deriving it from the
+instruction gave two runs of the *same* instruction the same path - the interleaving the atomic move
+exists to rule out.
+
+**A `contains` assertion over a whole prompt is close to worthless.** `PromptRulesTest`'s verb check
+passed while `select` and `submit` were deleted from the verb list, because "CSS selectors" and the
+submit rule carry those substrings. It now parses the `Available action types:` line and asserts set
+equality, which also catches a verb offered here that the engine does not implement.
+
+CI (`test.yml`, cherry-picked from `ci/add-test-workflow`) tracks api `latest`, matching
+`plugin-release.yml`. That means an unrelated api release can redden every open PR, and nothing
+verifies the `minApiVersion` floor the manifest declares - a matrix over floor and latest would get
+both. One observed flake: `dl.google.com` failed to serve three androidx artifacts mid-run, which
+looked exactly like a resolution bug; they returned 200 immediately after and a re-run was green.

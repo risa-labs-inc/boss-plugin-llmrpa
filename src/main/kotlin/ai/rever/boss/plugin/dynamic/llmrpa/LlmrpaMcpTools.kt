@@ -36,6 +36,7 @@ internal class LlmrpaMcpToolProvider(
                         "last=${last?.status?.name ?: "none"} " +
                         "actions=${last?.generatedActions?.size ?: 0}\n" +
                         "plan=${c.handoffPath.value ?: "not written"}\n" +
+                        "message=${last?.message ?: "none"}\n" +
                         "error=${last?.error ?: c.errorMessage.value ?: "none"}\n" +
                         "instruction=${c.currentInstruction.value}"
                 )
