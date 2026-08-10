@@ -157,3 +157,28 @@ watching a run fail:
 
 Verify a prompt change by generating and *running*, not by reading the plan. Both a stale-URL
 selector and a wrapper-element click produce a plan that looks entirely reasonable on disk.
+
+### Decisions worth keeping
+
+- `testImplementation` **must** branch on `useLocalDependencies` exactly like the `compileOnly`
+  above it. `newestApiJar`'s provider `error()`s when the sibling checkout is absent, which is the
+  CI case, and `tasks.build` resolves the test compile classpath - so an unconditional local jar
+  there fails the *release*, not just a test run.
+- The handoff writes with `explicitNulls = false`. Another plugin parses this file, and kotlinx
+  throws on an explicit `null` for a non-nullable-with-default field: if the engine ever gives
+  `value` a default, every action without one (`submit`, a bare `wait`) would make the whole file
+  unreadable.
+- The filename carries a hash of the full instruction. The slug is capped at 40 characters, so
+  two different instructions ("…invoices from january" / "…from february") truncate to the same
+  name and the second write would silently replace the first plan. Truncating *before* trimming
+  also matters, or a cut landing on a separator leaves a trailing hyphen.
+- `BossLogger.forComponent` is resolved lazily. An api symbol resolved in an object initializer
+  raises `NoSuchMethodError` on a host built against a different api revision, and an `Error`
+  slips straight past `catch (e: Exception)` around the caller.
+- `handoffPath` is rendered (`HandoffCard`). A public flow with no consumer is the bug it was
+  meant to fix: the plan lands in a directory the user was never told about, and the button still
+  says "Execute".
+
+A fixture can silently fail to discriminate. The truncation test only holds if the 40-character
+cut lands *exactly* on a separator - with any other instruction, trim-before-take and
+take-before-trim produce the same name and the test passes on the mutation it names.

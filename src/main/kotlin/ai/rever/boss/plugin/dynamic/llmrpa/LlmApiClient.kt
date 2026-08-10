@@ -27,11 +27,6 @@ class LlmApiClient(
     // example responses forever - so the compiler enforces the wiring instead.
     private val gateway: () -> AiGatewayAPI?,
 ) {
-    private val json =
-        Json {
-            ignoreUnknownKeys = true
-            isLenient = true
-        }
 
     /**
      * Generate actions for [request].
@@ -120,27 +115,7 @@ Provide only the JSON response without additional text.
         """.trimIndent()
     }
 
-    private fun parseRpaResponse(content: String): LLMRpaResponse {
-        return try {
-            val jsonMatch = Regex("""\{[\s\S]*\}""").find(content)
-            val jsonString = jsonMatch?.value ?: content
-            json.decodeFromString<LLMRpaResponse>(jsonString)
-        } catch (e: Exception) {
-            LLMRpaResponse(
-                configuration = listOf(
-                    RpaActionConfig(
-                        name = "Wait",
-                        action_type = "default",
-                        type = "wait",
-                        selector = SelectorInfo(type = "none", value = null),
-                        value = "1000"
-                    )
-                ),
-                status = "error",
-                message = "Failed to parse LLM response: ${e.message}"
-            )
-        }
-    }
+    private fun parseRpaResponse(content: String): LLMRpaResponse = parseReply(content)
 
     private fun createUnconfiguredResponse(request: LLMRpaRequest): LLMRpaResponse {
         val instruction = request.actions.firstOrNull()?.instruction ?: "wait"
@@ -161,7 +136,36 @@ Provide only the JSON response without additional text.
         )
     }
 
-    private companion object {
+    companion object {
+        private val json =
+            Json {
+                ignoreUnknownKeys = true
+                isLenient = true
+            }
+
+        /**
+         * Parse an LLM reply into a response, yielding **no actions** when it cannot be read.
+         *
+         * On the companion so a test can reach it without constructing a client (which needs a
+         * gateway). It used to fabricate a single `wait 1000` step on failure, and every caller
+         * treated that as a plan: the panel showed READY and the handoff wrote it to disk as a
+         * configuration the engine would run.
+         */
+        internal fun parseReply(content: String): LLMRpaResponse =
+            try {
+                val jsonMatch = Regex("""\{[\s\S]*\}""").find(content)
+                json.decodeFromString<LLMRpaResponse>(jsonMatch?.value ?: content)
+            } catch (e: Exception) {
+                LLMRpaResponse(
+                    configuration = emptyList(),
+                    status = "error",
+                    message = "Failed to parse LLM response: ${e.message}",
+                )
+            }
+
+        /** Test seam for [parseReply]. */
+        internal fun parseForTest(content: String): LLMRpaResponse = parseReply(content)
+
         const val SYSTEM_PROMPT =
             "You are an RPA assistant that generates browser automation actions."
     }

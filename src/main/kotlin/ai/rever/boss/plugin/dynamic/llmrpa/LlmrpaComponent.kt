@@ -18,6 +18,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 private const val AI_PROVIDERS_SETTINGS_SECTION = "LLM_PROVIDERS"
 
@@ -215,25 +216,45 @@ class LlmrpaComponent(
                 if (response.status == "success" || response.status == "error") {
                     updateExecutionStatus(
                         historyIndex,
-                        if (response.configuration.isNotEmpty()) LLMExecutionStatus.READY else LLMExecutionStatus.ERROR,
+                        if (response.status == "success" && response.configuration.isNotEmpty()) {
+                            LLMExecutionStatus.READY
+                        } else {
+                            LLMExecutionStatus.ERROR
+                        },
                         generatedActions = response.configuration,
-                        error = if (response.configuration.isEmpty()) response.message else null,
+                        error = if (response.status == "success" && response.configuration.isNotEmpty()) {
+                            null
+                        } else {
+                            response.message
+                        },
                         message = response.message
                     )
 
-                    if (response.configuration.isNotEmpty()) {
+                    if (response.status == "success" && response.configuration.isNotEmpty()) {
+                        // Gated on the status too, not only on there being actions: a failed parse
+                        // reports "error" and anything it still carries is not a plan the user
+                        // asked for, so it must never reach disk as a runnable configuration.
                         // Hand the plan to the RPA Engine, which loads configurations from disk.
                         // Without this the actions were generated and then had no consumer at
                         // all - the button said Execute and nothing could run what it produced.
-                        val written = RpaEngineHandoff.write(instruction, response.configuration)
-                        _handoffPath.value = written?.absolutePath
-                        _errorMessage.value =
-                            if (written != null) {
-                                null
-                            } else {
-                                "Generated the actions but could not save them for the RPA Engine."
+                        // On Dispatchers.IO: scope is Main, and this is mkdirs + a file write.
+                        val handoff =
+                            withContext(Dispatchers.IO) {
+                                RpaEngineHandoff.writeResult(instruction, response.configuration)
                             }
-                        _currentInstruction.value = ""
+                        _handoffPath.value = handoff.getOrNull()?.absolutePath
+                        _errorMessage.value =
+                            handoff.exceptionOrNull()?.let { cause ->
+                                // Name the reason. "Could not save them" with the cause only in
+                                // the log left the user nothing to act on.
+                                "Generated the actions but could not save them for the RPA " +
+                                    "Engine: ${cause.message ?: cause::class.simpleName}"
+                            }
+                        // Only clear the field on success - otherwise the text they would retry
+                        // with is gone.
+                        if (handoff.isSuccess) {
+                            _currentInstruction.value = ""
+                        }
                     }
                 } else {
                     updateExecutionStatus(

@@ -24,9 +24,15 @@ import kotlinx.serialization.json.Json
  * of it.
  */
 internal object RpaEngineHandoff {
-    private val logger = BossLogger.forComponent("LlmRpaHandoff")
+    // Lazy: an api-provided symbol resolved in an object initializer fails with NoSuchMethodError
+    // on a host built against a different api revision, and an Error slips straight past the
+    // `catch (e: Exception)` around the caller, taking the coroutine down.
+    private val logger by lazy { BossLogger.forComponent("LlmRpaHandoff") }
 
-    private val json = Json { prettyPrint = true; encodeDefaults = true }
+    // explicitNulls = false because another plugin parses this. kotlinx throws on an explicit
+    // null for a non-nullable-with-default field, so if the engine ever gives `value` a default,
+    // every action without a value (submit, a bare wait) would make the whole file unreadable.
+    private val json = Json { prettyPrint = true; encodeDefaults = true; explicitNulls = false }
 
     /**
      * Where the engine looks first. Created on demand, as the engine itself does.
@@ -57,8 +63,13 @@ internal object RpaEngineHandoff {
     @Serializable
     private data class EngineAction(
         val name: String = "",
+        // Pinned explicitly: this is the *engine's* field name, and renaming the property to
+        // match this plugin's own model would silently change the on-disk format.
         @SerialName("actionType") val actionType: String = "default",
         val type: String,
+        // SelectorInfo is shared with this plugin's own model on purpose: both sides agree on
+        // type/value/isUnique, and mirroring it would mean maintaining two identical shapes.
+        // A rename there does change the on-disk format, so it is a deliberate coupling.
         val selector: SelectorInfo,
         val value: String? = null,
         val meta: Map<String, String>? = null,
@@ -68,13 +79,26 @@ internal object RpaEngineHandoff {
      * Write [actions] as a configuration named after [instruction].
      *
      * Returns the file, or null when writing failed - the caller reports that rather than leaving
-     * the user to wonder why the engine's list is empty.
+     * the user to wonder why the engine's list is empty. Use [writeResult] to show *why* it failed.
      */
     fun write(
         instruction: String,
         actions: List<RpaActionConfig>,
         configDir: File = defaultConfigDir,
-    ): File? =
+    ): File? = writeResult(instruction, actions, configDir).getOrNull()
+
+    /**
+     * As [write], but keeps the failure so the caller can name it to the user.
+     *
+     * `runCatching` here catches [Throwable], which is deliberate for a best-effort side channel:
+     * a `NoClassDefFoundError` from a host/api mismatch should degrade to "could not save" rather
+     * than take the generating coroutine down with it.
+     */
+    fun writeResult(
+        instruction: String,
+        actions: List<RpaActionConfig>,
+        configDir: File = defaultConfigDir,
+    ): Result<File> =
         runCatching {
             val dir = configDir.apply { mkdirs() }
             val file = File(dir, "${safeName(instruction)}.json")
@@ -92,7 +116,7 @@ internal object RpaEngineHandoff {
                 "Could not write the generated plan for the RPA Engine",
                 mapOf("error" to (error.message ?: "unknown")),
             )
-        }.getOrNull()
+        }
 
     private fun RpaActionConfig.toEngineAction() =
         EngineAction(
@@ -108,15 +132,25 @@ internal object RpaEngineHandoff {
      * A filename from an instruction: word characters only, so nothing in a sentence can name a
      * path or collide with the engine's own settings file.
      */
+    /**
+     * A filename for [instruction]: a readable slug plus a hash of the whole instruction.
+     *
+     * `take` runs *before* `trim`, so a cut landing on a separator does not leave a trailing
+     * hyphen. The hash is what keeps the name honest: the slug is capped at
+     * [MAX_SLUG_CHARS], so "…invoices from january" and "…invoices from february" truncate to
+     * the same characters and the second write would silently replace the first plan in the
+     * user's engine list. Re-running the *same* instruction still overwrites itself, which is
+     * what you want.
+     */
     private fun safeName(instruction: String): String {
         val slug =
             instruction
                 .lowercase()
                 .replace(Regex("[^a-z0-9]+"), "-")
-                .trim('-')
                 .take(MAX_SLUG_CHARS)
+                .trim('-')
                 .ifBlank { "plan" }
-        return "llm-rpa-$slug"
+        return "llm-rpa-$slug-${instruction.hashCode().toUInt().toString(radix = 16)}"
     }
 
     private const val MAX_SLUG_CHARS = 40

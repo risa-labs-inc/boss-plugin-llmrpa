@@ -8,7 +8,7 @@ plugins {
 }
 
 group = "ai.rever.boss.plugin.dynamic"
-version = "1.1.6"
+version = "1.2.0"
 
 java {
     toolchain {
@@ -95,8 +95,16 @@ dependencies {
     // BossLogger binds it at class-init and every class holding a logger would otherwise fail
     // with NoClassDefFoundError.
     testImplementation(kotlin("test"))
-    testImplementation(files(newestApiJar))
-    testImplementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
+    // Must branch exactly like the compileOnly above: newestApiJar's provider error()s when the
+    // sibling checkout is absent, which is the CI case, and `build` resolves the test classpath -
+    // so an unconditional local jar here fails the release, not just a test run.
+    testImplementation(
+        if (useLocalDependencies) {
+            files(newestApiJar)
+        } else {
+            files("build/downloaded-deps/boss-plugin-api.jar")
+        }
+    )
     testRuntimeOnly("org.slf4j:slf4j-simple:2.0.17")
 }
 

@@ -103,6 +103,120 @@ class RpaEngineHandoffTest {
     fun `a blank instruction still yields a usable filename`() {
         val file = written("   ", listOf(action("wait", null, "100")))
 
-        assertEquals("llm-rpa-plan.json", file.name)
+        assertTrue(file.name.startsWith("llm-rpa-plan-"), "unusable name: ${file.name}")
+        assertTrue(file.name.endsWith(".json"), "not a json file: ${file.name}")
+    }
+
+    @Test
+    fun `two instructions that truncate alike get different files`() {
+        // The slug is capped, so these share every character it keeps. Without the hash the
+        // second write silently replaces the first plan in the user's engine list.
+        val a = written(
+            "open gmail and search for all the invoices from january last year",
+            listOf(action("navigate", null, "https://mail.google.com")),
+        )
+        val b = written(
+            "open gmail and search for all the invoices from february last year",
+            listOf(action("navigate", null, "https://mail.google.com")),
+        )
+
+        assertTrue(a.name != b.name, "both instructions wrote to ${a.name}")
+        assertTrue(a.exists() && b.exists(), "one file replaced the other")
+    }
+
+    @Test
+    fun `re-running the same instruction overwrites its own file`() {
+        val first = written("open gmail", listOf(action("navigate", null, "https://a.example")))
+        val second = written("open gmail", listOf(action("navigate", null, "https://b.example")))
+
+        assertEquals(first.name, second.name, "the same instruction should reuse its file")
+        assertEquals(1, configDir.listFiles()?.size, "left a duplicate behind")
+        assertTrue(second.readText().contains("b.example"), "did not overwrite the contents")
+    }
+
+    @Test
+    fun `a truncated slug does not end on a separator`() {
+        // Chosen so the 40-character cut lands exactly on a hyphen: the slug of this instruction
+        // is "open-the-reporting-dashboard-and-export-|every". Trimming *before* truncating
+        // leaves that hyphen in the filename.
+        val file = written(
+            "open the reporting dashboard and export every",
+            listOf(action("navigate", null, "https://a.example")),
+        )
+
+        val slug = file.name.removePrefix("llm-rpa-").substringBeforeLast("-")
+        assertTrue(!slug.endsWith("-"), "cut landed on a separator: ${file.name}")
+    }
+
+    @Test
+    fun `the envelope carries the instruction as name and description`() {
+        val file = written("search for cats", listOf(action("wait", null, "100")))
+
+        val root = Json.parseToJsonElement(file.readText()).jsonObject
+        assertEquals("search for cats", root["name"]?.jsonPrimitive?.content)
+        assertTrue(
+            root["description"]?.jsonPrimitive?.content?.contains("search for cats") == true,
+            "description does not name the instruction: ${root["description"]}",
+        )
+    }
+
+    @Test
+    fun `meta is passed through`() {
+        val withMeta = action("click", "[name='q']").copy(meta = mapOf("note" to "kept"))
+        val file = written("click something", listOf(withMeta))
+
+        val first = Json.parseToJsonElement(file.readText()).jsonObject["actions"]!!
+            .jsonArray.first().jsonObject
+        assertEquals("kept", first["meta"]?.jsonObject?.get("note")?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun `writeResult reports the reason instead of only null`() {
+        // A file where the directory must go: mkdirs cannot create it, so the write must fail
+        // with something the caller can show, not a bare null.
+        val blocker = File(configDir, "blocked").apply { writeText("not a directory") }
+
+        val result = RpaEngineHandoff.writeResult("anything", listOf(action("wait", null, "1")), blocker)
+
+        assertTrue(result.isFailure, "writing into a file-as-directory should not succeed")
+        assertNotNull(result.exceptionOrNull(), "no cause to report to the user")
+        assertEquals(null, RpaEngineHandoff.write("anything", listOf(action("wait", null, "1")), blocker))
+    }
+}
+
+/**
+ * An unparseable reply must yield no actions.
+ *
+ * The parser used to fabricate a single `wait 1000` step on a parse failure. Every caller then
+ * treated that as a plan: the panel showed READY and the handoff wrote it to disk as a
+ * configuration the engine would run. A run of "your automation" that waits one second and
+ * reports success is worse than a visible failure.
+ */
+class ParseFailureTest {
+
+    @Test
+    fun `an unparseable reply produces no actions`() {
+        val response = LlmApiClient.parseForTest("this is not json at all")
+
+        assertEquals("error", response.status)
+        assertTrue(
+            response.configuration.isEmpty(),
+            "fabricated ${response.configuration.size} action(s): ${response.configuration}",
+        )
+    }
+
+    @Test
+    fun `a well-formed reply is parsed`() {
+        val reply = """
+            {"configuration":[{"name":"Go","action_type":"default","type":"navigate",
+            "selector":{"type":"none","value":null,"isUnique":true},
+            "value":"https://example.com","meta":{}}],"status":"success","message":"ok"}
+        """.trimIndent()
+
+        val response = LlmApiClient.parseForTest(reply)
+
+        assertEquals("success", response.status)
+        assertEquals(1, response.configuration.size)
+        assertEquals("navigate", response.configuration.first().type)
     }
 }
