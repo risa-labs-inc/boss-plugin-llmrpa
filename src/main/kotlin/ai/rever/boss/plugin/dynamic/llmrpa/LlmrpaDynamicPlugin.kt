@@ -13,7 +13,11 @@ import com.arkivanov.essenty.lifecycle.doOnDestroy
 class LlmrpaDynamicPlugin : DynamicPlugin {
     override val pluginId: String = "ai.rever.boss.plugin.dynamic.llmrpa"
     override val displayName: String = "LLM RPA (Dynamic)"
-    override val version: String = "1.0.5"
+    // From the manifest, which processResources syncs from build.gradle.kts. Hardcoded, this said
+    // 1.0.5 while the build said 1.2.0 - the resource filter does not touch Kotlin sources - and
+    // this is the value the class reports at runtime. Only the manifest naming this plugin id is
+    // accepted: every BOSS plugin ships plugin.json at the same resource path.
+    override val version: String = manifestVersion()
     override val description: String = "AI-powered robotic process automation"
     override val author: String = "Risa Labs"
     override val url: String = "https://github.com/risa-labs-inc/boss-plugin-llmrpa"
@@ -63,4 +67,17 @@ class LlmrpaDynamicPlugin : DynamicPlugin {
     override fun dispose() {
         lastComponent = null
     }
+
+    private fun manifestVersion(): String =
+        runCatching {
+            javaClass.classLoader
+                ?.getResources("META-INF/boss-plugin/plugin.json")
+                ?.asSequence()
+                ?.mapNotNull { url -> runCatching { url.readText() }.getOrNull() }
+                ?.firstOrNull { text -> field(text, "pluginId") == pluginId }
+                ?.let { text -> field(text, "version") }
+        }.getOrNull() ?: "unknown"
+
+    private fun field(manifest: String, name: String): String? =
+        Regex(""""$name"\s*:\s*"([^"]+)"""").find(manifest)?.groupValues?.get(1)
 }

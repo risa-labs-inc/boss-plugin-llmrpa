@@ -8,7 +8,7 @@ plugins {
 }
 
 group = "ai.rever.boss.plugin.dynamic"
-version = "1.1.6"
+version = "1.2.0"
 
 java {
     toolchain {
@@ -90,6 +90,22 @@ dependencies {
 
     // Serialization
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.8.0")
+
+    // The api is compileOnly, so the test source set brings it back itself; slf4j because
+    // BossLogger binds it at class-init and every class holding a logger would otherwise fail
+    // with NoClassDefFoundError.
+    testImplementation(kotlin("test"))
+    // Must branch exactly like the compileOnly above: newestApiJar's provider error()s when the
+    // sibling checkout is absent, which is the CI case, and `build` resolves the test classpath -
+    // so an unconditional local jar here fails the release, not just a test run.
+    testImplementation(
+        if (useLocalDependencies) {
+            files(newestApiJar)
+        } else {
+            files("build/downloaded-deps/boss-plugin-api.jar")
+        }
+    )
+    testRuntimeOnly("org.slf4j:slf4j-simple:2.0.17")
 }
 
 // Task to build plugin JAR with compiled classes only
@@ -115,8 +131,13 @@ tasks.register<Jar>("buildPluginJar") {
 // Sync version from build.gradle.kts into plugin.json (single source of truth)
 tasks.processResources {
     filesMatching("**/plugin.json") {
+        // Anchored to the top-level key's two-space indent. The filter is per-line and used to be
+        // unanchored, so it also rewrote the *dependency's* constraint: the shipped manifest
+        // declared the AI Gateway as "version": "1.2.0" instead of ">=1.0.3" - a constraint no
+        // gateway release satisfies. ("apiVersion"/"minApiVersion" escaped only because the regex
+        // needs a quote immediately before `version`.)
         filter { line ->
-            line.replace(Regex(""""version"\s*:\s*"[^"]*""""), """"version": "\$version"""")
+            line.replace(Regex("""^  "version"\s*:\s*"[^"]*""""), """  "version": "\$version"""")
         }
     }
 }
@@ -137,4 +158,8 @@ tasks.register<Jar>("shadowJar") {
     from(configurations.runtimeClasspath.get().map { if (it.isDirectory) it else zipTree(it) })
     from(sourceSets.main.get().output)
     from("src/main/resources")
+}
+
+tasks.test {
+    useJUnitPlatform()
 }

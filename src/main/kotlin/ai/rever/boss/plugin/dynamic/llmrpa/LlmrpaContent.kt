@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
@@ -35,6 +36,7 @@ fun LlmrpaContent(component: LlmrpaComponent) {
     val history by component.executionHistory.collectAsState()
     val showSettings by component.showSettings.collectAsState()
     val errorMessage by component.errorMessage.collectAsState()
+    val handoffPath by component.handoffPath.collectAsState()
 
     BossTheme {
         Surface(
@@ -92,6 +94,17 @@ fun LlmrpaContent(component: LlmrpaComponent) {
                 errorMessage?.let { error ->
                     item {
                         ErrorCard(error) { component.clearError() }
+                    }
+                }
+
+                // Where the plan went. Without this the panel gave no sign that anything left
+                // the plugin: the button says Execute, and the actions land in a directory the
+                // user was never told about. Not gated on errorMessage: the flow is cleared at
+                // the start of every generation, so it is never stale, and an unrelated error
+                // (provider settings, say) must not hide a valid plan.
+                handoffPath?.let { path ->
+                    item {
+                        HandoffCard(path)
                     }
                 }
 
@@ -520,6 +533,53 @@ private fun QuickChip(text: String, onClick: () -> Unit) {
             style = MaterialTheme.typography.caption,
             color = MaterialTheme.colors.primary
         )
+    }
+}
+
+/**
+ * Where the generated plan was saved, and what to do with it next.
+ *
+ * The plan is written for the RPA Engine to load, which is a different panel - so without this
+ * the panel showed a list of actions and no indication that anything runnable exists, or where.
+ */
+@Composable
+private fun HandoffCard(path: String) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(8.dp),
+        backgroundColor = BossThemeColors.SuccessColor.copy(alpha = 0.1f),
+        elevation = 1.dp
+    ) {
+        Row(
+            modifier = Modifier.padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                Icons.Default.CheckCircle,
+                contentDescription = null,
+                tint = BossThemeColors.SuccessColor,
+                modifier = Modifier.size(20.dp)
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    "Saved for the RPA Engine - open it to load and run this plan",
+                    style = MaterialTheme.typography.body2,
+                    color = BossThemeColors.SuccessColor
+                )
+                // Selectable and ellipsised: the entire point of this line is telling the user
+                // where the file is, and a long path with maxLines alone hard-clips mid-name.
+                SelectionContainer {
+                    Text(
+                        path,
+                        style = MaterialTheme.typography.caption,
+                        color = BossThemeColors.SuccessColor.copy(alpha = 0.8f),
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+        }
     }
 }
 

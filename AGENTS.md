@@ -8,7 +8,7 @@ AI-powered robotic process automation with LLM integration
 
 - **Plugin ID**: `ai.rever.boss.plugin.dynamic.llmrpa`
 - **Main Class**: `ai.rever.boss.plugin.dynamic.llmrpa.LlmrpaDynamicPlugin`
-- **API Version**: 1.0.20 · **minApiVersion**: 1.0.74 · **minBossVersion**: 9.2.63
+- **API Version**: 1.0.20 · **minApiVersion**: 1.0.75 · **minBossVersion**: 9.2.63
 
 ## AI: this plugin owns no credentials and no wire formats
 
@@ -44,7 +44,7 @@ Three things to keep right:
   provider the user has since changed or removed.
 
 There are no wire formats here any more, so the `else`-branch rule that used to matter is the
-gateway's problem. The api floor is **1.0.74**.
+gateway's problem. The api floor is **1.0.75** (the manifest is the source of truth).
 
 ### The gateway is an *optional* declared dependency
 
@@ -126,3 +126,186 @@ Pushes to `main` trigger the release workflow which:
 3. Publishes to the BOSS Plugin Store
 
 The workflow is defined in `.github/workflows/build.yml` and delegates to the shared workflow in `risa-labs-inc/BossConsole-Releases`.
+
+## Handoff to the RPA Engine
+
+Generating a plan was the whole plugin: the result was rendered and then dropped. `RpaEngineHandoff`
+writes it to `~/.boss/config/rpaengine/llm-rpa-<slug>.json`, which the RPA Engine scans, so
+`rpa_load` + `rpa_run` can execute it.
+
+The envelope must match the engine's `RpaConfiguration`: `name`, `description`, `actions`, and each
+action's `actionType` (**not** `action_type` - that is the field name in the LLM's JSON, and the
+engine will not read it).
+
+`write()` takes `configDir` as a parameter with a default. That is not gratuitous: the tests
+originally wrote into the real `~/.boss/config/rpaengine` and left junk configurations in the
+user's engine list.
+
+## Selector guidance in the prompt is load-bearing
+
+The prompt's selector rules are what make a generated plan runnable, and each one was added after
+watching a run fail:
+
+- **Attribute-only CSS, never tag-qualified.** The model emitted `input[name='q']`; Google's search
+  box is a `textarea`. The tag is the part most often wrong, the attribute holds. (The engine also
+  retries with the tag stripped, and logs it - but the plan should be right.)
+- **`text` selectors for links and tabs, never `href*=` on query parameters.** The model emitted
+  `a[href*='tbm=isch']` for Google Images, which has used `udm=2` for some time. A visible label
+  does not change on Google's schedule.
+- **No site-internal `data-*` attributes; prefer ARIA landmarks.** `[data-ils]` matched nothing;
+  `[role='main'] img` is the first image result.
+
+Verify a prompt change by generating and *running*, not by reading the plan. Both a stale-URL
+selector and a wrapper-element click produce a plan that looks entirely reasonable on disk.
+
+### Decisions worth keeping
+
+- `testImplementation` **must** branch on `useLocalDependencies` exactly like the `compileOnly`
+  above it. `newestApiJar`'s provider `error()`s when the sibling checkout is absent, which is the
+  CI case, and `tasks.build` resolves the test compile classpath - so an unconditional local jar
+  there fails the *release*, not just a test run.
+- The handoff writes with `explicitNulls = false`. Another plugin parses this file, and kotlinx
+  throws on an explicit `null` for a non-nullable-with-default field: if the engine ever gives
+  `value` a default, every action without one (`submit`, a bare `wait`) would make the whole file
+  unreadable.
+- The filename carries a hash of the full instruction. The slug is capped at 40 characters, so
+  two different instructions ("…invoices from january" / "…from february") truncate to the same
+  name and the second write would silently replace the first plan. Truncating *before* trimming
+  also matters, or a cut landing on a separator leaves a trailing hyphen.
+- `BossLogger.forComponent` is resolved lazily. An api symbol resolved in an object initializer
+  raises `NoSuchMethodError` on a host built against a different api revision, and an `Error`
+  slips straight past `catch (e: Exception)` around the caller.
+- `handoffPath` is rendered (`HandoffCard`). A public flow with no consumer is the bug it was
+  meant to fix: the plan lands in a directory the user was never told about, and the button still
+  says "Execute".
+
+A fixture can silently fail to discriminate. The truncation test only holds if the 40-character
+cut lands *exactly* on a separator - with any other instruction, trim-before-take and
+take-before-trim produce the same name and the test passes on the mutation it names.
+
+### Second review round
+
+- **`_handoffPath` is cleared at the start of every generation.** It was only ever written on a
+  successful write, so a following generation that failed left the card pointing at the *previous*
+  instruction's file: a green check saying "ready to run" for a plan the user did not ask for. Once
+  it is per-run, the card no longer needs gating on `errorMessage` (which also hid a valid card
+  whenever an unrelated error was showing).
+- **`LLMRpaResponse.runnablePlan()` is the single predicate** behind panel state, error text and
+  what reaches disk. Those three were spelled out separately and disagreed - which is how an
+  `"error"` response still got written as a runnable configuration.
+- The verb list and selector-type set in the prompt are a **cross-repo contract** with the engine's
+  `ActionTypes`/`SelectorTypes`. Nothing here can pin them: a new engine verb is silently withheld,
+  a renamed one fails inside the *other* plugin. The KDoc on the prompt builder names the file and
+  the version it was read from - keep it current.
+- One entry point per side effect: `write` was dropped in favour of `writeResult`, and the
+  `parseForTest`/`parseRpaResponse` aliases removed. Two doors to the same effect drift.
+
+### Third review round
+
+- **The JSON extraction must stop at the first *complete* object.** `\{[\s\S]*\}` ran from the
+  first brace to the last one in the whole reply, and a reasoning model closes the JSON, closes a
+  code fence and keeps talking - GLM produced `...}\n```\n\nHmm, wait. Let me reconsider...` - so
+  the match swallowed the prose and the parse died at the far end of it. Every action was present
+  and correct and the generation was thrown away. `firstJsonObject` counts braces at depth,
+  skipping string literals and escapes. This was found by *running* a generation, not by review:
+  it looked like an ordinary model failure until `llmrpa_status` reported the real reason.
+- **The unconfigured example response is not `"success"`.** It is a single `wait 1000` and it
+  satisfied `runnablePlan()`, so it landed on disk named after the user's instruction and the card
+  offered to run it. It carries `STATUS_EXAMPLE` now. Reaching it needs the provider to disappear
+  between `aiAvailable()` and the call, which is a TOCTOU window rather than an impossibility.
+- **`llmrpa_status` reports the last history entry, not just `_errorMessage`.** The latter only
+  carries a *save* failure, so a generation that produced nothing runnable reported `error=none` and
+  an agent polling it could not tell anything had gone wrong. This is what surfaced the extraction
+  bug above.
+- **The write is atomic** (`.part` sibling plus `ATOMIC_MOVE`). The engine scans that directory on
+  its own schedule, and `writeText` truncates first - so a scan landing mid-write reads half a file,
+  most likely exactly when re-running an instruction overwrites in place.
+- **The `onFailure` logger call has its own guard.** `logger` is lazy so an api mismatch degrades,
+  but the initialiser first runs inside `onFailure`, which is *outside* the `runCatching` - a
+  `NoSuchMethodError` there defeated the whole arrangement and slipped past the caller's
+  `catch (e: Exception)`.
+- `actionType` is pinned because the file must *parse*; the verb that decides what runs travels in
+  `type`, whose name agrees on both sides. The doc used to emphasise only the first.
+- `buildPrompt` is `internal` and `PromptRulesTest` asserts each selector rule and every verb is
+  still being sent. It cannot prove a rule works - only that a stray edit did not delete one.
+
+### Fourth review round
+
+Three more routes by which a complete, correct plan was thrown away. That is the failure mode of
+this plugin; assume any new comparison or extraction is another instance until shown otherwise.
+
+- **Status was compared exactly.** `status == "success"` against a model that answers `"Success"`.
+  Normalised once at the parse boundary (`trim().lowercase()`), because doing it at each comparison
+  is what `runnablePlan()` exists to prevent.
+- **The extraction anchored on the first `{` anywhere.** A braced aside before the fenced JSON
+  handed back an undecodable slice. The contract is now "the first *decodable* object": advance to
+  the next opening brace and retry, bounded.
+- **`updateExecutionStatus`'s `message` was accepted and dropped**, so the model's explanation never
+  reached the panel or `llmrpa_status`.
+
+Also: `generateActions` refuses a second concurrent run - two of them collide on the staging file,
+on `_handoffPath`, and on a history index resolved by `size` after a non-atomic append (now
+`update`). The staging file is `Files.createTempFile` per write, since deriving it from the
+instruction gave two runs of the *same* instruction the same path - the interleaving the atomic move
+exists to rule out.
+
+**A `contains` assertion over a whole prompt is close to worthless.** `PromptRulesTest`'s verb check
+passed while `select` and `submit` were deleted from the verb list, because "CSS selectors" and the
+submit rule carry those substrings. It now parses the `Available action types:` line and asserts set
+equality, which also catches a verb offered here that the engine does not implement.
+
+CI (`test.yml`, cherry-picked from `ci/add-test-workflow`) tracks api `latest`, matching
+`plugin-release.yml`. That means an unrelated api release can redden every open PR, and nothing
+verifies the `minApiVersion` floor the manifest declares - a matrix over floor and latest would get
+both. One observed flake: `dl.google.com` failed to serve three androidx artifacts mid-run, which
+looked exactly like a resolution bug; they returned 200 immediately after and a re-run was green.
+
+### Fifth review round
+
+- **kotlinx treats a nullable field with no default as REQUIRED.** `"selector":{"type":"none"}`, or
+  an action with no `selector` at all - normal output for `navigate`, `wait`, `submit` - threw
+  `MissingFieldException`, so a reply carrying a complete plan was reported as a parse error. Every
+  field on `SelectorInfo` and all but `type` on `RpaActionConfig` have defaults now. `type` stays
+  required: an action without a verb is not an action.
+- **`status == "success"` was still exact.** Case was normalised, but `"ok"`, `"completed"` and
+  `"done"` still lost the plan. The test is inverted: the *failure* statuses are the closed set, so
+  anything unrecognised carrying actions is runnable. Status drift is this plugin's premise.
+- **The re-entrancy guard was check-then-set**, and `llmrpa_run` calls `generateActions` from a
+  thread that is not guaranteed to be the UI thread. `compareAndSet`, taken *after* the refusals so
+  a refusal cannot latch the flag, and the history append is one `updateAndGet` so the index cannot
+  disagree with the list.
+- **`llmrpa_run` reported "Generating..." for a generation that never started.** `generateActions`
+  returns the refusal and the tool relays it with `isError`.
+- The staging file is deleted when the move fails, and `AtomicMoveNotSupportedException` falls back
+  to a plain replace - a real outcome on some macOS and Windows volumes, where the alternative is
+  "could not save" forever on that machine.
+
+**`processResources` was corrupting the shipped manifest.** The filter is per-line and was
+unanchored, so it rewrote the *dependency's* constraint too: the jar declared the AI Gateway as
+`"version": "1.2.0"` instead of `">=1.0.3"` - a constraint no gateway release satisfies, which the
+host's install-time dependency check reads. Anchored on the top-level two-space indent.
+(`apiVersion`/`minApiVersion` escaped only because the regex needs a quote immediately before
+`version`.) Verify by reading `plugin.json` out of the built jar, not the source file.
+
+### Sixth review round
+
+- **`status` was the same required-nullable shape one level up.** A reply of
+  `{"configuration":[...ten good actions...],"message":"..."}` with no `status` key threw and the
+  whole plan was discarded. Defaulted to `"success"`, which `runnablePlan()` already tolerates.
+  `configuration` stays **required**, and that is load-bearing: defaulted, a braced aside like
+  `{"foo":1}` would decode cleanly under `ignoreUnknownKeys` and be returned as the first
+  "successful" candidate - an empty plan.
+- **`runnablePlan()`'s failure set has to cover what a *model* says**, not only the two statuses this
+  plugin sets. `"status":"failed"` with a partial or apologetic action list was runnable: written to
+  disk under the user's instruction with the card saying ready to run.
+- **The candidate loop advanced one character**, so the budget was spent on the failed object's own
+  nested braces - its actions and selectors - and eight candidates was effectively one for the case
+  it exists for. It advances past the whole candidate, skips asides with no `"configuration"` key,
+  and keeps the **first** error, since an error about a nested `{"type":"none"}` is the
+  diagnosability failure this plugin keeps fixing.
+- The staging file is deleted in a `finally`: the earlier `catch` only wrapped the move, and
+  `writeText` throwing (full disk, quota) left the `.part` sibling behind on exactly the paths that
+  repeat.
+- `EngineAction.meta` is never omitted, so a stricter reader on the other side cannot break on a
+  missing key. The durable half of that is in rpaengine, which now defaults `selector` and has a test
+  decoding the shapes this writer produces.

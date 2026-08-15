@@ -15,9 +15,12 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.flow.updateAndGet
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 private const val AI_PROVIDERS_SETTINGS_SECTION = "LLM_PROVIDERS"
 
@@ -104,6 +107,15 @@ class LlmrpaComponent(
     private val _errorMessage = MutableStateFlow<String?>(null)
     val errorMessage: StateFlow<String?> = _errorMessage
 
+    /**
+     * Where the last generated plan was written for the RPA Engine, or null.
+     *
+     * Surfaced so the panel can say the plan is ready to run rather than leaving the user to
+     * guess whether anything left this plugin.
+     */
+    private val _handoffPath = MutableStateFlow<String?>(null)
+    val handoffPath: StateFlow<String?> = _handoffPath
+
     // Settings state
     private val _showSettings = MutableStateFlow(false)
     val showSettings: StateFlow<Boolean> = _showSettings
@@ -166,11 +178,21 @@ class LlmrpaComponent(
     /**
      * Generate RPA actions from natural language instruction
      */
-    fun generateActions() {
+    /**
+     * Start a generation, reporting why not when it does not start.
+     *
+     * Returned Unit and routed all three refusals into `_errorMessage`, so `llmrpa_run` answered
+     * "Generating..." regardless and an agent then polled `llmrpa_status` and read the *previous*
+     * run's result.
+     */
+    fun generateActions(): String? {
+        // compareAndSet, not a check then a set: llmrpa_run also calls this, and the MCP handler
+        // thread is not guaranteed to be the UI thread - two calls could both pass a plain check,
+        // lose one history append, resolve the same index and race on _handoffPath.
         val instruction = _currentInstruction.value
         if (instruction.isBlank()) {
             _errorMessage.value = "Please enter an instruction"
-            return
+            return "Please enter an instruction"
         }
 
         // Ask about AI before generating. Without this the panel quietly returned its
@@ -178,18 +200,32 @@ class LlmrpaComponent(
         // the user has no way to tell that from a model that did badly.
         if (!aiAvailable()) {
             scope.launch { if (promptAiFix("Generating RPA actions")) generateActions() }
-            return
+            return "No AI provider is configured"
         }
 
-        _isGenerating.value = true
+        // Last, and with compareAndSet rather than a check then a set: llmrpa_run also calls this
+        // and the MCP handler thread is not guaranteed to be the UI thread, so two calls could both
+        // pass a plain check, lose one history append, resolve the same index and race on
+        // _handoffPath. It is taken *after* the refusals above, because those return without
+        // starting anything and must not leave the flag latched - and because the aiAvailable path
+        // re-enters this function.
+        if (!_isGenerating.compareAndSet(expect = false, update = true)) {
+            return "A generation is already in progress"
+        }
+
         _errorMessage.value = null
+        // The previous plan is not this run's result. Without this, a generation that fails or
+        // returns an unparseable reply leaves the card pointing at the *earlier* instruction's
+        // file, so the user opens the engine and runs the wrong plan believing it is the new one.
+        _handoffPath.value = null
 
         val executionState = LLMExecutionState(
             instruction = instruction,
             status = LLMExecutionStatus.GENERATING
         )
-        _executionHistory.value = _executionHistory.value + executionState
-        val historyIndex = _executionHistory.value.size - 1
+        // updateAndGet, so the append and the index that addresses it cannot disagree: reading
+        // .value, concatenating, assigning back and then taking size - 1 is three separate steps.
+        val historyIndex = _executionHistory.updateAndGet { it + executionState }.size - 1
 
         scope.launch {
             try {
@@ -203,17 +239,47 @@ class LlmrpaComponent(
 
                 val response = apiClient.callLLMApi(request)
 
-                if (response.status == "success" || response.status == "error") {
+                // The example response carries its own status so runnablePlan() excludes it; it
+                // still has actions to show, so it belongs on this branch rather than the
+                // error-only one below. Listed explicitly, so an unrecognised status keeps
+                // falling through to the else rather than being treated as showable.
+                // Everything with a status we recognise or actions to show goes here; the else
+                // is for a response that is neither, which is nothing this plugin produces today.
+                if (response.status in SHOWABLE_STATUSES || response.configuration.isNotEmpty()) {
+                    val plan = response.runnablePlan()
                     updateExecutionStatus(
                         historyIndex,
-                        if (response.configuration.isNotEmpty()) LLMExecutionStatus.READY else LLMExecutionStatus.ERROR,
+                        if (plan != null) LLMExecutionStatus.READY else LLMExecutionStatus.ERROR,
                         generatedActions = response.configuration,
-                        error = if (response.configuration.isEmpty()) response.message else null,
+                        error = if (plan == null) response.message else null,
                         message = response.message
                     )
 
-                    if (response.configuration.isNotEmpty()) {
-                        _currentInstruction.value = ""
+                    if (plan != null) {
+                        // Gated on the status too, not only on there being actions: a failed parse
+                        // reports "error" and anything it still carries is not a plan the user
+                        // asked for, so it must never reach disk as a runnable configuration.
+                        // Hand the plan to the RPA Engine, which loads configurations from disk.
+                        // Without this the actions were generated and then had no consumer at
+                        // all - the button said Execute and nothing could run what it produced.
+                        // On Dispatchers.IO: scope is Main, and this is mkdirs + a file write.
+                        val handoff =
+                            withContext(Dispatchers.IO) {
+                                RpaEngineHandoff.writeResult(instruction, plan)
+                            }
+                        _handoffPath.value = handoff.getOrNull()?.absolutePath
+                        _errorMessage.value =
+                            handoff.exceptionOrNull()?.let { cause ->
+                                // Name the reason. "Could not save them" with the cause only in
+                                // the log left the user nothing to act on.
+                                "Generated the actions but could not save them for the RPA " +
+                                    "Engine: ${cause.message ?: cause::class.simpleName}"
+                            }
+                        // Only clear the field on success - otherwise the text they would retry
+                        // with is gone.
+                        if (handoff.isSuccess) {
+                            _currentInstruction.value = ""
+                        }
                     }
                 } else {
                     updateExecutionStatus(
@@ -232,6 +298,8 @@ class LlmrpaComponent(
                 _isGenerating.value = false
             }
         }
+        // Started: nothing to report.
+        return null
     }
 
     private fun updateExecutionStatus(
@@ -241,14 +309,28 @@ class LlmrpaComponent(
         error: String? = null,
         message: String? = null
     ) {
-        val history = _executionHistory.value.toMutableList()
-        if (index < history.size) {
-            history[index] = history[index].copy(
-                status = status,
-                generatedActions = if (generatedActions.isNotEmpty()) generatedActions else history[index].generatedActions,
-                error = error ?: history[index].error
-            )
-            _executionHistory.value = history
+        // update, not read-modify-write on .value: two interleaved callers could otherwise lose
+        // an append and then both write the same index.
+        _executionHistory.update { current ->
+            if (index >= current.size) {
+                current
+            } else {
+                current.toMutableList().also { history ->
+                    history[index] = history[index].copy(
+                        status = status,
+                        generatedActions =
+                            if (generatedActions.isNotEmpty()) {
+                                generatedActions
+                            } else {
+                                history[index].generatedActions
+                            },
+                        error = error ?: history[index].error,
+                        // Was accepted and dropped on the floor, so the model's explanation of
+                        // what the plan does never reached the panel or llmrpa_status.
+                        message = message ?: history[index].message,
+                    )
+                }
+            }
         }
     }
 
@@ -258,5 +340,10 @@ class LlmrpaComponent(
 
     fun applyQuickExample(example: String) {
         _currentInstruction.value = example
+    }
+
+    private companion object {
+        /** Statuses that carry something worth showing in the panel. */
+        val SHOWABLE_STATUSES = setOf("success", "error", LlmApiClient.STATUS_EXAMPLE)
     }
 }
