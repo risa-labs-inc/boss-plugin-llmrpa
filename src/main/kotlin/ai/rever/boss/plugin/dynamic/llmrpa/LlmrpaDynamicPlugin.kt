@@ -38,6 +38,9 @@ class LlmrpaDynamicPlugin : DynamicPlugin {
         // the panel falls back to naming the path in text.
         val settingsProvider = context.settingsProvider
         val windowId = context.windowId
+        // Lazy and guarded for the same load-order and api-mismatch reasons as the gateway.
+        val tools = RegistryToolInvoker { runCatching { context.mcpToolRegistry }.getOrNull() }
+        val llmProvider = { runCatching { context.llmProvider }.getOrNull() }
 
         context.panelRegistry.registerPanel(LlmrpaInfo) { ctx, panelInfo ->
             LlmrpaComponent(
@@ -52,6 +55,8 @@ class LlmrpaDynamicPlugin : DynamicPlugin {
                 },
                 settingsProvider,
                 windowId,
+                tools,
+                llmProvider,
             ).also { comp ->
                 lastComponent = comp
                 // Clear on panel close: a destroyed component's scope is cancelled,
@@ -61,7 +66,13 @@ class LlmrpaDynamicPlugin : DynamicPlugin {
         }
 
         // Contribute llmrpa_status/run MCP tools; auto-removed on disable/unload.
-        context.registerMcpToolProvider(LlmrpaMcpToolProvider(pluginId) { lastComponent })
+        context.registerMcpToolProvider(
+            LlmrpaMcpToolProvider(
+                pluginId,
+                component = { lastComponent },
+                headless = HeadlessRunner(tools, aiGateway, llmProvider) { activeTabsProvider?.activeTabs?.value.orEmpty() },
+            ),
+        )
     }
 
     override fun dispose() {

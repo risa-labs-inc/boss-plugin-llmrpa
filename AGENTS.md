@@ -309,3 +309,27 @@ host's install-time dependency check reads. Anchored on the top-level two-space 
 - `EngineAction.meta` is never omitted, so a stricter reader on the other side cannot break on a
   missing key. The durable half of that is in rpaengine, which now defaults `selector` and has a test
   decoding the shapes this writer produces.
+
+## Live runs (1.3)
+
+`TaskRunner` is the observe → decide → act loop. It never touches the browser: RPA Engine's
+`rpa_observe` / `rpa_step` do, reached through `PluginContext.mcpToolRegistry` (`RegistryToolInvoker`,
+guarded, because the registry is absent on older hosts and throws across the boundary). Jev is
+reached the same way (`jev_decide`); chat models through the gateway with
+`AiRequest.EXTRAS_KEY_PROVIDER_ID` / `EXTRAS_KEY_MODEL_OVERRIDE`, only when the gateway advertises
+`CAPABILITY_PROVIDER_OVERRIDE` - otherwise it would silently answer with the active model and the
+timeline would name the wrong one.
+
+Found by running, not reviewing:
+- **An autocomplete box reports role `combobox`.** Wikipedia's search upgrades itself a moment after
+  load; keying "Type into" on textbox/searchbox only offered it when the page was observed early.
+  `Candidates.isTextField` covers a text `input` with role combobox and no options.
+- **A model will claim success on the wrong page.** Haiku said "done, 95%" on an empty search
+  results page. A pick of done is verified once against the page title and address
+  (`verifyDone`); a rejected done continues, a second contradicted one stops the run.
+- **Pages rebuild widgets on load.** The runner waits after a step (longer after navigation) before
+  the next observation; tests zero `NAV_SETTLE_MS` / `STEP_SETTLE_MS`.
+- The history each decision sees ends every step with the page it led to ("→ now on '…'").
+
+`PanelRenderTest` renders the real panel through the fakes at 280/360/520 and two-pane widths into
+`build/reports/visual/`; look at them after UI changes.

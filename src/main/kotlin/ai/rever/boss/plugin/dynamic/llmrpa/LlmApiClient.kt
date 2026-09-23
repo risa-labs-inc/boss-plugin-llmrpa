@@ -34,7 +34,7 @@ class LlmApiClient(
      * No gateway or no configured provider yields the example response rather than an
      * error, so the panel stays usable while the user goes and sets a provider up.
      */
-    suspend fun callLLMApi(request: LLMRpaRequest): LLMRpaResponse {
+    suspend fun callLLMApi(request: LLMRpaRequest, model: ModelOption? = null): LLMRpaResponse {
         val api = gateway() ?: return createUnconfiguredResponse(request)
         if (api.activeModel() == null) return createUnconfiguredResponse(request)
 
@@ -43,6 +43,11 @@ class LlmApiClient(
                 AiRequest(
                     system = SYSTEM_PROMPT,
                     messages = listOf(AiMessage.user(buildPrompt(request))),
+                    // A chat model picked in the panel; a gateway without per-request selection
+                    // ignores these and uses the active provider.
+                    extras = model?.takeIf { it.kind == ModelOption.Kind.CHAT && ChatDecider.routingProblem(api, it) == null }
+                        ?.let(ChatDecider::routingExtras)
+                        .orEmpty(),
                 ),
             ).fold(
                 onSuccess = { reply -> parseReply(reply.text) },
