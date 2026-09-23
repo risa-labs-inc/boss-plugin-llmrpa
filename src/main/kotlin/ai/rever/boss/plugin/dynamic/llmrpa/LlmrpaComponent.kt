@@ -21,6 +21,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.flow.updateAndGet
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -365,6 +366,9 @@ class LlmrpaComponent(
         scope.launch {
             try {
                 val groups = modelDirectory.load()
+                // An empty answer is usually "not registered yet" (plugins load in any order), not
+                // "nothing exists": keep what we had rather than clearing the user's pick.
+                if (groups.isEmpty()) return@launch
                 _modelGroups.value = groups
                 val all = groups.flatMap { it.models }
                 val current = _selectedModel.value
@@ -379,7 +383,31 @@ class LlmrpaComponent(
         }
     }
 
-    fun selectModel(option: ModelOption) { _selectedModel.value = option }
+    fun selectModel(option: ModelOption) {
+        _selectedModel.value = option
+        recheck()
+    }
+
+    private val _readiness = MutableStateFlow<Blocker?>(Blocker.MODEL)
+
+    /**
+     * What stops Run, as observable state, so the chip, the notice and the Run button agree. A
+     * plain call from composition went stale: nothing recomposes when Jev or RPA Engine register
+     * after the panel opened, which is the normal order at BOSS startup and after a hot reload.
+     */
+    val readiness: StateFlow<Blocker?> = _readiness
+
+    private var jevSeen = false
+
+    /** Recomputes readiness, reloading models when the list is empty or Jev appeared or left. */
+    fun recheck() {
+        val jevNow = tools.has(ToolNames.JEV_DECIDE)
+        if (_modelGroups.value.isEmpty() || jevNow != jevSeen) {
+            jevSeen = jevNow
+            refreshModels()
+        }
+        _readiness.value = blocker()
+    }
 
     // ---- Running ----
 
@@ -401,8 +429,19 @@ class LlmrpaComponent(
 
     val isRunning: Boolean get() = runJob?.isActive == true
 
-    // After every property it touches: an init block runs in declaration order.
-    init { refreshModels() }
+    // After every property it touches: an init block runs in declaration order. The loop is cheap
+    // (a registry read and, only when needed, a model reload) and dies with the panel's scope.
+    init {
+        refreshModels()
+        scope.launch {
+            while (true) {
+                recheck()
+                delay(READINESS_POLL_MS)
+            }
+        }
+        scope.launch { _selectedModel.collect { _readiness.value = blocker() } }
+        scope.launch { _selectedTab.collect { _readiness.value = blocker() } }
+    }
 
     /** What stops Run from starting, in words the panel shows; null when ready. */
     fun blocker(): Blocker? = when {
@@ -463,6 +502,8 @@ class LlmrpaComponent(
     }
 
     private companion object {
+        const val READINESS_POLL_MS = 2_000L
+
         /** Statuses that carry something worth showing in the panel. */
         val SHOWABLE_STATUSES = setOf("success", "error", LlmApiClient.STATUS_EXAMPLE)
     }

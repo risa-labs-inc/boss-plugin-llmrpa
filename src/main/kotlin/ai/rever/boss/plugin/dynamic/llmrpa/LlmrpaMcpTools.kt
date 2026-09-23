@@ -70,6 +70,9 @@ internal class LlmrpaMcpToolProvider(
                 val last = c.executionHistory.value.lastOrNull()
                 val run = c.run.value
                 McpToolResult(
+                    "ready=${c.blocker()?.name ?: "yes"} model=${c.selectedModel.value?.key ?: "none"} " +
+                        "models=${c.modelGroups.value.sumOf { it.models.size }} " +
+                        "tools=${listOf(ToolNames.OBSERVE, ToolNames.STEP, ToolNames.JEV_DECIDE).filter { c.tools.has(it) }}\n" +
                     "run=${run?.status?.name ?: "none"} steps=${run?.steps?.size ?: 0} " +
                         "summary=${run?.summary ?: "none"}\n" +
                         "draft: generating=${c.isGenerating.value} history=${c.executionHistory.value.size} " +

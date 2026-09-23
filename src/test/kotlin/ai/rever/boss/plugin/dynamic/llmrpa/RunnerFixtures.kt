@@ -43,7 +43,10 @@ internal class FakeTools(
     var riskCalls = 0
     var verifyCalls = 0
 
-    override fun has(toolName: String) = true
+    /** Tools currently registered; null means all of them. Lets a test register Jev late. */
+    var registered: Set<String>? = null
+
+    override fun has(toolName: String) = registered?.contains(toolName) ?: true
     override fun inputSchema(toolName: String): String? =
         if (toolName == ToolNames.JEV_DECIDE) """{"properties":{"model":{"type":"string","enum":["typesafe/jev-1.13","typesafe/jev-2"]}}}""" else null
 

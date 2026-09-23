@@ -88,6 +88,32 @@ class PanelRenderTest {
         }
     }
 
+    @Test
+    fun `readiness recovers when Jev registers after the panel opened`() {
+        Dispatchers.setMain(UnconfinedTestDispatcher())
+        try {
+            val tools = FakeTools { _, _ -> Triple("The task is complete", 0.9, null) }
+            tools.registered = setOf(ToolNames.OBSERVE, ToolNames.STEP)
+            val c = component(tools)
+            // Plugins load in any order: at creation there is no model to pick.
+            assertEquals(LlmrpaComponent.Blocker.MODEL, c.readiness.value)
+            assertEquals(null, c.selectedModel.value)
+
+            tools.registered = null
+            c.recheck()
+            assertEquals("typesafe/jev-1.13", c.selectedModel.value?.modelId)
+            assertEquals(null, c.readiness.value)
+
+            // Jev briefly unregistering (a hot reload) must not wipe the pick.
+            tools.registered = setOf(ToolNames.OBSERVE, ToolNames.STEP)
+            c.recheck()
+            assertEquals("typesafe/jev-1.13", c.selectedModel.value?.modelId)
+            assertEquals(LlmrpaComponent.Blocker.JEV, c.readiness.value)
+        } finally {
+            Dispatchers.resetMain()
+        }
+    }
+
     private fun render(component: LlmrpaComponent, width: Int, height: Int, name: String) {
         val out = Path.of("build/reports/visual/llmrpa-$name.png")
         val scene = ImageComposeScene(width = width, height = height, density = Density(1f)) { LlmrpaContent(component) }

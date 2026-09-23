@@ -97,8 +97,7 @@ fun LlmrpaContent(component: LlmrpaComponent) {
     val drafting by component.isGenerating.collectAsState()
     val draftPath by component.handoffPath.collectAsState()
     val errorMessage by component.errorMessage.collectAsState()
-    // Read per composition: there is no change signal for the registry or the gateway.
-    val blocker = component.blocker()
+    val blocker by component.readiness.collectAsState()
     val active = run?.status == RunStatus.RUNNING || run?.status == RunStatus.WAITING
 
     BossTheme {
