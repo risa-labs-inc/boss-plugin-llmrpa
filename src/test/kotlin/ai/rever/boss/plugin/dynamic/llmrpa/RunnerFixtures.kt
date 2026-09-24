@@ -57,7 +57,9 @@ internal class FakeTools(
             ToolNames.STEP -> {
                 steps += args["action"]!!.jsonObject
                 val ok = stepOk(args["action"]!!.jsonObject)
-                ToolReply("""{"ok":$ok,"error":${if (ok) "null" else "\"element not found\""}}""", false)
+                val download = if (ok && (args["action"]!!.jsonObject["type"] as JsonPrimitive).content == "download")
+                    ""","download":{"url":"https://upload.example/cat.jpg","file":"cat.jpg","bytes":1234,"method":"blob"}""" else ""
+                ToolReply("""{"ok":$ok,"error":${if (ok) "null" else "\"element not found\""}$download}""", false)
             }
             ToolNames.JEV_DECIDE -> {
                 val questions = args["questions"]!!.jsonObject
@@ -89,7 +91,8 @@ internal class FakeTools(
     private fun observeJson(p: PageSnapshot): String {
         val els = p.elements.joinToString(",") { e ->
             val opts = if (e.options.isEmpty()) "null" else e.options.joinToString(",", "[", "]") { "\"$it\"" }
-            """{"id":"${e.id}","role":"${e.role}","tag":"${e.tag}","label":${e.label?.let { "\"$it\"" } ?: "null"},"options":$opts,"sensitive":${e.sensitive},"in_viewport":true,"selector":{"type":"${e.selector.type}","value":"${e.selector.value}"}}"""
+            val image = e.imageSrc?.let { ""","image":{"src":"$it","alt":null,"width":300,"height":200}""" }.orEmpty()
+            """{"id":"${e.id}","role":"${e.role}","tag":"${e.tag}","label":${e.label?.let { "\"$it\"" } ?: "null"},"options":$opts,"sensitive":${e.sensitive},"in_viewport":true,"selector":{"type":"${e.selector.type}","value":"${e.selector.value}"}$image}"""
         }
         return """{"tab_id":"t1","url":"${p.url}","title":"${p.title}","truncated":false,"elements":[$els]}"""
     }

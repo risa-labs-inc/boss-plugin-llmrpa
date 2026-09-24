@@ -187,6 +187,52 @@ class TaskRunnerTest {
     }
 
     @Test
+    fun `an image can be downloaded and the saved file reaches the timeline and history`() = runTest {
+        val cat = element("e9", "link", "Persialainen.jpg").copy(imageSrc = "https://upload.example/cat.jpg")
+        val page = SEARCH_PAGE.copy(elements = SEARCH_PAGE.elements + cat)
+        val descriptions = Candidates.build(page, instruction).map { it.description }
+        assertTrue("Download image 'Persialainen.jpg'" in descriptions)
+        assertTrue("Open 'Persialainen.jpg' link" in descriptions)
+
+        val seen = mutableListOf<String>()
+        val tools = FakeTools(page = page) { _, call ->
+            if (call == 0) Triple("Download image 'Persialainen.jpg'", 0.93, null) else Triple("The task is complete", 0.9, null)
+        }
+        val decider = object : StepDecider by JevDecider(tools, JEV) {
+            override suspend fun decide(ctx: StepContext): Result<Decision> { seen += ctx.history; return JevDecider(tools, JEV).decide(ctx) }
+        }
+        val state = TaskRunner(tools, decider, "t1", "Download the picture of the cat") { Answer.Stop }.run()
+        assertEquals(RunStatus.DONE, state.status)
+        assertEquals("download", (tools.steps.single()["type"] as JsonPrimitive).content)
+        assertEquals("Saved cat.jpg", state.steps.single().detail)
+        assertTrue(seen.any { it.contains("Saved cat.jpg") })
+        // Saving a file changes nothing on the page, so it is not risk-checked.
+        assertEquals(0, tools.riskCalls)
+    }
+
+    @Test
+    fun `a standalone picture is offered only as a download`() {
+        val img = element("e1", "img", "Persian cat in flowers", tag = "img").copy(imageSrc = "https://upload.example/p.jpg")
+        val c = Candidates.build(SEARCH_PAGE.copy(elements = listOf(img)), instruction).filter { it.element?.id == "e1" }
+        assertEquals(listOf("Download image 'Persian cat in flowers'"), c.map { it.description })
+    }
+
+    @Test
+    fun `a chat model that answers in prose is asked once more`() = runTest {
+        val ctx = StepContext(instruction, SEARCH_PAGE, Candidates.build(SEARCH_PAGE, instruction), Candidates.values(instruction), emptyList())
+        val key = ctx.candidates.first().key
+        val replies = ArrayDeque(listOf("I would click the search box first.", """{"action":"$key","confidence":0.7,"irreversible":false}"""))
+        val requests = mutableListOf<AiRequest>()
+        val api = object : AiGatewayAPI by gateway(setOf(AiGatewayAPI.CAPABILITY_PROVIDER_OVERRIDE), null) {
+            override suspend fun complete(request: AiRequest): Result<AiReply> { requests += request; return Result.success(AiReply(replies.removeFirst())) }
+        }
+        val d = ChatDecider({ api }, ModelOption(ModelOption.Kind.CHAT, "OPENROUTER", "OpenRouter", "openrouter/free")).decide(ctx).getOrThrow()
+        assertEquals(key, d.key)
+        assertEquals(2, requests.size)
+        assertEquals(3, requests[1].messages.size)
+    }
+
+    @Test
     fun `jev models come from the jev_decide schema`() {
         assertEquals(listOf("typesafe/jev-1.13", "typesafe/jev-2"), ModelDirectory.jevModelIds(FakeTools { _, _ -> Triple("", 0.0, null) }.inputSchema(ToolNames.JEV_DECIDE)))
         assertEquals(emptyList(), ModelDirectory.jevModelIds("not json"))

@@ -186,8 +186,17 @@ class ChatDecider(
     override suspend fun decide(ctx: StepContext): Result<Decision> {
         val api = runCatching { gateway() }.getOrNull() ?: return Result.failure(IllegalStateException("The AI Gateway plugin is not available"))
         routingProblem(api, option)?.let { return Result.failure(IllegalStateException(it)) }
-        val reply = api.complete(request(prompt(ctx))).getOrElse { return Result.failure(it) }
-        return runCatching { parseReply(reply.text, ctx) }
+        val first = request(prompt(ctx))
+        val reply = api.complete(first).getOrElse { return Result.failure(it) }
+        runCatching { parseReply(reply.text, ctx) }.onSuccess { return Result.success(it) }
+        // Smaller and "free" routed models sometimes answer in prose. Ask once more, showing them
+        // their own reply, before giving up on the step.
+        val retry = first.copy(
+            messages = first.messages + AiMessage.assistant(reply.text.take(2000)) +
+                AiMessage.user("That was not the JSON object. Reply with only the JSON object described, using a key from the list."),
+        )
+        val second = api.complete(retry).getOrElse { return Result.failure(it) }
+        return runCatching { parseReply(second.text, ctx) }
     }
 
     // The chat decision already carries the irreversible flag, so no second call.
@@ -253,6 +262,7 @@ Reply with only a JSON object:
  "confidence": <0..1>, "irreversible": <true if the action submits, pays, sends, publishes or deletes>,
  "reason": "<one short sentence>"}
 Use "done" when the instruction is complete and "stuck" when no action helps. Never invent keys.
+"Download image" saves a picture to the user's Downloads folder.
 Prefer values the instruction states. Never type passwords or payment details unless the instruction gives them.
         """.trimIndent()
 

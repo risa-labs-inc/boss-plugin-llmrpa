@@ -169,7 +169,7 @@ class TaskRunner(
             }
             if (ok) {
                 failures = 0
-                history += description
+                history += if (error != null) "$description ($error)" else description
             } else if (++failures >= limits.maxConsecutiveFailures) {
                 return finish(RunStatus.FAILED, "Stopped at step $stepNo after $failures failed tries: $error. Nothing else was clicked.")
             } else {
@@ -200,7 +200,10 @@ class TaskRunner(
         if (reply.isError) return Triple(false, reply.errorMessage, false)
         val ok = (reply.json?.get("ok") as? JsonPrimitive)?.booleanOrNull ?: false
         val navigated = (reply.json?.get("navigated") as? JsonPrimitive)?.booleanOrNull ?: false
-        return Triple(ok, (reply.json?.get("error") as? JsonPrimitive)?.takeIf { it.isString }?.content, navigated)
+        val error = (reply.json?.get("error") as? JsonPrimitive)?.takeIf { it.isString }?.content
+        // A download names the file it saved; the timeline shows it as the step's detail.
+        val saved = ((reply.json?.get("download") as? kotlinx.serialization.json.JsonObject)?.get("file") as? JsonPrimitive)?.content
+        return Triple(ok, if (ok) saved?.let { "Saved $it" } else error, navigated)
     }
 
     private suspend fun waitFor(q: PendingQuestion): Answer {

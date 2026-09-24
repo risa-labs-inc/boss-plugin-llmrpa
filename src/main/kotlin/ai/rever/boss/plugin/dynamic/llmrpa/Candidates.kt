@@ -19,6 +19,8 @@ data class PageElement(
     val sensitive: Boolean = false,
     val inViewport: Boolean = true,
     val selector: SelectorInfo,
+    /** The image this element is or wraps (RPA Engine 1.3+), when it is big enough to matter. */
+    val imageSrc: String? = null,
 )
 
 data class PageSnapshot(val url: String, val title: String, val elements: List<PageElement>, val truncated: Boolean) {
@@ -42,6 +44,7 @@ data class PageSnapshot(val url: String, val title: String, val elements: List<P
                     sensitive = (o["sensitive"] as? JsonPrimitive)?.booleanOrNull ?: false,
                     inViewport = (o["in_viewport"] as? JsonPrimitive)?.booleanOrNull ?: true,
                     selector = SelectorInfo(sel.str("type") ?: "css", sel.str("value")),
+                    imageSrc = (o["image"] as? JsonObject)?.str("src"),
                 )
             },
         )
@@ -58,7 +61,7 @@ data class Candidate(
     val action: StepAction? = null,
     val element: PageElement? = null,
 ) {
-    enum class Kind { CLICK, TYPE, SELECT, KEY, NAVIGATE, DONE, STUCK }
+    enum class Kind { CLICK, TYPE, SELECT, KEY, NAVIGATE, DOWNLOAD, DONE, STUCK }
 
     val needsValue: Boolean get() = kind == Kind.TYPE
 
@@ -72,8 +75,11 @@ internal object Candidates {
     const val DONE = "done"
     const val STUCK = "stuck"
 
-    /** Jev's choice questions take at most 255 options; leave room for done and stuck. */
-    const val MAX = 240
+    /**
+     * Jev's choice questions take at most 255 options, but a decision over ~200 links is both slow
+     * and diluted. RPA Engine lists in-viewport elements first, so the cut drops what is off screen.
+     */
+    const val MAX = 150
     private const val MAX_SELECT_OPTIONS = 12
 
     // Single quotes count only outside words, so the apostrophe in "don't" opens nothing.
@@ -111,6 +117,11 @@ internal object Candidates {
             if (out.size >= MAX) break
             val label = el.label ?: continue
             val quotedLabel = "'${label.take(60)}'"
+            // An image (or a link wrapping one) can be saved; RPA Engine's download action fetches it.
+            if (el.imageSrc != null) {
+                out += Candidate(next(), Candidate.Kind.DOWNLOAD, "Download image $quotedLabel", StepAction("download", el.selector), el)
+                if (el.role == "img") continue
+            }
             when {
                 isTextField(el) -> out += Candidate(
                     next(), Candidate.Kind.TYPE, "Type into $quotedLabel${if (el.sensitive) " (private field)" else ""}",
