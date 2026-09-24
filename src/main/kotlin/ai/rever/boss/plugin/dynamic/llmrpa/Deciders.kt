@@ -196,7 +196,12 @@ class ChatDecider(
                 AiMessage.user("That was not the JSON object. Reply with only the JSON object described, using a key from the list."),
         )
         val second = api.complete(retry).getOrElse { return Result.failure(it) }
-        return runCatching { parseReply(second.text, ctx) }
+        return runCatching { parseReply(second.text, ctx) }.recoverCatching { e ->
+            // Quote the reply: "did not reply with JSON" alone left nothing to act on, and an empty
+            // reply (a reasoning model spending its budget thinking) looks different from prose.
+            val said = second.text.trim().replace(Regex("\\s+"), " ").take(160)
+            throw IllegalStateException("${e.message}. It replied: ${if (said.isEmpty()) "(nothing)" else "\"$said\""}")
+        }
     }
 
     // The chat decision already carries the irreversible flag, so no second call.
@@ -213,7 +218,7 @@ class ChatDecider(
         }
         val reply = api.complete(
             AiRequest(system = "You check whether a browser task is finished. Be strict: a search or results page is not an opened article.",
-                messages = listOf(AiMessage.user(user)), temperature = 0f, maxTokens = 60, timeoutMs = 60_000, extras = routingExtras(option)),
+                messages = listOf(AiMessage.user(user)), temperature = 0f, maxTokens = 1_000, timeoutMs = 90_000, extras = routingExtras(option)),
         ).getOrElse { return Result.failure(it) }
         return runCatching {
             val obj = Json.parseToJsonElement(LlmApiClient.firstJsonObject(reply.text) ?: error("no JSON")).jsonObject
@@ -227,8 +232,9 @@ class ChatDecider(
         system = SYSTEM,
         messages = listOf(AiMessage.user(user)),
         temperature = 0f,
-        maxTokens = 400,
-        timeoutMs = 60_000,
+        // Room for reasoning models, which spend part of the budget thinking before the JSON.
+        maxTokens = 2_000,
+        timeoutMs = 90_000,
         extras = routingExtras(option),
     )
 

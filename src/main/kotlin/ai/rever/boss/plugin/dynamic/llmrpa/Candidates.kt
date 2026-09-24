@@ -109,6 +109,7 @@ internal object Candidates {
     fun build(page: PageSnapshot, instruction: String): List<Candidate> {
         val out = mutableListOf<Candidate>()
         var n = 0
+        var firstImage = true
         fun next() = "a${++n}"
         urls(instruction).filter { it != page.url }.forEach { u ->
             out += Candidate(next(), Candidate.Kind.NAVIGATE, "Go to $u", StepAction("navigate", value = u))
@@ -119,7 +120,11 @@ internal object Candidates {
             val quotedLabel = "'${label.take(60)}'"
             // An image (or a link wrapping one) can be saved; RPA Engine's download action fetches it.
             if (el.imageSrc != null) {
-                out += Candidate(next(), Candidate.Kind.DOWNLOAD, "Download image $quotedLabel", StepAction("download", el.selector), el)
+                // "the image" on an article almost always means its lead image, which RPA Engine
+                // lists first; saying so lets a model tell it from the gallery further down.
+                val lead = if (firstImage) " (first image on the page)" else ""
+                firstImage = false
+                out += Candidate(next(), Candidate.Kind.DOWNLOAD, "Download image $quotedLabel$lead", StepAction("download", el.selector), el)
                 if (el.role == "img") continue
             }
             when {

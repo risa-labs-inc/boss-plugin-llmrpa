@@ -191,12 +191,12 @@ class TaskRunnerTest {
         val cat = element("e9", "link", "Persialainen.jpg").copy(imageSrc = "https://upload.example/cat.jpg")
         val page = SEARCH_PAGE.copy(elements = SEARCH_PAGE.elements + cat)
         val descriptions = Candidates.build(page, instruction).map { it.description }
-        assertTrue("Download image 'Persialainen.jpg'" in descriptions)
+        assertTrue("Download image 'Persialainen.jpg' (first image on the page)" in descriptions)
         assertTrue("Open 'Persialainen.jpg' link" in descriptions)
 
         val seen = mutableListOf<String>()
         val tools = FakeTools(page = page) { _, call ->
-            if (call == 0) Triple("Download image 'Persialainen.jpg'", 0.93, null) else Triple("The task is complete", 0.9, null)
+            if (call == 0) Triple("Download image 'Persialainen.jpg' (first image on the page)", 0.93, null) else Triple("The task is complete", 0.9, null)
         }
         val decider = object : StepDecider by JevDecider(tools, JEV) {
             override suspend fun decide(ctx: StepContext): Result<Decision> { seen += ctx.history; return JevDecider(tools, JEV).decide(ctx) }
@@ -214,7 +214,7 @@ class TaskRunnerTest {
     fun `a standalone picture is offered only as a download`() {
         val img = element("e1", "img", "Persian cat in flowers", tag = "img").copy(imageSrc = "https://upload.example/p.jpg")
         val c = Candidates.build(SEARCH_PAGE.copy(elements = listOf(img)), instruction).filter { it.element?.id == "e1" }
-        assertEquals(listOf("Download image 'Persian cat in flowers'"), c.map { it.description })
+        assertEquals(listOf("Download image 'Persian cat in flowers' (first image on the page)"), c.map { it.description })
     }
 
     @Test
@@ -256,6 +256,15 @@ class TaskRunnerTest {
         assertNull(ChatDecider.routingProblem(gateway(emptySet(), AiModelInfo("OPENAI", "OpenAI", "gpt-5")), gpt))
         assertTrue(ChatDecider.routingProblem(gateway(emptySet(), AiModelInfo("ANTHROPIC", "Anthropic", "claude")), gpt)!!.contains("Update AI Gateway"))
         assertEquals(mapOf(AiRequest.EXTRAS_KEY_PROVIDER_ID to "OPENAI", AiRequest.EXTRAS_KEY_MODEL_OVERRIDE to "gpt-5"), ChatDecider.routingExtras(gpt))
+    }
+
+    @Test
+    fun `a headless stop reports the question it could not ask`() = runTest {
+        val tools = FakeTools { _, _ -> Triple("Open 'Sign in' link", 0.4, null) }
+        val state = TaskRunner(tools, JevDecider(tools, JEV), "t1", instruction) { Answer.Stop }.run()
+        val q = LlmrpaMcpToolProvider.transcript(state)["stopped_at_question"] as kotlinx.serialization.json.JsonObject
+        assertTrue((q["reason"] as JsonPrimitive).content.contains("40%"))
+        assertEquals("Open 'Sign in' link", ((q["options"] as kotlinx.serialization.json.JsonArray)[0] as kotlinx.serialization.json.JsonObject)["action"].let { (it as JsonPrimitive).content })
     }
 
     @Test

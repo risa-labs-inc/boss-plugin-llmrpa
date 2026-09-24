@@ -120,6 +120,21 @@ internal class LlmrpaMcpToolProvider(
             put("model_calls", state.calls)
             // Chat models report tokens, not money, through the gateway; leave cost out rather than say $0.
             if (state.costUsd > 0) put("cost_usd", state.costUsd)
+            when (val q = state.lastQuestion.takeIf { state.status == RunStatus.STOPPED }) {
+                is PendingQuestion.Choose -> put("stopped_at_question", buildJsonObject {
+                    put("reason", q.reason)
+                    put("options", buildJsonArray {
+                        q.options.forEach { (c, p) -> add(buildJsonObject { put("action", c.description); put("confidence", p) }) }
+                    })
+                    put("hint", "Rerun with a more specific instruction, or run it in the LLM RPA panel to choose.")
+                })
+                is PendingQuestion.Confirm -> put("stopped_at_question", buildJsonObject {
+                    put("reason", "The next action looks irreversible")
+                    put("action", q.action.description)
+                    put("risk", q.risk)
+                })
+                null -> Unit
+            }
             put("steps", buildJsonArray {
                 state.steps.forEach { s ->
                     add(buildJsonObject {
@@ -127,7 +142,7 @@ internal class LlmrpaMcpToolProvider(
                         put("action", s.description)
                         put("confidence", s.confidence)
                         put("result", s.outcome.name.lowercase())
-                        s.detail?.let { put("error", it) }
+                        s.detail?.let { put(if (s.outcome == StepRecord.Outcome.FAILED) "error" else "detail", it) }
                     })
                 }
             })

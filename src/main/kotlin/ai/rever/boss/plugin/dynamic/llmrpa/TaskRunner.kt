@@ -50,6 +50,8 @@ data class RunState(
     val status: RunStatus = RunStatus.RUNNING,
     val steps: List<StepRecord> = emptyList(),
     val question: PendingQuestion? = null,
+    /** The last question asked, kept after the run ends so a headless caller can see where it stopped. */
+    val lastQuestion: PendingQuestion? = null,
     val summary: String? = null,
     val calls: Int = 0,
     val costUsd: Double = 0.0,
@@ -115,7 +117,7 @@ class TaskRunner(
                 else "The model is only ${pct(decision.confidence)} sure"
                 when (val a = waitFor(PendingQuestion.Choose(reason, actionable.take(3)))) {
                     is Answer.Pick -> { chosen = a.candidate; chosenBy = StepRecord.ChosenBy.USER }
-                    else -> return finish(RunStatus.STOPPED, "Stopped at step $stepNo")
+                    else -> return finish(RunStatus.STOPPED, "Stopped at step $stepNo: $reason, so it asked which action to take")
                 }
             }
 
@@ -207,7 +209,7 @@ class TaskRunner(
     }
 
     private suspend fun waitFor(q: PendingQuestion): Answer {
-        _state.update { it.copy(status = RunStatus.WAITING, question = q) }
+        _state.update { it.copy(status = RunStatus.WAITING, question = q, lastQuestion = q) }
         val answer = ask(q)
         _state.update { it.copy(status = RunStatus.RUNNING, question = null) }
         return answer
