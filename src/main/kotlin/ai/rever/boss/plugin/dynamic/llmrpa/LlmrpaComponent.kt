@@ -4,6 +4,7 @@ import ai.rever.boss.plugin.api.ActiveTabData
 import ai.rever.boss.plugin.api.ActiveTabsProvider
 import ai.rever.boss.plugin.api.AiGatewayAPI
 import ai.rever.boss.plugin.api.AiModelInfo
+import ai.rever.boss.plugin.api.LlmProvider
 import ai.rever.boss.plugin.api.PanelComponentWithUI
 import ai.rever.boss.plugin.api.PanelInfo
 import ai.rever.boss.plugin.api.SettingsProvider
@@ -11,6 +12,7 @@ import androidx.compose.runtime.Composable
 import com.arkivanov.decompose.ComponentContext
 import com.arkivanov.essenty.lifecycle.doOnDestroy
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
@@ -19,6 +21,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.flow.updateAndGet
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -46,7 +49,10 @@ class LlmrpaComponent(
      */
     private val promptAiFix: suspend (feature: String) -> Boolean = { false },
     private val settingsProvider: SettingsProvider? = null,
-    private val windowId: String? = null
+    private val windowId: String? = null,
+    /** Other plugins' MCP tools: RPA Engine acts and Jev decides. */
+    internal val tools: ToolInvoker = RegistryToolInvoker { null },
+    private val llmProvider: () -> LlmProvider? = { null },
 ) : PanelComponentWithUI, ComponentContext by ctx {
 
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
@@ -144,6 +150,7 @@ class LlmrpaComponent(
         }
 
         lifecycle.doOnDestroy {
+            runJob?.cancel()
             scope.cancel()
             // No apiClient.dispose(): it no longer owns an HTTP client. The transport
             // belongs to the AI Gateway plugin now, which the host unloads with its own
@@ -230,14 +237,16 @@ class LlmrpaComponent(
         scope.launch {
             try {
                 // Use selected tab's URL or fallback
-                val sourceUrl = _selectedTab.value?.url ?: "https://example.com"
+                // No example.com fallback: Draft steps is disabled without a tab, and a plan
+                // written for a made-up page is worse than none.
+                val sourceUrl = _selectedTab.value?.url ?: error("Pick a tab first")
 
                 val request = LLMRpaRequest(
                     actions = listOf(LLMAction(instruction)),
                     sourceUrl = sourceUrl
                 )
 
-                val response = apiClient.callLLMApi(request)
+                val response = apiClient.callLLMApi(request, _selectedModel.value)
 
                 // The example response carries its own status so runnablePlan() excludes it; it
                 // still has actions to show, so it belongs on this branch rather than the
@@ -338,11 +347,163 @@ class LlmrpaComponent(
         _executionHistory.value = emptyList()
     }
 
+    // ---- Models ----
+
+    private val modelDirectory = ModelDirectory(tools, llmProvider, aiGateway)
+
+    private val _modelGroups = MutableStateFlow<List<ModelGroup>>(emptyList())
+    val modelGroups: StateFlow<List<ModelGroup>> = _modelGroups
+
+    private val _selectedModel = MutableStateFlow<ModelOption?>(null)
+    val selectedModel: StateFlow<ModelOption?> = _selectedModel
+
+    private val _loadingModels = MutableStateFlow(false)
+    val loadingModels: StateFlow<Boolean> = _loadingModels
+
+    /** Reloads the model list; keeps the current pick when it still exists, else prefers Jev. */
+    fun refreshModels() {
+        if (!_loadingModels.compareAndSet(expect = false, update = true)) return
+        scope.launch {
+            try {
+                val groups = modelDirectory.load()
+                // An empty answer is usually "not registered yet" (plugins load in any order), not
+                // "nothing exists": keep what we had rather than clearing the user's pick.
+                if (groups.isEmpty()) return@launch
+                _modelGroups.value = groups
+                val all = groups.flatMap { it.models }
+                val current = _selectedModel.value
+                if (current == null || all.none { it.key == current.key }) {
+                    _selectedModel.value = all.firstOrNull { it.kind == ModelOption.Kind.DECISION }
+                        ?: all.firstOrNull { active -> aiModel()?.let { it.providerId == active.providerId && it.modelId == active.modelId } == true }
+                        ?: all.firstOrNull()
+                }
+            } finally {
+                _loadingModels.value = false
+            }
+        }
+    }
+
+    fun selectModel(option: ModelOption) {
+        _selectedModel.value = option
+        recheck()
+    }
+
+    private val _readiness = MutableStateFlow<Blocker?>(Blocker.MODEL)
+
+    /**
+     * What stops Run, as observable state, so the chip, the notice and the Run button agree. A
+     * plain call from composition went stale: nothing recomposes when Jev or RPA Engine register
+     * after the panel opened, which is the normal order at BOSS startup and after a hot reload.
+     */
+    val readiness: StateFlow<Blocker?> = _readiness
+
+    private var jevSeen = false
+
+    /** Recomputes readiness, reloading models when the list is empty or Jev appeared or left. */
+    fun recheck() {
+        val jevNow = tools.has(ToolNames.JEV_DECIDE)
+        if (_modelGroups.value.isEmpty() || jevNow != jevSeen) {
+            jevSeen = jevNow
+            refreshModels()
+        }
+        _readiness.value = blocker()
+    }
+
+    // ---- Running ----
+
+    private val _maxSteps = MutableStateFlow(RunLimits().maxSteps)
+    val maxSteps: StateFlow<Int> = _maxSteps
+    fun setMaxSteps(n: Int) { _maxSteps.value = n.coerceIn(1, 50) }
+
+    private val _run = MutableStateFlow<RunState?>(null)
+    /** The current or most recent run, or null before the first. */
+    val run: StateFlow<RunState?> = _run
+
+    private val _pastRuns = MutableStateFlow<List<RunState>>(emptyList())
+    /** Finished runs for this panel, newest first. In memory only; never written to disk. */
+    val pastRuns: StateFlow<List<RunState>> = _pastRuns
+
+    private var runJob: Job? = null
+    private var runner: TaskRunner? = null
+    private val asker = TaskRunner.Companion.Asker()
+
+    val isRunning: Boolean get() = runJob?.isActive == true
+
+    // After every property it touches: an init block runs in declaration order. The loop is cheap
+    // (a registry read and, only when needed, a model reload) and dies with the panel's scope.
+    init {
+        refreshModels()
+        scope.launch {
+            while (true) {
+                recheck()
+                delay(READINESS_POLL_MS)
+            }
+        }
+        scope.launch { _selectedModel.collect { _readiness.value = blocker() } }
+        scope.launch { _selectedTab.collect { _readiness.value = blocker() } }
+    }
+
+    /** What stops Run from starting, in words the panel shows; null when ready. */
+    fun blocker(): Blocker? = when {
+        !tools.has(ToolNames.OBSERVE) || !tools.has(ToolNames.STEP) -> Blocker.ENGINE
+        _selectedModel.value == null -> Blocker.MODEL
+        _selectedModel.value?.kind == ModelOption.Kind.DECISION && !tools.has(ToolNames.JEV_DECIDE) -> Blocker.JEV
+        _selectedModel.value?.kind == ModelOption.Kind.CHAT && !aiAvailable() -> Blocker.AI
+        _selectedTab.value == null -> Blocker.TAB
+        else -> null
+    }
+
+    enum class Blocker(val short: String, val detail: String) {
+        ENGINE("Update RPA Engine", "Running tasks needs RPA Engine 1.3 or newer, which can read and act on a tab. Update it from Toolbox."),
+        JEV("Install Jev", "Jev picks each step. Install it from Toolbox, then add an OpenRouter key in Settings → AI Providers."),
+        AI("Add an AI provider", "Add a provider and key in Settings → AI Providers, or pick Jev."),
+        MODEL("Pick a model", "Install Jev from Toolbox or add an AI provider in Settings → AI Providers."),
+        TAB("Open a page", "Open a web page in a browser tab to run a task on it."),
+    }
+
+    /** Starts a live run on the selected tab. Returns why it did not start, or null. */
+    fun startRun(): String? {
+        val instruction = _currentInstruction.value.trim()
+        if (instruction.isEmpty()) return "Describe the task first"
+        blocker()?.let { return it.detail }
+        if (isRunning) return "A task is already running"
+        val tab = _selectedTab.value!!
+        val model = _selectedModel.value!!
+        val decider = if (model.kind == ModelOption.Kind.DECISION) JevDecider(tools, model) else ChatDecider(aiGateway, model)
+        val r = TaskRunner(tools, decider, tab.tabId, instruction, RunLimits(maxSteps = _maxSteps.value)) { asker.ask(it) }
+        runner = r
+        runJob = scope.launch {
+            val mirror = launch { r.state.collect { _run.value = it } }
+            try {
+                r.run()
+            } finally {
+                r.markStopped()
+                _run.value = r.state.value
+                mirror.cancel()
+                _pastRuns.update { (listOf(r.state.value) + it).take(10) }
+            }
+        }
+        return null
+    }
+
+    /** Answers the question the run is waiting on. */
+    fun answer(a: Answer) = asker.answer(a)
+
+    fun stopRun() {
+        asker.answer(Answer.Stop)
+        runJob?.cancel()
+    }
+
+    /** Puts a finished run's instruction back in the box. */
+    fun reuse(past: RunState) { _currentInstruction.value = past.instruction }
+
     fun applyQuickExample(example: String) {
         _currentInstruction.value = example
     }
 
     private companion object {
+        const val READINESS_POLL_MS = 2_000L
+
         /** Statuses that carry something worth showing in the panel. */
         val SHOWABLE_STATUSES = setOf("success", "error", LlmApiClient.STATUS_EXAMPLE)
     }
