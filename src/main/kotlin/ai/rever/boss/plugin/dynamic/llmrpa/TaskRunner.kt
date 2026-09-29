@@ -1,16 +1,19 @@
 package ai.rever.boss.plugin.dynamic.llmrpa
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
+import java.util.concurrent.atomic.AtomicReference
 
 enum class RunStatus { RUNNING, WAITING, DONE, STOPPED, FAILED }
 
@@ -33,8 +36,8 @@ sealed interface PendingQuestion {
     /** The model was unsure; [options] are its best picks with their confidence. */
     data class Choose(val reason: String, val options: List<Pair<Candidate, Double>>) : PendingQuestion
 
-    /** The chosen action looks irreversible. */
-    data class Confirm(val action: Candidate, val risk: Double) : PendingQuestion
+    /** The chosen action looks irreversible. [risk] is null when it could not be assessed. */
+    data class Confirm(val action: Candidate, val risk: Double?) : PendingQuestion
 }
 
 sealed interface Answer {
@@ -55,7 +58,7 @@ data class RunState(
     val summary: String? = null,
     val calls: Int = 0,
     val costUsd: Double = 0.0,
-    val startedAt: Long = System.currentTimeMillis(),
+    val startedAt: Long,
 )
 
 data class RunLimits(
@@ -78,18 +81,41 @@ class TaskRunner(
     private val tabId: String,
     private val instruction: String,
     private val limits: RunLimits = RunLimits(),
+    clock: () -> Long = System::currentTimeMillis,
     private val ask: suspend (PendingQuestion) -> Answer,
 ) {
-    private val _state = MutableStateFlow(RunState(instruction, decider.option.label, limits.maxSteps))
+    private val _state = MutableStateFlow(RunState(instruction, decider.option.label, limits.maxSteps, startedAt = clock()))
     val state: StateFlow<RunState> = _state.asStateFlow()
 
     private val values = Candidates.values(instruction)
 
-    suspend fun run(): RunState {
+    /**
+     * Never throws except on cancellation: anything a decider or tool raises across the plugin
+     * boundary ends the run as FAILED with the reason, not as "Stopped by you".
+     */
+    suspend fun run(): RunState = try {
+        loop()
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Throwable) {
+        fail(e)
+    }
+
+    /** Ends a live run as FAILED because of [e]. */
+    fun fail(e: Throwable): RunState {
+        if (_state.value.status == RunStatus.RUNNING || _state.value.status == RunStatus.WAITING) {
+            finish(RunStatus.FAILED, "The run failed at step ${_state.value.steps.size + 1}: ${e.message ?: e::class.simpleName}")
+        }
+        return state.value
+    }
+
+    private suspend fun loop(): RunState {
         val history = mutableListOf<String>()
         var failures = 0
         var doneRejected = false
-        for (stepNo in 1..limits.maxSteps) {
+        // Counted in actions taken, so a rejected done check does not use up the budget.
+        while (_state.value.steps.size < limits.maxSteps) {
+            val stepNo = _state.value.steps.size + 1
             val page = observe() ?: return state.value
             // Where the last step landed, so the model can tell a search results page from the article.
             if (history.isNotEmpty() && !history.last().contains(" → now on ")) {
@@ -128,10 +154,11 @@ class TaskRunner(
                 }?.first
                 if (verified == null || verified >= limits.confirmAbove || doneRejected) {
                     val sure = verified ?: decision.confidence
+                    val n = _state.value.steps.size
                     return finish(
                         if (verified != null && verified < limits.confirmAbove) RunStatus.STOPPED else RunStatus.DONE,
                         if (verified != null && verified < limits.confirmAbove) "Stopped: the model says the task is done, but the page ('${page.title}') does not look like it."
-                        else "Done in ${stepNo - 1} ${if (stepNo - 1 == 1) "step" else "steps"}. ${pct(sure)} sure the task is complete.",
+                        else "Done in $n ${if (n == 1) "step" else "steps"}. ${pct(sure)} sure the task is complete.",
                     )
                 }
                 doneRejected = true
@@ -141,27 +168,37 @@ class TaskRunner(
 
             // Typing needs text; a decision model only ever types what the instruction gave.
             var value = chosen.action?.value
+            // The model's value only describes the model's own pick.
+            val modelValue = decision.value.takeIf { chosenBy == StepRecord.ChosenBy.MODEL }
             if (chosen.needsValue) {
-                value = decision.value ?: values.singleOrNull()
+                value = modelValue ?: values.singleOrNull()
                     ?: return finish(RunStatus.STOPPED, "Needs text to type into ${chosen.element?.label ?: "the field"}. Put it in quotes in the instruction.")
+            }
+            val fromInstruction = value != null && value in values
+            if (chosen.needsValue && chosen.element?.sensitive == true && !fromInstruction) {
+                return finish(RunStatus.STOPPED, "Stopped before typing into the private field '${chosen.element?.label?.take(60)}': only text from your instruction goes there.")
             }
             val description = if (chosen.needsValue) "Type '${value!!.take(60)}' into '${chosen.element?.label?.take(60)}'" else chosen.description
 
             if (chosen.canCommit) {
-                val risk = decision.risk ?: decider.risk(ctx, chosen).getOrNull()?.also { (_, cost) ->
-                    _state.update { it.copy(calls = it.calls + 1, costUsd = it.costUsd + cost) }
-                }?.first
-                if (risk != null && risk >= limits.confirmAbove && waitFor(PendingQuestion.Confirm(chosen, risk)) != Answer.Proceed) {
+                // Fails closed: an unassessed risk asks (and stops a headless run). The model's flag
+                // describes its own pick, never an alternative the person chose.
+                val assessed = decision.risk.takeIf { chosenBy == StepRecord.ChosenBy.MODEL }
+                    ?: decider.risk(ctx, chosen).getOrNull()?.also { (_, cost) ->
+                        _state.update { it.copy(calls = it.calls + 1, costUsd = it.costUsd + cost) }
+                    }?.first
+                val risk = assessed ?: if (Candidates.soundsCommitting(chosen)) 1.0 else null
+                if ((risk == null || risk >= limits.confirmAbove) && waitFor(PendingQuestion.Confirm(chosen, risk)) != Answer.Proceed) {
                     return finish(RunStatus.STOPPED, "Stopped before \"${chosen.description}\"")
                 }
             }
 
             val record = StepRecord(stepNo, description, decision.confidence, decision.alternatives.mapNotNull { (k, p) ->
                 candidates.firstOrNull { it.key == k }?.let { it.description to p }
-            }, valueWritten = chosen.needsValue && decision.valueWritten, chosenBy = chosenBy)
+            }, valueWritten = chosen.needsValue && !fromInstruction, chosenBy = chosenBy)
             _state.update { it.copy(steps = it.steps + record) }
 
-            val (ok, error, navigated) = act(chosen.action!!.copy(value = value))
+            val (ok, error, navigated) = act(chosen.action!!.copy(value = value), allowSensitive = chosen.element?.sensitive == true && fromInstruction)
             // Let the page finish rendering before the next look: scripts often rebuild widgets on load.
             delay(if (navigated) NAV_SETTLE_MS else STEP_SETTLE_MS)
             _state.update { s ->
@@ -190,9 +227,11 @@ class TaskRunner(
         return PageSnapshot.parse(reply.json!!)
     }
 
-    private suspend fun act(action: StepAction): Triple<Boolean, String?, Boolean> {
+    private suspend fun act(action: StepAction, allowSensitive: Boolean): Triple<Boolean, String?, Boolean> {
         val reply = tools.invoke(ToolNames.STEP, buildJsonObject {
             put("tab_id", tabId)
+            // RPA Engine refuses typing into a sensitive field without this; older engines ignore it.
+            if (allowSensitive) put("allow_sensitive", true)
             putJsonObject("action") {
                 put("type", action.type)
                 action.selector?.let { s -> putJsonObject("selector") { put("type", s.type); s.value?.let { put("value", it) } } }
@@ -204,7 +243,7 @@ class TaskRunner(
         val navigated = (reply.json?.get("navigated") as? JsonPrimitive)?.booleanOrNull ?: false
         val error = (reply.json?.get("error") as? JsonPrimitive)?.takeIf { it.isString }?.content
         // A download names the file it saved; the timeline shows it as the step's detail.
-        val saved = ((reply.json?.get("download") as? kotlinx.serialization.json.JsonObject)?.get("file") as? JsonPrimitive)?.content
+        val saved = ((reply.json?.get("download") as? JsonObject)?.get("file") as? JsonPrimitive)?.content
         return Triple(ok, if (ok) saved?.let { "Saved $it" } else error, navigated)
     }
 
@@ -236,9 +275,10 @@ class TaskRunner(
 
         /** An [ask] that the panel completes from a button press. */
         class Asker {
-            private var pending: CompletableDeferred<Answer>? = null
-            suspend fun ask(q: PendingQuestion): Answer = CompletableDeferred<Answer>().also { pending = it }.await()
-            fun answer(a: Answer) { pending?.complete(a); pending = null }
+            // Atomic: ask and answer run on Main today, but answer is public and Stop may come from elsewhere.
+            private val pending = AtomicReference<CompletableDeferred<Answer>?>(null)
+            suspend fun ask(q: PendingQuestion): Answer = CompletableDeferred<Answer>().also { pending.set(it) }.await()
+            fun answer(a: Answer) { pending.getAndSet(null)?.complete(a) }
         }
     }
 }

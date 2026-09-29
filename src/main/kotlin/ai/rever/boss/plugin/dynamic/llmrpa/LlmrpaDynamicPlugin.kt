@@ -41,6 +41,7 @@ class LlmrpaDynamicPlugin : DynamicPlugin {
         // Lazy and guarded for the same load-order and api-mismatch reasons as the gateway.
         val tools = RegistryToolInvoker { runCatching { context.mcpToolRegistry }.getOrNull() }
         val llmProvider = { runCatching { context.llmProvider }.getOrNull() }
+        val tabLocks = TabLocks()
 
         context.panelRegistry.registerPanel(LlmrpaInfo) { ctx, panelInfo ->
             LlmrpaComponent(
@@ -57,6 +58,7 @@ class LlmrpaDynamicPlugin : DynamicPlugin {
                 windowId,
                 tools,
                 llmProvider,
+                tabLocks,
             ).also { comp ->
                 lastComponent = comp
                 // Clear on panel close: a destroyed component's scope is cancelled,
@@ -70,7 +72,16 @@ class LlmrpaDynamicPlugin : DynamicPlugin {
             LlmrpaMcpToolProvider(
                 pluginId,
                 component = { lastComponent },
-                headless = HeadlessRunner(tools, aiGateway, llmProvider) { activeTabsProvider?.activeTabs?.value.orEmpty() },
+                headless = HeadlessRunner(
+                    tools, aiGateway, llmProvider,
+                    tabs = { activeTabsProvider?.activeTabs?.value.orEmpty() },
+                    activeTabId = {
+                        activeTabsProvider?.let { p ->
+                            HeadlessRunner.activeTab(p.activeTabs.value, p.activePanelId) { ws, panel -> p.selectedTabId(ws, panel) }
+                        }
+                    },
+                    locks = tabLocks,
+                ),
             ),
         )
     }

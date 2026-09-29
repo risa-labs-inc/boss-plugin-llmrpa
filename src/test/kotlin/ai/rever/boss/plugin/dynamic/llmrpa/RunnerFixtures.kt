@@ -39,6 +39,10 @@ internal class FakeTools(
     private val decide: (Map<String, String>, Int) -> Triple<String, Double, Int?>,
 ) : ToolInvoker {
     val steps = mutableListOf<JsonObject>()
+    /** Full `rpa_step` arguments, for what travels beside the action. */
+    val stepArgs = mutableListOf<JsonObject>()
+    /** Thrown from every call to this tool, standing in for an api mismatch across the boundary. */
+    var throwOn: String? = null
     var decideCalls = 0
     var riskCalls = 0
     var verifyCalls = 0
@@ -52,10 +56,12 @@ internal class FakeTools(
 
     override suspend fun invoke(toolName: String, arguments: JsonElement): ToolReply {
         val args = arguments.jsonObject
+        if (toolName == throwOn) throw NoSuchMethodError("$toolName: no such method")
         return when (toolName) {
             ToolNames.OBSERVE -> ToolReply(observeJson(page), false)
             ToolNames.STEP -> {
                 steps += args["action"]!!.jsonObject
+                stepArgs += args
                 val ok = stepOk(args["action"]!!.jsonObject)
                 val download = if (ok && (args["action"]!!.jsonObject["type"] as JsonPrimitive).content == "download")
                     ""","download":{"url":"https://upload.example/cat.jpg","file":"cat.jpg","bytes":1234,"method":"blob"}""" else ""

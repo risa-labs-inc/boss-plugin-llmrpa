@@ -30,13 +30,14 @@ internal class LlmrpaMcpToolProvider(
         McpToolDefinition(
             name = "llmrpa_execute",
             description =
-                "Do a browser task from a plain-language instruction, one step at a time, on an open tab. " +
+                "Do a browser task from a plain-language instruction, one step at a time, on an open tab. It acts in the user's " +
+                    "real, logged-in browser session, as them. " +
                     "A model (Jev by default, or any configured chat model) picks each step and RPA Engine performs it. " +
                     "Stops instead of guessing when the model is unsure or the next action looks irreversible, and returns " +
                     "the steps taken. Put any text to type in quotes in the instruction. Each step is a paid model call.",
             inputSchema = """{"type":"object","additionalProperties":false,"properties":{""" +
                 """"instruction":{"type":"string","description":"The task, e.g. Search for 'wireless keyboard' and open the first result"},""" +
-                """"tab_id":{"type":"string","description":"Browser tab to act on; defaults to the first open browser tab"},""" +
+                """"tab_id":{"type":"string","description":"Browser tab to act on; defaults to the focused tab; required when no tab is focused (the error lists the open ones)"},""" +
                 """"max_steps":{"type":"integer","minimum":1,"maximum":50,"default":12},""" +
                 """"model":{"type":"string","description":"Model id, e.g. typesafe/jev-1.13 or a chat model id; defaults to Jev"}""" +
                 """},"required":["instruction"]}""",
@@ -129,9 +130,9 @@ internal class LlmrpaMcpToolProvider(
                     put("hint", "Rerun with a more specific instruction, or run it in the LLM RPA panel to choose.")
                 })
                 is PendingQuestion.Confirm -> put("stopped_at_question", buildJsonObject {
-                    put("reason", "The next action looks irreversible")
+                    put("reason", if (q.risk == null) "Could not tell whether the next action can be undone" else "The next action looks irreversible")
                     put("action", q.action.description)
-                    put("risk", q.risk)
+                    q.risk?.let { put("risk", it) }
                 })
                 null -> Unit
             }

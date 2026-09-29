@@ -150,6 +150,14 @@ internal object Candidates {
             Candidate(STUCK, Candidate.Kind.STUCK, "None of these moves the task forward")
     }
 
+    private val COMMIT_WORDS = Regex(
+        """\b(submit|pay|buy|purchase|order|send|delete|remove|confirm|place order|check ?out|transfer)\b""",
+        RegexOption.IGNORE_CASE,
+    )
+
+    /** A cheap label check, used only when the model could not say whether [c] can be undone. */
+    fun soundsCommitting(c: Candidate): Boolean = COMMIT_WORDS.containsMatchIn(c.element?.label ?: c.description)
+
     private val TEXT_ROLES = setOf("textbox", "searchbox")
     private val TEXT_INPUT_TYPES = setOf(null, "", "text", "search", "email", "url", "tel", "number", "password")
 

@@ -11,6 +11,8 @@ import ai.rever.boss.plugin.api.SettingsProvider
 import androidx.compose.runtime.Composable
 import com.arkivanov.decompose.ComponentContext
 import com.arkivanov.essenty.lifecycle.doOnDestroy
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.Dispatchers
@@ -53,6 +55,10 @@ class LlmrpaComponent(
     /** Other plugins' MCP tools: RPA Engine acts and Jev decides. */
     internal val tools: ToolInvoker = RegistryToolInvoker { null },
     private val llmProvider: () -> LlmProvider? = { null },
+    /** Shared with `llmrpa_execute`, so a panel run and a headless one never drive the same tab. */
+    private val tabLocks: TabLocks = TabLocks(),
+    /** Where catalog reads run; tests pass the test Main so the model list lands synchronously. */
+    private val io: CoroutineDispatcher = Dispatchers.IO,
 ) : PanelComponentWithUI, ComponentContext by ctx {
 
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
@@ -182,9 +188,6 @@ class LlmrpaComponent(
         _errorMessage.value = null
     }
 
-    /**
-     * Generate RPA actions from natural language instruction
-     */
     /**
      * Start a generation, reporting why not when it does not start.
      *
@@ -365,7 +368,8 @@ class LlmrpaComponent(
         if (!_loadingModels.compareAndSet(expect = false, update = true)) return
         scope.launch {
             try {
-                val groups = modelDirectory.load()
+                // Off Main: catalog calls into other plugins can read settings or secrets.
+                val groups = withContext(io) { modelDirectory.load() }
                 // An empty answer is usually "not registered yet" (plugins load in any order), not
                 // "nothing exists": keep what we had rather than clearing the user's pick.
                 if (groups.isEmpty()) return@launch
@@ -461,14 +465,21 @@ class LlmrpaComponent(
         TAB("Open a page", "Open a web page in a browser tab to run a task on it."),
     }
 
-    /** Starts a live run on the selected tab. Returns why it did not start, or null. */
-    fun startRun(): String? {
+    /**
+     * Starts a live run on the selected tab. Returns why it did not start, or null; the reason is
+     * also shown in the panel, so every way of starting (button, Cmd/Ctrl+Enter, Run again) reports it.
+     */
+    fun startRun(): String? = refuseRun()?.also { _errorMessage.value = it }
+
+    private fun refuseRun(): String? {
         val instruction = _currentInstruction.value.trim()
         if (instruction.isEmpty()) return "Describe the task first"
         blocker()?.let { return it.detail }
         if (isRunning) return "A task is already running"
         val tab = _selectedTab.value!!
         val model = _selectedModel.value!!
+        if (!tabLocks.tryAcquire(tab.tabId)) return TabLocks.BUSY
+        _errorMessage.value = null
         val decider = if (model.kind == ModelOption.Kind.DECISION) JevDecider(tools, model) else ChatDecider(aiGateway, model)
         val r = TaskRunner(tools, decider, tab.tabId, instruction, RunLimits(maxSteps = _maxSteps.value)) { asker.ask(it) }
         runner = r
@@ -476,12 +487,20 @@ class LlmrpaComponent(
             val mirror = launch { r.state.collect { _run.value = it } }
             try {
                 r.run()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                // run() already reports its own failures; this covers anything around it.
+                r.fail(e)
             } finally {
                 r.markStopped()
                 _run.value = r.state.value
                 mirror.cancel()
                 _pastRuns.update { (listOf(r.state.value) + it).take(10) }
             }
+        }.also { job ->
+            // On completion, not in finally: a job cancelled before it starts never runs its body.
+            job.invokeOnCompletion { tabLocks.release(tab.tabId) }
         }
         return null
     }

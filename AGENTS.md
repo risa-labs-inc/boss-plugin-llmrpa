@@ -8,7 +8,7 @@ AI-powered robotic process automation with LLM integration
 
 - **Plugin ID**: `ai.rever.boss.plugin.dynamic.llmrpa`
 - **Main Class**: `ai.rever.boss.plugin.dynamic.llmrpa.LlmrpaDynamicPlugin`
-- **API Version**: 1.0.20 · **minApiVersion**: 1.0.75 · **minBossVersion**: 9.2.63
+- **apiVersion**: 1.0.93 · **minApiVersion**: 1.0.91 · **minBossVersion**: 9.2.63
 
 ## AI: this plugin owns no credentials and no wire formats
 
@@ -44,7 +44,7 @@ Three things to keep right:
   provider the user has since changed or removed.
 
 There are no wire formats here any more, so the `else`-branch rule that used to matter is the
-gateway's problem. The api floor is **1.0.75** (the manifest is the source of truth).
+gateway's problem. The api floor is **1.0.91** (the manifest is the source of truth).
 
 ### The gateway is an *optional* declared dependency
 
@@ -333,3 +333,21 @@ Found by running, not reviewing:
 
 `PanelRenderTest` renders the real panel through the fakes at 280/360/520 and two-pane widths into
 `build/reports/visual/`; look at them after UI changes.
+
+### Review round (1.3)
+
+- **The irreversible check fails closed.** A chat model that leaves out `"irreversible"`, or a
+  `jev_decide` risk call that fails, used to let a Submit through unasked. An unknown risk now asks
+  (and stops a headless run); `Candidates.soundsCommitting` only labels it. `decision.risk` and
+  `decision.value` describe the model's pick, so a person-picked alternative is re-assessed.
+- **`TaskRunner.run()` never throws except on cancellation.** A `NoSuchMethodError` from the
+  gateway used to reach `finally`, which wrote "Stopped by you". Deciders wrap their bodies in
+  `guarded`; `JevDecider` names the missing reply path instead of a bare `!!` NPE.
+- **One run per tab, plugin-wide** (`TabLocks`), across the panel and `llmrpa_execute`.
+- **`llmrpa_execute` never picks an arbitrary tab.** It uses the focused tab (`activePanelId` +
+  `selectedTabId`) or requires `tab_id` and lists the open ones.
+- **A sensitive field only takes text from the instruction.** A chat-written value is refused;
+  a value from the instruction is sent with `allow_sensitive: true`, which RPA Engine requires for
+  sensitive fields (older engines ignore unknown arguments).
+- The floor is **1.0.91**: `CAPABILITY_PROVIDER_OVERRIDE` / `EXTRAS_KEY_PROVIDER_ID` routing
+  arrived there, `availableModels()` in 1.0.89. Nothing from 1.0.92–1.0.93 is used.

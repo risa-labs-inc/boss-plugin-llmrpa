@@ -50,6 +50,7 @@ import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.isCtrlPressed
 import androidx.compose.ui.input.key.isMetaPressed
 import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.PointerIcon
@@ -105,14 +106,9 @@ fun LlmrpaContent(component: LlmrpaComponent) {
             Modifier.fillMaxSize().background(RpaTokens.Panel).onPreviewKeyEvent { e ->
                 if (e.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                 val mod = e.isMetaPressed || e.isCtrlPressed
-                val question = run?.question
                 when {
                     mod && e.key == Key.Enter -> { if (!active) component.startRun(); true }
                     e.key == Key.Escape && active -> { component.stopRun(); true }
-                    question is PendingQuestion.Choose && e.key in NUMBER_KEYS -> {
-                        question.options.getOrNull(NUMBER_KEYS.indexOf(e.key))?.let { component.answer(Answer.Pick(it.first)) }
-                        true
-                    }
                     else -> false
                 }
             },
@@ -463,6 +459,12 @@ private fun QuestionCard(component: LlmrpaComponent, q: PendingQuestion) {
     Column(
         Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).background(RpaTokens.Panel)
             .border(1.dp, (if (risk) RpaTokens.Error else RpaTokens.Warning).copy(alpha = 0.6f), RoundedCornerShape(8.dp))
+            // On the card, not the panel root: digits typed into a text field must stay text.
+            .onKeyEvent { e ->
+                if (q !is PendingQuestion.Choose || e.type != KeyEventType.KeyDown || e.key !in NUMBER_KEYS) return@onKeyEvent false
+                q.options.getOrNull(NUMBER_KEYS.indexOf(e.key))?.let { component.answer(Answer.Pick(it.first)) }
+                true
+            }
             .focusRequester(focus).focusable().padding(12.dp)
             .semantics { liveRegion = LiveRegionMode.Assertive },
         verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -488,8 +490,10 @@ private fun QuestionCard(component: LlmrpaComponent, q: PendingQuestion) {
                 OutlineButton("Stop here", { component.answer(Answer.Stop) }, tone = Tone.ERROR)
             }
             is PendingQuestion.Confirm -> {
-                Text("This looks like it can't be undone", color = RpaTokens.Text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.semantics { heading() })
-                Text("Next: ${q.action.description}. ${TaskRunner.pct(q.risk)} likely to submit, pay, send, or delete something.",
+                Text(if (q.risk == null) "This might not be undoable" else "This looks like it can't be undone", color = RpaTokens.Text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.semantics { heading() })
+                Text("Next: ${q.action.description}. " +
+                    (q.risk?.let { "${TaskRunner.pct(it)} likely to submit, pay, send, or delete something." }
+                        ?: "The model could not say whether it submits, pays, sends, or deletes something."),
                     color = RpaTokens.TextSecondary, fontSize = 12.sp)
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     BossPrimaryButton("Continue", onClick = { component.answer(Answer.Proceed) }, modifier = Modifier.height(34.dp))

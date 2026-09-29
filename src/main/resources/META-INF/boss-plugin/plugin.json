@@ -4,7 +4,7 @@
   "displayName": "LLM RPA (Dynamic)",
   "version": "1.0.6",
   "apiVersion": "1.0.93",
-  "minApiVersion": "1.0.75",
+  "minApiVersion": "1.0.91",
   "minBossVersion": "9.2.63",
   "dependencies": [
     {
