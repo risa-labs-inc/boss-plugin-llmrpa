@@ -189,6 +189,9 @@ class ModelCallTest {
 
     @Test
     fun `masking is whole-word and covers the JSON spelling`() {
+        // Percent-encoded in an address, bare after an encoded quote or space.
+        assertEquals("https://x.example/?p=${Secrets.MASK}&q=%22${Secrets.MASK}", Secrets.mask("https://x.example/?p=hunter%232x&q=%22hunter#2x", setOf("hunter#2x")))
+        assertEquals("q=a%20${Secrets.MASK}", Secrets.mask("q=a%20hunter2x", setOf("hunter2x")))
         // After an escaped newline in JSON text, which ends in a letter.
         assertEquals("""{"instruction":"line one\n${Secrets.MASK} next"}""", Secrets.mask("""{"instruction":"line one\nhunter2x next"}""", setOf("hunter2x")))
         assertEquals("the pin is ${Secrets.MASK}, not 12345", Secrets.mask("the pin is 1234, not 12345", setOf("1234")))

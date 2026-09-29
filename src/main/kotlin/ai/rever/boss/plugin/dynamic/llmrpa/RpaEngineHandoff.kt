@@ -133,7 +133,7 @@ internal object RpaEngineHandoff {
      * Verbs RPA Engine's plan runner performs (`ActionRunner.execute`, rpaengine 1.3.1). A
      * cross-repo contract: `download` is `rpa_step`-only there, so a run's download cannot be exported.
      */
-    private val PLAN_VERBS = setOf("navigate", "click", "input", "select", "keypress", "submit", "wait", "scroll")
+    internal val PLAN_VERBS = setOf("navigate", "click", "input", "select", "keypress", "submit", "wait", "scroll")
 
     /** A run can be exported when it finished, or stopped after doing something. */
     fun exportable(run: RunState): Boolean = run.startUrl != null && when (run.status) {
@@ -156,7 +156,7 @@ internal object RpaEngineHandoff {
             // session or sign-in token. An address the run opened came from the instruction, the
             // caller or a checked model pick, and is kept whole.
             val found = checkNotNull(run.startUrl)
-            val start = Secrets.mask(if (run.opened != null) found else withoutQuery(found), secrets)
+            val start = Secrets.mask(if (run.opened != null) withoutUserInfo(found) else withoutQuery(found), secrets)
             if (run.opened == null && start != found) notes += "The start address was cut to $start: its query or fragment can carry a session or sign-in token."
             val actions = listOf(
                 EngineAction(name = "Open the start page", type = "navigate", selector = SelectorInfo(type = "none"), value = start, meta = mapOf("source" to "llm-rpa")),
@@ -171,7 +171,7 @@ internal object RpaEngineHandoff {
                     name = step.description,
                     type = a.type,
                     selector = a.selector ?: SelectorInfo(type = "none"),
-                    value = if (step.privateValue) "" else a.value?.let { Secrets.mask(it, secrets) },
+                    value = if (step.privateValue) "" else a.value?.let { v -> Secrets.mask(if (a.type == "navigate") withoutUserInfo(v) else v, secrets) },
                     meta = buildMap {
                         put("source", "llm-rpa")
                         put("step", step.index.toString())
@@ -179,10 +179,14 @@ internal object RpaEngineHandoff {
                     },
                 )
             }
+            if (actions.size == 1) notes += "Only the start page: no step of the run worked or could be exported."
+            // Every quoted value, email and address is masked here, not only known secrets: a run
+            // that stopped before its private field never learned which value was private.
+            val instruction = Candidates.scrub(run.instruction, Secrets.MASK)
             val stamp = java.time.Instant.ofEpochMilli(now).atZone(java.time.ZoneId.systemDefault())
             val date = java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss").format(stamp)
             val ok = run.steps.count { it.outcome == StepRecord.Outcome.OK }
-            val base = "llm-rpa-export-${slug(run.shareableInstruction)}-${java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss").format(stamp)}"
+            val base = "llm-rpa-export-${slug(instruction)}-${java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss").format(stamp)}"
             val dir = configDir.apply { mkdirs() }
             // Reserved with an exclusive create, since a rename replaces silently on most systems.
             // A scan that lands before the move reads an empty file, which it skips as unparseable.
@@ -190,10 +194,10 @@ internal object RpaEngineHandoff {
                 val f = File(dir, if (i == 1) "$base.json" else "$base-$i.json")
                 try { Files.createFile(f.toPath()); f to i } catch (_: java.nio.file.FileAlreadyExistsException) { null }
             }.firstOrNull() ?: error("$MAX_EXPORT_SUFFIX exports named $base already exist")
-            val name = "${run.shareableInstruction.trim().take(MAX_NAME_CHARS - 30).ifBlank { "LLM RPA run" }} (exported $date${if (n > 1) " #$n" else ""})"
+            val name = "${instruction.trim().take(MAX_NAME_CHARS - 30).ifBlank { "LLM RPA run" }} (exported $date${if (n > 1) " #$n" else ""})"
             val description = buildString {
                 append("Exported from LLM RPA on $date. ")
-                append("Instruction: ${run.shareableInstruction.trim()}. ")
+                append("Instruction: ${instruction.trim()}. ")
                 append("Model: ${run.modelName}. ")
                 append("Run: ${run.status.name.lowercase()}, $ok of ${run.steps.size} steps worked; only those are here.")
                 notes.forEach { append(' ').append(it) }
@@ -235,6 +239,13 @@ internal object RpaEngineHandoff {
             if (staging.exists()) staging.delete()
         }
     }
+
+    /** [url] without credentials (`user:token@`). */
+    internal fun withoutUserInfo(url: String): String = runCatching {
+        val u = java.net.URI(url)
+        if (u.rawUserInfo == null) url
+        else java.net.URI(u.scheme, null, u.host, u.port, u.path, u.query, u.fragment).toString()
+    }.getOrDefault(url)
 
     /** [url] without credentials, query or fragment. */
     internal fun withoutQuery(url: String): String = runCatching {

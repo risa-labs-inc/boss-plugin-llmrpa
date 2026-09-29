@@ -140,9 +140,9 @@ internal object Secrets {
      */
     fun mask(text: String, secrets: Collection<String>): String {
         var out = text
-        secrets.flatMap { listOf(it, jsonEscaped(it)) }.distinct().filter { it.isNotEmpty() }.sortedByDescending { it.length }.forEach { s ->
-            // An escape like \n in JSON text ends in a letter, and still separates words.
-            out = out.replace(Regex("(?:(?<![\\p{L}\\p{N}])|(?<=\\\\[nrtbf]))${Regex.escape(s)}(?![\\p{L}\\p{N}])"), Regex.escapeReplacement(MASK))
+        secrets.flatMap { listOf(it, jsonEscaped(it), java.net.URLEncoder.encode(it, Charsets.UTF_8), java.net.URLEncoder.encode(it, Charsets.UTF_8).replace("+", "%20")) }.distinct().filter { it.isNotEmpty() }.sortedByDescending { it.length }.forEach { s ->
+            // An escape like \n in JSON text, or %20 in an address, ends in a letter or digit and still separates words.
+            out = out.replace(Regex("(?:(?<![\\p{L}\\p{N}])|(?<=\\\\[nrtbf])|(?<=%[0-9A-Fa-f]{2}))${Regex.escape(s)}(?![\\p{L}\\p{N}])"), Regex.escapeReplacement(MASK))
         }
         return out
     }

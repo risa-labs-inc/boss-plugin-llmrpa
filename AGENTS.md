@@ -511,7 +511,9 @@ emails and addresses only, and Jev cannot write.
 - **Export reuses `RpaEngineHandoff`'s envelope and writer.** A navigate to `RunState.startUrl`, then
   each OK step's recorded `StepAction`. `download` is `rpa_step`-only in the engine and is left out
   with a note. The engine has no variables, so a private field is written with `value: ""`,
-  `meta.private = "true"` and a note in the description. Names come from `shareableInstruction`.
+  `meta.private = "true"` and a note in the description. The name, description and filename use
+  `Candidates.scrub` (every quoted value, email and address masked): a run that stopped before its
+  private field never learned which quoted value was private. Credentials leave every address.
 - **An export never replaces a file.** The name is reserved with `Files.createFile` and the content
   moved over it: an atomic rename replaces silently on Unix. A scan in between reads an empty file,
   which the engine skips as unparseable.

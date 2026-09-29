@@ -95,16 +95,42 @@ class RunExportTest {
 
     @Test
     fun `a tab found open loses its query, an address the run opened keeps it`() {
-        val found = run(RunStatus.DONE, emptyList()).copy(startUrl = "https://user:pw@mail.example:8443/inbox?session=abc123#msg")
+        val found = run(RunStatus.DONE, listOf(step(1, "click"))).copy(startUrl = "https://user:pw@mail.example:8443/inbox?session=abc123#msg")
         val e = RpaEngineHandoff.exportRun(found, dir, now).getOrThrow()
         assertEquals("https://mail.example:8443/inbox", read(e.file).actions[0].value)
         assertFalse(e.file.readText().contains("abc123") || e.file.readText().contains("pw@"))
         assertTrue(e.notes.single().contains("session or sign-in token"))
         val search = "https://duckduckgo.com/?q=weather+paris"
-        val opened = run(RunStatus.DONE, emptyList()).copy(startUrl = search, opened = OpenedPage(search, StartSource.SEARCH))
+        val opened = run(RunStatus.DONE, listOf(step(1, "click"))).copy(startUrl = search, opened = OpenedPage(search, StartSource.SEARCH))
         val kept = RpaEngineHandoff.exportRun(opened, dir, now + 1_000).getOrThrow()
         assertEquals(search, read(kept.file).actions[0].value)
         assertTrue(kept.notes.isEmpty())
+        // Credentials go on every path, even from an address the run opened as given.
+        val given = "https://bob:t0ken@intranet.example/app?view=1"
+        val caller = run(RunStatus.DONE, listOf(step(1, "click"))).copy(startUrl = given, opened = OpenedPage(given, StartSource.CALLER))
+        assertEquals("https://intranet.example/app?view=1", read(RpaEngineHandoff.exportRun(caller, dir, now + 2_000).getOrThrow().file).actions[0].value)
+    }
+
+    @Test
+    fun `a run that stopped before its private field writes none of the quoted values`() = runTest {
+        val page = SEARCH_PAGE.copy(elements = listOf(element("u1", "textbox", "Username"), element("p1", "textbox", "Password").copy(sensitive = true)))
+        val tools = FakeTools(page = page) { _, _ -> Triple("Type into 'Username'", 0.95, 1) }
+        val instruction = "Log in to shop.example as \"bob\" with \"hunter2x\""
+        val state = TaskRunner(tools, JevDecider(tools, JEV), "t1", instruction, RunLimits(maxSteps = 1, navSettleMs = 0, stepSettleMs = 0)) { Answer.Stop }.run()
+        assertEquals(RunStatus.STOPPED, state.status, state.summary)
+        assertEquals(StepRecord.Outcome.OK, state.steps.single().outcome)
+        // The run never learned hunter2x was the password, so the shareable text still has it; the file must not.
+        assertTrue(state.shareableInstruction.contains("hunter2x"))
+        val raw = RpaEngineHandoff.exportRun(state, dir, now).getOrThrow().file.readText()
+        assertFalse(raw.contains("hunter2x"), raw)
+        assertTrue(read(RpaEngineHandoff.exportRun(state, dir, now + 1_000).getOrThrow().file).name.startsWith("Log in to shop.example as \"${Secrets.MASK}\" with \"${Secrets.MASK}\""))
+    }
+
+    @Test
+    fun `exported verbs are the ones RPA Engine's plan runner performs`() {
+        // rpaengine 1.3.1 ActionRunner.execute, less screenshot/switch_frame (refused on a real browser),
+        // assert and run_script (never produced by a run) and download (rpa_step only).
+        assertEquals(setOf("navigate", "click", "input", "select", "keypress", "submit", "wait", "scroll"), RpaEngineHandoff.PLAN_VERBS)
     }
 
     @Test

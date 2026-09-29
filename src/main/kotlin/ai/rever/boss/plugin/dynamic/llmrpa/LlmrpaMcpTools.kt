@@ -119,7 +119,7 @@ internal class LlmrpaMcpToolProvider(
                     "and a private field's text is never written: that step types nothing and the description says so. " +
                     "Addresses from the instruction are kept; a tab the run found open is written without its query and fragment. " +
                     "Works for a done run, or a stopped or failed one with at least one step that worked. Returns the path and the action count.",
-            inputSchema = """{"type":"object","additionalProperties":false,"properties":{""" +
+            inputSchema = """{"type":"object","properties":{""" +
                 """"run":{"type":"integer","minimum":1,"default":1,"description":"Which finished run, newest first: 1 is the last one"}}}""",
             readOnly = false,
             handler = McpToolHandler { args -> export(args) },

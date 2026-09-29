@@ -632,7 +632,8 @@ class LlmrpaComponent(
                 r.markStopped()
                 _run.value = r.state.value
                 mirror.cancel()
-                _pastRuns.update { (listOf(r.state.value) + it).take(10) }
+                // Only the newest few keep their call text; the panel expands calls for the run on screen.
+                _pastRuns.update { (listOf(r.state.value) + it).take(10).mapIndexed { i, p -> if (i < 3) p else p.copy(modelCalls = p.modelCalls.map(ModelCall::withoutText)) } }
                 runHistory.add(r.state.value)
             }
         }.also { job ->

@@ -125,7 +125,7 @@ class JevDecider(private val tools: ToolInvoker, override val option: ModelOptio
 
     /**
      * One `jev_decide` call, recorded with its questions, Jev's probabilities and what it parsed
-     * to. A throw from the tool is recorded, then rethrown for the caller's guard.
+     * to. A throw from the tool is recorded and returned as a failure, like any decider's.
      */
     private suspend fun <T> ask(kind: CallKind, args: JsonObject, parse: (JsonObject) -> T, outcome: (T) -> CallOutcome): Result<T> {
         val started = System.nanoTime()
@@ -142,7 +142,7 @@ class JevDecider(private val tools: ToolInvoker, override val option: ModelOptio
             throw e
         } catch (e: Throwable) {
             recordCall { record(null, Result.failure(e)) }
-            throw e
+            return Result.failure(e)
         }
         val result = if (reply.isError) Result.failure(IllegalStateException(reply.errorMessage))
         else guarded { Result.success(parse(reply.json ?: error("Jev returned no JSON"))) }
@@ -408,7 +408,7 @@ class ChatDecider(
         val request = AiRequest(system = START_SYSTEM, messages = listOf(AiMessage.user("Instruction: ${quote(instruction, 1_000)}")),
             temperature = 0f, maxTokens = 2_000, timeoutMs = 90_000, extras = routingExtras(option))
         val (reply, parsed) = call(api, CallKind.START_URL, request, { StartUrlReply(parseStartUrl(it)) }) { CallOutcome(it.url ?: "no address") }
-        if (reply == null) Result.failure(StartUrlCallFailed(parsed.exceptionOrNull()!!)) else parsed
+        if (reply == null) Result.failure(StartUrlCallFailed(requireNotNull(parsed.exceptionOrNull()) { "A failed request carries its error" })) else parsed
     }
 
     private fun request(user: String) = AiRequest(
@@ -466,13 +466,13 @@ Give the real https address of the site or page the instruction is about. Never 
 If you do not know a fitting site, reply {"url": null}.
         """.trimIndent()
 
-        /** The "url" string in a start-page reply, or null. Validation is the caller's. */
         /** A request as the model reads it: the system prompt, then each turn. */
         internal fun promptText(request: AiRequest): String = buildString {
             append("[system]\n").append(request.system)
             request.messages.forEach { append("\n\n[").append(it.role).append("]\n").append(it.text) }
         }
 
+        /** The "url" string in a start-page reply, or null. Validation is the caller's. */
         internal fun parseStartUrl(text: String): String? = runCatching {
             val obj = Json.parseToJsonElement(LlmApiClient.firstJsonObject(text) ?: return null).jsonObject
             (obj["url"] as? JsonPrimitive)?.takeIf { it.isString }?.content
