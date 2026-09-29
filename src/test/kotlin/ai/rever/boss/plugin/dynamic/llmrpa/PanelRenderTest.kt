@@ -1,7 +1,13 @@
 package ai.rever.boss.plugin.dynamic.llmrpa
 
 import ai.rever.boss.plugin.api.ActiveTabData
+import ai.rever.boss.plugin.ui.BossTheme
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.padding
 import androidx.compose.ui.ExperimentalComposeUiApi
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.ImageComposeScene
 import androidx.compose.ui.unit.Density
 import com.arkivanov.decompose.DefaultComponentContext
@@ -26,9 +32,11 @@ class PanelRenderTest {
 
     private fun tabs(list: List<ActiveTabData>) = FakeTabs(list, focused = { list.firstOrNull()?.tabId })
 
+    private val exportDir = Files.createTempDirectory("render-export").toFile().apply { deleteOnExit() }
+
     private fun component(tools: ToolInvoker, openTabs: List<ActiveTabData> = listOf(tab)) =
-        LlmrpaComponent(DefaultComponentContext(LifecycleRegistry()), LlmrpaInfo, tabs(openTabs), { null }, tools = tools, llmProvider = { null }, tabLocks = TabLocks(),
-            io = Dispatchers.Main, work = Dispatchers.Main, baseLimits = RunLimits(navSettleMs = 0, stepSettleMs = 0))
+        LlmrpaComponent(DefaultComponentContext(LifecycleRegistry()), LlmrpaInfo, tabs(openTabs), { null }, tools = tools, llmProvider = { null }, tabLocks = TabLocks(), runHistory = RunHistory(),
+            io = Dispatchers.Main, work = Dispatchers.Main, baseLimits = RunLimits(navSettleMs = 0, stepSettleMs = 0), exportDir = exportDir)
 
     @Test
     fun `renders every state at every width`() {
@@ -71,13 +79,19 @@ class PanelRenderTest {
             assertEquals(RunStatus.DONE, done.run.value?.status)
             render(done, 360, 1000, "done-360")
             render(done, 1440, 800, "done-wide-1440")
+            done.exportRun(done.run.value!!)
+            render(done, 360, 1100, "exported-360")
+            val calls = done.run.value!!.modelCalls
+            listOf(2, 1).forEach { step ->
+                renderContent(360, 900, "calls-step$step-360") { BossTheme { Column(Modifier.background(RpaTokens.Content).padding(12.dp)) { ModelCallsRow(calls.filter { it.step == step }, initiallyExpanded = true) } } }
+            }
 
             val noTab = component(FakeTools { _, _ -> Triple("The task is complete", 0.9, null) }, openTabs = emptyList())
             noTab.updateInstruction(instruction)
             render(noTab, 360, 800, "no-tab-360")
 
             val opened = LlmrpaComponent(DefaultComponentContext(LifecycleRegistry()), LlmrpaInfo, FakeTabs(emptyList(), create = { "new1" }), { null },
-                tools = FakeTools { _, _ -> Triple("The task is complete", 0.9, null) }, llmProvider = { null }, tabLocks = TabLocks(),
+                tools = FakeTools { _, _ -> Triple("The task is complete", 0.9, null) }, llmProvider = { null }, tabLocks = TabLocks(), runHistory = RunHistory(),
                 io = Dispatchers.Main, work = Dispatchers.Main, baseLimits = RunLimits(navSettleMs = 0, stepSettleMs = 0, openWaitsMs = listOf(0)))
             opened.updateInstruction("Check the weather in Paris")
             assertEquals(null, opened.startRun())
@@ -114,9 +128,11 @@ class PanelRenderTest {
         }
     }
 
-    private fun render(component: LlmrpaComponent, width: Int, height: Int, name: String) {
+    private fun render(component: LlmrpaComponent, width: Int, height: Int, name: String) = renderContent(width, height, name) { LlmrpaContent(component) }
+
+    private fun renderContent(width: Int, height: Int, name: String, content: @androidx.compose.runtime.Composable () -> Unit) {
         val out = Path.of("build/reports/visual/llmrpa-$name.png")
-        val scene = ImageComposeScene(width = width, height = height, density = Density(1f)) { LlmrpaContent(component) }
+        val scene = ImageComposeScene(width = width, height = height, density = Density(1f), content = content)
         try {
             val png = checkNotNull(scene.render().encodeToData(EncodedImageFormat.PNG))
             Files.createDirectories(out.parent)

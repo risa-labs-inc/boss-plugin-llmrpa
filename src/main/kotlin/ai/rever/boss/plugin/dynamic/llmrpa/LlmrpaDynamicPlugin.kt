@@ -44,6 +44,7 @@ class LlmrpaDynamicPlugin : DynamicPlugin {
         val tools = RegistryToolInvoker { runCatching { context.mcpToolRegistry }.getOrNull() }
         val llmProvider = { runCatching { context.llmProvider }.getOrNull() }
         val tabLocks = TabLocks()
+        val runHistory = RunHistory()
 
         context.panelRegistry.registerPanel(LlmrpaInfo) { ctx, panelInfo ->
             LlmrpaComponent(
@@ -61,6 +62,7 @@ class LlmrpaDynamicPlugin : DynamicPlugin {
                 tools,
                 llmProvider,
                 tabLocks,
+                runHistory,
             ).also { comp ->
                 lastComponent = comp
                 // Clear on panel close: a destroyed component's scope is cancelled,
@@ -87,7 +89,9 @@ class LlmrpaDynamicPlugin : DynamicPlugin {
                         withContext(Dispatchers.Main) { p.createBrowserTab(url, title) }
                     },
                     locks = tabLocks,
+                    runs = runHistory,
                 ),
+                runs = runHistory,
             ),
         )
     }
