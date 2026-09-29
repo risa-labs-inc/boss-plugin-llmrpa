@@ -443,8 +443,12 @@ class TaskRunner(
     }
 
     companion object {
-        /** RPA Engine's code before a new tab is registered; retried silently. */
-        private const val TAB_NOT_FOUND = "TAB_NOT_FOUND"
+        /**
+         * RPA Engine's code before a new tab is registered; retried silently. A cross-repo contract,
+         * read from rpaengine `TabActions.kt` (`TabErrorCodes`, 1.3): a rename degrades to reporting
+         * the raw message, never to a wrong result.
+         */
+        internal const val TAB_NOT_FOUND = "TAB_NOT_FOUND"
 
         fun pct(p: Double): String = "${(p * 100).toInt()}%"
     }

@@ -64,6 +64,7 @@ internal object StartPages {
 
     private val LOCAL_SUFFIXES = listOf(".localhost", ".local", ".internal", ".lan", ".home.arpa", ".intranet", ".corp")
     private val TLD = Regex("[a-z]{2,63}|xn--[a-z0-9-]{1,59}")
+    private val HEX_LABEL = Regex("0x[0-9a-f]*")
 
     /**
      * A model's pick is a public site: a dotted name with an alphabetic TLD, so no localhost,
@@ -74,7 +75,7 @@ internal object StartPages {
         if (host.endsWith(".") || host.startsWith("[") || !host.contains('.')) return false
         if (LOCAL_SUFFIXES.any { host.endsWith(it) }) return false
         val labels = host.split('.')
-        if (labels.any { it.isEmpty() || it.startsWith("0x") }) return false
+        if (labels.any { it.isEmpty() || HEX_LABEL.matches(it) }) return false
         return TLD.matches(labels.last())
     }
 

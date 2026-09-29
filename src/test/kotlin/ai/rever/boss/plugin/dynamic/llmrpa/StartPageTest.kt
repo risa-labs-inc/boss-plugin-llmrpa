@@ -78,6 +78,9 @@ class StartPageTest {
     @Test
     fun `a model address must be a public https address`() {
         assertEquals("https://www.bbc.co.uk/weather", StartPages.usable(" https://www.bbc.co.uk/weather ", httpsOnly = true))
+        // A name that merely starts with 0x is a real host.
+        assertEquals("https://www.0xproject.com/", StartPages.usable("https://www.0xproject.com/", httpsOnly = true))
+        assertNull(StartPages.usable("https://0x7f.0x1/", httpsOnly = true))
         listOf(
             "http://example.com", "javascript:alert(1)", "data:text/html,hi", "file:///etc/passwd", "https://user:pw@example.com/",
             "https://localhost/", "https://127.0.0.1/", "https://[::1]/", "https://exa mple.com", "example.com", "", null,
@@ -141,6 +144,21 @@ class StartPageTest {
     fun `an address outside quotes is the start page before one meant to be typed`() {
         assertEquals("https://blog.example/new", StartPages.fromInstruction("Paste 'https://paste.example/x' into the post at https://blog.example/new"))
         assertEquals("https://paste.example/x", StartPages.fromInstruction("Open 'https://paste.example/x'"))
+    }
+
+    @Test
+    fun `the search scrub keeps the words around apostrophes and quoted values`() {
+        assertEquals("https://duckduckgo.com/?q=Find+Ada%27s+order+for+and+don%27t+pay",
+            StartPages.searchUrl("Find Ada's order for 'ACME-4471' and don't pay"))
+    }
+
+    @Test
+    fun `a new tab that is not registered yet is waited for`() = runTest {
+        val tools = FakeTools(decide = done)
+        var n = 0
+        tools.observeHook = { if (n++ < 2) ToolReply("""{"error":{"code":"${TaskRunner.TAB_NOT_FOUND}","message":"No tab with id 'new1'"}}""", true) else null }
+        val state = headless(tools, emptyList(), emptySet()).execute("Open https://orders.example/", null, 3, null, newTab = true).getOrThrow()
+        assertEquals(RunStatus.DONE, state.status)
     }
 
     @Test
@@ -328,6 +346,9 @@ class StartPageTest {
         assertEquals(listOf("https://orders.example/"), opened)
         assertTrue(r.execute("x", null, 3, null, startUrl = "javascript:alert(1)").isFailure)
         assertTrue(r.execute("x", "t1", 3, null, newTab = true).exceptionOrNull()!!.message!!.contains("not both"))
+        val tool = LlmrpaMcpToolProvider("p", component = { null }, headless = r).tools().first { it.name == "llmrpa_execute" }.handler
+        val blank = tool.call(ai.rever.boss.plugin.api.McpToolArgs(emptyMap(), """{"instruction":"Open https://orders.example/","tab_id":"","new_tab":true}"""))
+        assertFalse(blank.isError, blank.text)
     }
 
     @Test

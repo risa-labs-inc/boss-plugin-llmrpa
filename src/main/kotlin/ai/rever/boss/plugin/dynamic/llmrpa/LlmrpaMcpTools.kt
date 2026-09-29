@@ -59,7 +59,7 @@ internal class LlmrpaMcpToolProvider(
                 val maxSteps = ((root["max_steps"] as? JsonPrimitive)?.intOrNull ?: RunLimits().maxSteps).coerceIn(1, 50)
                 headless.execute(
                     instruction,
-                    (root["tab_id"] as? JsonPrimitive)?.contentOrNull,
+                    (root["tab_id"] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() },
                     maxSteps,
                     (root["model"] as? JsonPrimitive)?.contentOrNull,
                     newTab = (root["new_tab"] as? JsonPrimitive)?.booleanOrNull ?: false,

@@ -276,6 +276,7 @@ class ChatDecider(
         val api = runCatching { gateway() }.getOrNull() ?: return@guarded Result.failure(IllegalStateException("The AI Gateway plugin is not available"))
         routingProblem(api, option)?.let { return@guarded Result.failure(IllegalStateException(it)) }
         val reply = api.complete(
+            // 2 000 tokens for one field: room for reasoning models, as in decide.
             AiRequest(system = START_SYSTEM, messages = listOf(AiMessage.user("Instruction: ${quote(instruction, 1_000)}")),
                 temperature = 0f, maxTokens = 2_000, timeoutMs = 90_000, extras = routingExtras(option)),
         ).getOrElse { return@guarded Result.failure(StartUrlCallFailed(it)) }
