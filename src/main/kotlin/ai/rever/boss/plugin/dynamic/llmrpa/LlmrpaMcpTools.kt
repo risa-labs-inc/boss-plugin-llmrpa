@@ -182,7 +182,8 @@ internal class LlmrpaMcpToolProvider(
             listOf("include_calls", "verbose").any { (root?.get(it) as? JsonPrimitive)?.booleanOrNull == true }
 
         private fun listing(runs: List<RunState>): String = runs.take(10).withIndex().joinToString { (i, r) ->
-            "${i + 1}: ${r.status.name.lowercase()} '${r.shareableInstruction.take(50)}' (${r.steps.count { it.outcome == StepRecord.Outcome.OK }} steps ok)"
+            // Scrubbed like an export's name: a run that stopped early never learned which value was private.
+            "${i + 1}: ${r.status.name.lowercase()} '${Candidates.scrub(r.instruction, Secrets.MASK).take(50)}' (${r.steps.count { it.outcome == StepRecord.Outcome.OK }} steps ok)"
         }
 
         /** A step's model calls in one line each: what was asked, the pick, how sure, how long. */
@@ -214,7 +215,7 @@ internal class LlmrpaMcpToolProvider(
                 }
             })
             // An older run's text is let go to save memory; saying so reads better than an empty string.
-            if (c.request.dropped) put("text_dropped", "kept for the 3 newest runs only") else {
+            if (c.request.dropped) put("text_dropped", ModelCall.TEXT_DROPPED) else {
                 put("request", c.request.text)
                 if (c.request.truncated) put("request_truncated", true)
                 c.response?.let { put("response", it.text); if (it.truncated) put("response_truncated", true) }

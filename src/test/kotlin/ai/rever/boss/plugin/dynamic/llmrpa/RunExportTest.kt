@@ -217,7 +217,7 @@ class RunExportTest {
         suspend fun call(raw: String) = tool.handler.call(McpToolArgs(emptyMap(), raw))
         assertTrue(call("{}").isError)
 
-        history.add(run(RunStatus.STOPPED, listOf(step(1, "click", StepRecord.Outcome.FAILED)), instruction = "Older"))
+        history.add(run(RunStatus.STOPPED, listOf(step(1, "click", StepRecord.Outcome.FAILED)), instruction = "Older, as \"bob\" with \"hunter2x\""))
         history.add(run(RunStatus.DONE, listOf(step(1, "click"), step(2, "download"))))
         val result = call("{}")
         assertFalse(result.isError, result.text)
@@ -228,7 +228,10 @@ class RunExportTest {
         assertNotNull(out["notes"])
         val older = call("""{"run":2}""")
         assertTrue(older.isError && older.text.contains("no step that worked"), older.text)
-        assertTrue(call("""{"run":3}""").text.contains("There is no run 3"))
+        val missing = call("""{"run":3}""").text
+        assertTrue(missing.contains("There is no run 3"))
+        // The listing scrubs quoted values like an export's name does.
+        assertTrue(missing.contains("Older, as \"${Secrets.MASK}\"") && !missing.contains("hunter2x"), missing)
     }
 
     @Test

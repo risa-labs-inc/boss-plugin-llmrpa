@@ -532,3 +532,5 @@ emails and addresses only, and Jev cannot write.
 - A record that cannot be built or stored becomes a text-less stub, so `calls` still counts it.
 - The export adds a 1.5 s `wait` after the start page and after each step that navigated, where the
   live run waited before looking again. Selectors are written as the page gave them.
+- Masking every untyped quoted value errs safe and over-masks the call view: a search term or the
+  username about to be typed is blanked too, and stays blanked. Expected; the timeline shows them.

@@ -34,12 +34,12 @@ class TabLocks {
  * Finished runs from the panel and `llmrpa_execute`, newest first, so `llmrpa_export` reaches
  * either. In memory only.
  */
-class RunHistory(private val keep: Int = 20, private val keepCallText: Int = 3) {
+class RunHistory(private val keep: Int = 20) {
     private val runs = AtomicReference<List<RunState>>(emptyList())
 
     /** Older runs keep their steps and call summaries, not the call text: export needs only steps. */
     fun add(run: RunState) {
-        runs.updateAndGet { (listOf(run) + it).take(keep).mapIndexed { i, r -> if (i < keepCallText) r else r.copy(modelCalls = r.modelCalls.map(ModelCall::withoutText)) } }
+        runs.updateAndGet { (listOf(run) + it).take(keep).mapIndexed { i, r -> ModelCall.trimmed(r, i) } }
     }
     fun recent(): List<RunState> = runs.get()
 }

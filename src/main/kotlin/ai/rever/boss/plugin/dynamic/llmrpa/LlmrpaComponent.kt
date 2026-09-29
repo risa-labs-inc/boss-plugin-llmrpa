@@ -633,7 +633,7 @@ class LlmrpaComponent(
                 _run.value = r.state.value
                 mirror.cancel()
                 // Only the newest few keep their call text; the panel expands calls for the run on screen.
-                _pastRuns.update { (listOf(r.state.value) + it).take(10).mapIndexed { i, p -> if (i < 3) p else p.copy(modelCalls = p.modelCalls.map(ModelCall::withoutText)) } }
+                _pastRuns.update { (listOf(r.state.value) + it).take(PAST_RUNS).mapIndexed { i, p -> ModelCall.trimmed(p, i) } }
                 runHistory.add(r.state.value)
             }
         }.also { job ->
@@ -700,6 +700,8 @@ class LlmrpaComponent(
 
     companion object {
         private const val READINESS_POLL_MS = 2_000L
+        /** Finished runs the panel lists under "Earlier". */
+        private const val PAST_RUNS = 10
         private const val PROBE_EVERY_MS = 10_000L
         /** RPA Engine's tool that loads a saved configuration into its panel by name. */
         internal const val RPA_LOAD = "rpa_load"

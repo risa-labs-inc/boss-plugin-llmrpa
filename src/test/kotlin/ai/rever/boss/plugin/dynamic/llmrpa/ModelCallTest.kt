@@ -176,17 +176,17 @@ class ModelCallTest {
 
     @Test
     fun `older runs in the history keep their call summaries but not the text`() {
-        val history = RunHistory(keepCallText = 1)
+        val history = RunHistory()
         val call = ModelCall(1, CallKind.DECIDE, ToolNames.JEV_DECIDE, "m", request = CappedText("req"), response = CappedText("resp"), pick = "x", latencyMs = 3, costUsd = 0.1)
         val run = RunState("i", "m", 12, modelCalls = listOf(call), startedAt = 0)
-        history.add(run)
-        history.add(run.copy(startedAt = 1))
-        val (newest, older) = history.recent()
+        repeat(ModelCall.TEXT_KEPT_RUNS + 1) { history.add(run.copy(startedAt = it.toLong())) }
+        val newest = history.recent().first()
+        val older = history.recent().last()
         assertEquals("req", newest.modelCalls.single().request.text)
         assertEquals(CappedText("", dropped = true), older.modelCalls.single().request)
         assertEquals("x" to 0.1, older.modelCalls.single().pick to older.costUsd)
         val detail = LlmrpaMcpToolProvider.callDetail(older.modelCalls.single())
-        assertEquals(JsonPrimitive("kept for the 3 newest runs only"), detail["text_dropped"])
+        assertEquals(JsonPrimitive("The prompt and reply are kept for the 3 newest runs only"), detail["text_dropped"])
         assertNull(detail["request"])
     }
 

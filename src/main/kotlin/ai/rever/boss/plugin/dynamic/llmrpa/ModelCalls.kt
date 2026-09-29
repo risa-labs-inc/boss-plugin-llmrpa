@@ -76,6 +76,16 @@ data class ModelCall(
     companion object {
         const val GATEWAY = "ai_gateway"
 
+        /** Runs that keep their call text; older ones keep steps and summaries only. */
+        const val TEXT_KEPT_RUNS = 3
+
+        /** Why an older run's call has no text, as the panel and `include_calls` say it. */
+        const val TEXT_DROPPED = "The prompt and reply are kept for the $TEXT_KEPT_RUNS newest runs only"
+
+        /** Keeps [run]'s call text only when it is among the [TEXT_KEPT_RUNS] newest ([index] 0 = newest). */
+        fun trimmed(run: RunState, index: Int): RunState =
+            if (index < TEXT_KEPT_RUNS) run else run.copy(modelCalls = run.modelCalls.map(ModelCall::withoutText))
+
         /** What is known of a call whose record could not be built, so the count still holds. */
         internal fun stub(kind: CallKind, tool: String, model: String) =
             ModelCall(0, kind, tool, model, request = CappedText(""), latencyMs = 0, error = "This call happened but could not be recorded")
