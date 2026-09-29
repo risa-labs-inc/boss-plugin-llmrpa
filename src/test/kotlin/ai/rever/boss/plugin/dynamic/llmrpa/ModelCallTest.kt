@@ -167,7 +167,30 @@ class ModelCallTest {
     }
 
     @Test
+    fun `a recorder that throws does not fail a good decision`() = runTest {
+        val tools = FakeTools { _, _ -> Triple("Open 'Sign in' link", 0.9, null) }
+        val ctx = StepContext("Sign in", SEARCH_PAGE, Candidates.build(SEARCH_PAGE, "Sign in", writes = false), emptyList(), emptyList())
+        val d = kotlinx.coroutines.withContext(CallRecorder(1) { throw NoSuchMethodError("AiReply.getUsage") }) { JevDecider(tools, JEV).decide(ctx) }
+        assertEquals("Open 'Sign in' link", ctx.candidates.first { it.key == d.getOrThrow().key }.description)
+    }
+
+    @Test
+    fun `older runs in the history keep their call summaries but not the text`() {
+        val history = RunHistory(keepCallText = 1)
+        val call = ModelCall(1, CallKind.DECIDE, ToolNames.JEV_DECIDE, "m", request = CappedText("req"), response = CappedText("resp"), pick = "x", latencyMs = 3, costUsd = 0.1)
+        val run = RunState("i", "m", 12, modelCalls = listOf(call), startedAt = 0)
+        history.add(run)
+        history.add(run.copy(startedAt = 1))
+        val (newest, older) = history.recent()
+        assertEquals("req", newest.modelCalls.single().request.text)
+        assertEquals(CappedText("", truncated = true), older.modelCalls.single().request)
+        assertEquals("x" to 0.1, older.modelCalls.single().pick to older.costUsd)
+    }
+
+    @Test
     fun `masking is whole-word and covers the JSON spelling`() {
+        // After an escaped newline in JSON text, which ends in a letter.
+        assertEquals("""{"instruction":"line one\n${Secrets.MASK} next"}""", Secrets.mask("""{"instruction":"line one\nhunter2x next"}""", setOf("hunter2x")))
         assertEquals("the pin is ${Secrets.MASK}, not 12345", Secrets.mask("the pin is 1234, not 12345", setOf("1234")))
         assertEquals("""{"v1":"${Secrets.MASK}"}""", Secrets.mask("""{"v1":"pa\"ss"}""", setOf("pa\"ss")))
         assertEquals("there", Secrets.mask("there", setOf("the")))
@@ -186,6 +209,9 @@ class ModelCallTest {
         val cut = ModelCall.cap(text, listOf("s3cretvalue"))
         assertEquals("x".repeat(ModelCall.MAX_TEXT_BYTES - 3), cut.text)
         assertTrue(cut.truncated)
+        // Moving the cut back past one value can land inside another; it moves until none straddles it.
+        val overlap = "x".repeat(ModelCall.MAX_TEXT_BYTES - 6) + "abcdefghij" + "y".repeat(100)
+        assertEquals("x".repeat(ModelCall.MAX_TEXT_BYTES - 6) + "a", ModelCall.cap(overlap, listOf("ghij", "defgh", "bcde")).text)
     }
 
     @Test

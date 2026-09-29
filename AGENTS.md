@@ -518,3 +518,8 @@ emails and addresses only, and Jev cannot write.
 - "Open in RPA Engine" is `rpa_load` by the configuration's name, which needs the engine's panel open;
   its answer is shown as is. `RunHistory` is shared like `TabLocks` so `llmrpa_export` reaches panel
   and headless runs.
+- **Recording is best-effort** (`recordCall` takes a builder and swallows its throws): it runs after
+  the answer is in, so an api mismatch reading `AiReply.usage` must not fail a good pick.
+- **A tab the run found open is exported without its query and fragment** (a session or sign-in
+  token rides there); an address the run opened itself is kept, since a search fallback needs its `?q=`.
+- `RunHistory` keeps call text for the newest 3 runs only; export needs just the steps.

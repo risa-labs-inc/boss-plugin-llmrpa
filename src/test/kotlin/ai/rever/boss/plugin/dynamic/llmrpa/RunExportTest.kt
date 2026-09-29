@@ -94,6 +94,20 @@ class RunExportTest {
     }
 
     @Test
+    fun `a tab found open loses its query, an address the run opened keeps it`() {
+        val found = run(RunStatus.DONE, emptyList()).copy(startUrl = "https://user:pw@mail.example:8443/inbox?session=abc123#msg")
+        val e = RpaEngineHandoff.exportRun(found, dir, now).getOrThrow()
+        assertEquals("https://mail.example:8443/inbox", read(e.file).actions[0].value)
+        assertFalse(e.file.readText().contains("abc123") || e.file.readText().contains("pw@"))
+        assertTrue(e.notes.single().contains("session or sign-in token"))
+        val search = "https://duckduckgo.com/?q=weather+paris"
+        val opened = run(RunStatus.DONE, emptyList()).copy(startUrl = search, opened = OpenedPage(search, StartSource.SEARCH))
+        val kept = RpaEngineHandoff.exportRun(opened, dir, now + 1_000).getOrThrow()
+        assertEquals(search, read(kept.file).actions[0].value)
+        assertTrue(kept.notes.isEmpty())
+    }
+
+    @Test
     fun `a download is left out with a note, since plans cannot download`() {
         val r = run(RunStatus.DONE, listOf(step(1, "click"), step(2, "download", description = "Download image 'cat.jpg'")))
         val e = RpaEngineHandoff.exportRun(r, dir, now).getOrThrow()

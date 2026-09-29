@@ -661,11 +661,20 @@ class LlmrpaComponent(
     private val _export = MutableStateFlow<ExportNotice?>(null)
     internal val export: StateFlow<ExportNotice?> = _export
 
+    private val _exporting = MutableStateFlow(false)
+    /** An export is being written; the button waits, so a double click cannot write two files. */
+    val exporting: StateFlow<Boolean> = _exporting
+
     /** Writes [run]'s steps that worked as an RPA Engine configuration. */
     fun exportRun(run: RunState) {
+        if (!_exporting.compareAndSet(expect = false, update = true)) return
         scope.launch {
-            val result = withContext(io) { RpaEngineHandoff.exportRun(run, exportDir) }
-            _export.value = ExportNotice(run.startedAt, result.getOrNull(), result.exceptionOrNull()?.let { it.message ?: it::class.simpleName })
+            try {
+                val result = withContext(io) { RpaEngineHandoff.exportRun(run, exportDir) }
+                _export.value = ExportNotice(run.startedAt, result.getOrNull(), result.exceptionOrNull()?.let { it.message ?: it::class.simpleName })
+            } finally {
+                _exporting.value = false
+            }
         }
     }
 

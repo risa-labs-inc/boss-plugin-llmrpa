@@ -151,8 +151,15 @@ internal object RpaEngineHandoff {
         runCatching {
             require(exportable(run)) { "Only a finished run, or a stopped one with a step that worked, can be exported" }
             val notes = mutableListOf<String>()
+            val secrets = Secrets.of(run.instruction)
+            // A tab the run found open was not chosen for it, and its query or fragment can carry a
+            // session or sign-in token. An address the run opened came from the instruction, the
+            // caller or a checked model pick, and is kept whole.
+            val found = checkNotNull(run.startUrl)
+            val start = Secrets.mask(if (run.opened != null) found else withoutQuery(found), secrets)
+            if (run.opened == null && start != found) notes += "The start address was cut to $start: its query or fragment can carry a session or sign-in token."
             val actions = listOf(
-                EngineAction(name = "Open the start page", type = "navigate", selector = SelectorInfo(type = "none"), value = run.startUrl, meta = mapOf("source" to "llm-rpa")),
+                EngineAction(name = "Open the start page", type = "navigate", selector = SelectorInfo(type = "none"), value = start, meta = mapOf("source" to "llm-rpa")),
             ) + run.steps.filter { it.outcome == StepRecord.Outcome.OK }.mapNotNull { step ->
                 val a = step.action ?: return@mapNotNull null
                 if (a.type !in PLAN_VERBS) {
@@ -164,7 +171,7 @@ internal object RpaEngineHandoff {
                     name = step.description,
                     type = a.type,
                     selector = a.selector ?: SelectorInfo(type = "none"),
-                    value = if (step.privateValue) "" else a.value,
+                    value = if (step.privateValue) "" else a.value?.let { Secrets.mask(it, secrets) },
                     meta = buildMap {
                         put("source", "llm-rpa")
                         put("step", step.index.toString())
@@ -228,6 +235,12 @@ internal object RpaEngineHandoff {
             if (staging.exists()) staging.delete()
         }
     }
+
+    /** [url] without credentials, query or fragment. */
+    internal fun withoutQuery(url: String): String = runCatching {
+        val u = java.net.URI(url)
+        "${u.scheme}://${u.host}${if (u.port != -1) ":${u.port}" else ""}${u.rawPath.orEmpty()}".takeIf { u.scheme != null && u.host != null }
+    }.getOrNull() ?: url.substringBefore('#').substringBefore('?')
 
     private fun RpaActionConfig.toEngineAction() =
         EngineAction(

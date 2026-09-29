@@ -603,7 +603,11 @@ private fun ResultCard(component: LlmrpaComponent, run: RunState) {
         val notice = component.export.collectAsState().value?.takeIf { it.runStartedAt == run.startedAt }
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             OutlineButton("Run again", { component.reuse(run); component.startRun() })
-            if (RpaEngineHandoff.exportable(run)) OutlineButton("Export as RPA config", { component.exportRun(run) }, tone = Tone.NEUTRAL)
+            val exporting = component.exporting.collectAsState().value
+            if (RpaEngineHandoff.exportable(run)) {
+                OutlineButton(if (exporting) "Exporting…" else if (notice?.export != null) "Export again" else "Export as RPA config",
+                    { component.exportRun(run) }, enabled = !exporting, tone = Tone.NEUTRAL)
+            }
         }
         notice?.let { n ->
             n.error?.let { Notice("Could not export: $it", Tone.ERROR) }

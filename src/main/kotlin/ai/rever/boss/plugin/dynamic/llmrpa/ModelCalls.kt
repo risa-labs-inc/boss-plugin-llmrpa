@@ -2,6 +2,7 @@ package ai.rever.boss.plugin.dynamic.llmrpa
 
 import kotlin.coroutines.AbstractCoroutineContextElement
 import kotlin.coroutines.CoroutineContext
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
 
 /** What a model call was for. */
@@ -66,6 +67,9 @@ data class ModelCall(
         c.copy(request = cap(c.request.text, avoid), response = c.response?.let { cap(it.text, avoid) })
     }
 
+    /** Without the request and reply text, which is most of its size. */
+    fun withoutText(): ModelCall = copy(request = CappedText("", request.text.isNotEmpty()), response = response?.let { CappedText("", it.text.isNotEmpty()) })
+
     companion object {
         const val GATEWAY = "ai_gateway"
         const val MAX_TEXT_BYTES = 8 * 1024
@@ -87,9 +91,14 @@ data class ModelCall(
                 bytes += n
                 end += Character.charCount(cp)
             }
-            val cut = avoid.filter { it.length > 1 }.mapNotNull { v ->
-                (1 until v.length).lastOrNull { k -> end - k >= 0 && text.startsWith(v, end - k) }?.let { end - it }
-            }.minOrNull() ?: end
+            // Until nothing straddles the cut: moving it back can land inside another value.
+            var cut = end
+            while (true) {
+                val earlier = avoid.filter { it.length > 1 }.mapNotNull { v ->
+                    (1 until v.length).lastOrNull { k -> cut - k >= 0 && text.startsWith(v, cut - k) }?.let { cut - it }
+                }.minOrNull() ?: break
+                cut = earlier
+            }
             return CappedText(text.substring(0, cut), truncated = true)
         }
     }
@@ -105,9 +114,18 @@ internal class CallRecorder(val step: Int, private val sink: (ModelCall) -> Unit
     fun record(call: ModelCall) = sink(call.copy(step = step))
 }
 
-/** Reports [call] to the run's recorder, if any. */
-internal suspend fun recordCall(call: ModelCall) {
-    currentCoroutineContext()[CallRecorder]?.record(call)
+/**
+ * Reports the call [build] describes to the run's recorder, if any. Best-effort: it runs after the
+ * answer is in, so a throw here (an api mismatch reading the reply, say) must not fail a good pick.
+ */
+internal suspend fun recordCall(build: () -> ModelCall) {
+    val recorder = currentCoroutineContext()[CallRecorder] ?: return
+    try {
+        recorder.record(build())
+    } catch (e: CancellationException) {
+        throw e
+    } catch (_: Throwable) {
+    }
 }
 
 internal object Secrets {
@@ -123,7 +141,8 @@ internal object Secrets {
     fun mask(text: String, secrets: Collection<String>): String {
         var out = text
         secrets.flatMap { listOf(it, jsonEscaped(it)) }.distinct().filter { it.isNotEmpty() }.sortedByDescending { it.length }.forEach { s ->
-            out = out.replace(Regex("(?<![\\p{L}\\p{N}])${Regex.escape(s)}(?![\\p{L}\\p{N}])"), Regex.escapeReplacement(MASK))
+            // An escape like \n in JSON text ends in a letter, and still separates words.
+            out = out.replace(Regex("(?:(?<![\\p{L}\\p{N}])|(?<=\\\\[nrtbf]))${Regex.escape(s)}(?![\\p{L}\\p{N}])"), Regex.escapeReplacement(MASK))
         }
         return out
     }

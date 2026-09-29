@@ -141,12 +141,12 @@ class JevDecider(private val tools: ToolInvoker, override val option: ModelOptio
         } catch (e: CancellationException) {
             throw e
         } catch (e: Throwable) {
-            recordCall(record(null, Result.failure(e)))
+            recordCall { record(null, Result.failure(e)) }
             throw e
         }
         val result = if (reply.isError) Result.failure(IllegalStateException(reply.errorMessage))
         else guarded { Result.success(parse(reply.json ?: error("Jev returned no JSON"))) }
-        recordCall(record(reply, result))
+        recordCall { record(reply, result) }
         return result
     }
 
@@ -365,12 +365,12 @@ class ChatDecider(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Throwable) {
-            recordCall(record(null, Result.failure(e)))
+            recordCall { record(null, Result.failure(e)) }
             throw e
         }
-        val text = reply.getOrElse { e -> recordCall(record(null, Result.failure(e))); return null to Result.failure(e) }
+        val text = reply.getOrElse { e -> recordCall { record(null, Result.failure(e)) }; return null to Result.failure(e) }
         val result = runCatching { parse(text.text) }
-        recordCall(record(text, result))
+        recordCall { record(text, result) }
         return text to result
     }
 

@@ -84,7 +84,7 @@ internal class LlmrpaMcpToolProvider(
             description =
                 "Report the LLM RPA panel's state: the live run (status, steps, summary, model calls per step) and the last drafted plan. " +
                     "include_calls: true adds each model call in full.",
-            inputSchema = """{"type":"object","additionalProperties":false,"properties":{""" +
+            inputSchema = """{"type":"object","properties":{""" +
                 """"include_calls":{"type":"boolean","default":false,"description":"Add every model call of the run in full: request, response, parsed pick, latency, cost (private text masked)"},""" +
                 """"verbose":{"type":"boolean","default":false,"description":"Same as include_calls"}}}""",
             handler = McpToolHandler { args ->
@@ -117,6 +117,7 @@ internal class LlmrpaMcpToolProvider(
                 "Save a finished LLM RPA run as an RPA Engine configuration: a navigate to where it started, then each step that worked, " +
                     "in ~/.boss/config/rpaengine as a new file (never replacing one). Downloads are left out (RPA Engine plans cannot download), " +
                     "and a private field's text is never written: that step types nothing and the description says so. " +
+                    "Addresses from the instruction are kept; a tab the run found open is written without its query and fragment. " +
                     "Works for a done run, or a stopped or failed one with at least one step that worked. Returns the path and the action count.",
             inputSchema = """{"type":"object","additionalProperties":false,"properties":{""" +
                 """"run":{"type":"integer","minimum":1,"default":1,"description":"Which finished run, newest first: 1 is the last one"}}}""",
