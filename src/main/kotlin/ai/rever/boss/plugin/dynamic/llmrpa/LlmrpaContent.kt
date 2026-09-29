@@ -174,8 +174,8 @@ private const val NEW_TAB_LABEL = "New tab (pick the page for me)"
 /** The tab every action lands on. Always visible, because it is where clicks will happen. */
 @Composable
 private fun TabPicker(component: LlmrpaComponent, target: TabTarget, showHost: Boolean, enabled: Boolean) {
-    val (tabs, selected0, newTab, _) = target
-    val selected = selected0.takeIf { !newTab }
+    val (tabs, _, newTab, _) = target
+    val selected = target.selected.takeIf { !newTab }
     val away = selected != null && !target.canDrive(selected.tabId)
     var open by remember { mutableStateOf(false) }
     Box {
@@ -205,7 +205,7 @@ private fun TabPicker(component: LlmrpaComponent, target: TabTarget, showHost: B
             RpaMenu(onDismiss = { open = false }, width = 300) {
                 MenuHeading("Run on")
                 MenuRow(NEW_TAB_LABEL, onClick = { open = false; component.selectNewTab() },
-                    detail = "Opens the address in your task, or one the model picks", selected = newTab)
+                    detail = "The address in your task, else the model's pick, else a DuckDuckGo search", selected = newTab)
                 if (tabs.isNotEmpty()) MenuDivider()
                 // Drivable first; a tab in another space is listed but cannot be picked, since the host cannot reach its browser.
                 tabs.sortedByDescending { target.canDrive(it.tabId) }.forEach { t ->
@@ -296,6 +296,7 @@ private fun Compose(
     val values = remember(instruction) { Candidates.values(instruction) }
     val decision = model?.kind == ModelOption.Kind.DECISION
     val hasTab = component.selectedTab.collectAsState().value != null
+    val newTab = component.newTab.collectAsState().value
     Column(
         Modifier.fillMaxWidth().widthIn(max = PaneMaxWidth).padding(12.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
@@ -335,7 +336,8 @@ private fun Compose(
         draftPath?.let { Notice("Draft saved for RPA Engine as ${java.io.File(it).name}. Load it there to run the whole plan.", Tone.SUCCESS) }
         if (!collapsed && model != null) {
             val where = if (decision) "OpenRouter" else model.providerName
-            Text("Every step sends your instruction, with all quoted text (even text meant for a password field), element labels and the page address to $where. Text already in fields is never read.",
+            val search = if (newTab) " With New tab and no address in the task, the task minus its quoted text, emails and addresses may be searched on DuckDuckGo." else ""
+            Text("Every step sends your instruction, with all quoted text (even text meant for a password field), element labels and the page address to $where. Text already in fields is never read.$search",
                 color = RpaTokens.TextMuted, fontSize = 11.sp)
         }
     }

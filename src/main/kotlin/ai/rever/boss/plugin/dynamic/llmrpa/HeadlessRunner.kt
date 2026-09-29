@@ -131,9 +131,10 @@ class HeadlessRunner(
             return Result.failure(IllegalStateException("Jev is not installed or not loaded (no jev_decide tool). Install it from Toolbox, or pass a chat model."))
         }
         val decider = if (option.kind == ModelOption.Kind.DECISION) JevDecider(tools, option) else ChatDecider(gateway, option)
-        tab?.let { t -> locks.tryAcquire(t.tabId, TabLocks.Owner.HEADLESS)?.let { return Result.failure(IllegalStateException(it)) } }
         val opener = if (tab == null) NewTab(openTab, claim = { locks.tryAcquire(it, TabLocks.Owner.HEADLESS) }, startUrl = start) else null
+        // Built before the lock, so a constructor that throws cannot leave the tab held.
         val runner = TaskRunner(tools, decider, tab?.tabId, instruction, limits.copy(maxSteps = maxSteps), newTab = opener) { Answer.Stop }
+        tab?.let { t -> locks.tryAcquire(t.tabId, TabLocks.Owner.HEADLESS)?.let { return Result.failure(IllegalStateException(it)) } }
         return try {
             // Bounded, so a caller that times out does not leave a run going on the user's tab.
             Result.success(withTimeoutOrNull(timeLimitMs) { runner.run() } ?: runner.also { it.timedOut(timeLimitMs) }.state.value)

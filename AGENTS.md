@@ -422,6 +422,10 @@ Found by running, not reviewing:
   and a fresh look, which is the first step's page.
 - **Focus on a pane with no browser keeps a drivable pick.** Clicking into a terminal and pressing
   Run acts on the page just looked at; New tab is the target only when no drivable pick is left.
+- The periodic probe runs only while the panel is composed (`Content` counts itself in and out);
+  `rpa_*` callers outside this plugin read the same host static, so it should not tick unseen.
+- New tab is the default when no drivable tab is focused; the privacy line under the box says a scrubbed search
+  may go to DuckDuckGo, and the menu row says so too.
 - **Probe results are kept per tab** (`Map<String, Boolean>`), so a tab opened while a run held the
   probe off is unknown, not away; a probe asked for mid-probe runs again after it. A set of drivable
   ids made every unprobed tab look away for as long as a headless run held a lock (up to 10 min).

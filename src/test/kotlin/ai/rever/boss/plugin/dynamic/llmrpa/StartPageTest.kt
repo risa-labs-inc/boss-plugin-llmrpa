@@ -372,10 +372,23 @@ class StartPageTest {
     }
 
     @Test
-    fun `a new tab that never renders anything is used as it is when the wait runs out`() = runTest {
+    fun `a new tab with nothing to act on is used once it reads the same twice`() = runTest {
         val tools = FakeTools(decide = done).apply { observeHook = { ToolReply("""{"url":"https://orders.example/","title":"Orders","elements":[]}""", false) } }
         val state = headless(tools, emptyList(), emptySet()).execute("Open https://orders.example/", null, 3, null, newTab = true).getOrThrow()
         assertEquals(RunStatus.DONE, state.status)
+        assertEquals(2, tools.observedTabs.size)
+    }
+
+    @Test
+    fun `a new tab another run already holds is refused with its id`() = runTest {
+        val locks = TabLocks()
+        assertNull(locks.tryAcquire("new1", TabLocks.Owner.PANEL))
+        val state = headless(FakeTools(decide = done), emptyList(), emptySet(), locks).execute("Open https://orders.example/", null, 3, null, newTab = true).getOrThrow()
+        assertEquals(RunStatus.FAILED, state.status)
+        assertEquals("Opened new1, but: ${TabLocks.Owner.PANEL.busy}", state.summary)
+        assertNull(state.tabId)
+        // Still the panel's.
+        assertEquals(TabLocks.Owner.PANEL.busy, locks.tryAcquire("new1", TabLocks.Owner.HEADLESS))
     }
 
     @Test

@@ -181,7 +181,12 @@ class TaskRunner(
             if (page == null) continue
             lastReadError = null
             if (page.url.isBlank() || page.url == "about:blank") { last = "it is still blank"; continue }
-            if (page.elements.isEmpty()) { empty = page; continue }
+            // A page with nothing to act on (plain text, a PDF) is taken once it reads the same twice.
+            if (page.elements.isEmpty()) {
+                if (empty?.url == page.url && empty.title == page.title) return Result.success(page)
+                empty = page
+                continue
+            }
             delay(limits.navSettleMs)
             return Result.success(read(id)?.takeIf { it.url.isNotBlank() } ?: page)
         }

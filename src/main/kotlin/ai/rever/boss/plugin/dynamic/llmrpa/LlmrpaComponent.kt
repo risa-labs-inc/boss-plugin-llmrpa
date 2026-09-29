@@ -189,8 +189,15 @@ class LlmrpaComponent(
 
     @Composable
     override fun Content() {
+        // The periodic probe runs only while the panel is on screen.
+        androidx.compose.runtime.DisposableEffect(Unit) {
+            shown.incrementAndGet()
+            onDispose { shown.decrementAndGet() }
+        }
         LlmrpaContent(this)
     }
+
+    private val shown = java.util.concurrent.atomic.AtomicInteger(0)
 
     fun updateInstruction(instruction: String) {
         _currentInstruction.value = instruction
@@ -514,8 +521,9 @@ class LlmrpaComponent(
             jevSeen = jevNow
             refreshModels()
         }
-        // Space switches have no signal, so re-probe now and then; tab changes and the picker probe at once.
-        if (now - lastProbeAt >= PROBE_EVERY_MS) probeDrivable() else followFocusedTab()
+        // Space switches have no signal, so re-probe now and then while the panel shows; tab changes
+        // and the picker probe at once.
+        if (shown.get() > 0 && now - lastProbeAt >= PROBE_EVERY_MS) probeDrivable() else followFocusedTab()
         _readiness.value = blocker()
     }
 
@@ -621,7 +629,8 @@ class LlmrpaComponent(
             // On completion, not in finally: a job cancelled before it starts never runs its body.
             job.invokeOnCompletion {
                 r.state.value.tabId?.let(tabLocks::release)
-                // Probes skip while the run holds a tab, so the one it opened is not known yet.
+                // Probes skip while the run holds a tab, so the one it opened is not known yet. Launched,
+                // not called: this handler runs on whichever thread completed the job.
                 scope.launch { probeDrivable() }
             }
         }
