@@ -139,6 +139,8 @@ internal class FakeTabs(
     val tabs = MutableStateFlow(list)
     val created = mutableListOf<String>()
     var probes = 0
+    /** Runs inside each probe, e.g. to ask for another probe mid-probe. */
+    var onProbe: (() -> Unit)? = null
     override val activeTabs: StateFlow<List<ActiveTabData>> = tabs
     override val activePanelId: String? get() = focused()?.let { id -> tabs.value.firstOrNull { it.tabId == id }?.panelId }
     override fun selectedTabId(workspaceId: String, panelId: String): String? =
@@ -151,6 +153,7 @@ internal class FakeTabs(
     override fun getFallbackIcon(typeId: String): ImageVector? = null
     override fun getBrowserIntegration(tabId: String): BrowserIntegration? {
         probes++
+        onProbe?.invoke()
         return if (tabs.value.any { it.tabId == tabId } && drivable?.contains(tabId) != false) FakeBrowser else null
     }
     override fun createBrowserTab(url: String, title: String): String? { created += url; return create(url) }

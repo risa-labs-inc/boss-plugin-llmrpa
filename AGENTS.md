@@ -406,7 +406,14 @@ Found by running, not reviewing:
   style suffixes, trailing dots or IP literals such as `0x7f.1`), else a DuckDuckGo search.
 - **The search never carries the instruction's values.** Quoted text, emails and addresses are what
   a run may type, passwords included, so they are cut from the query; with nothing left the run stops
-  and asks for the site. An unquoted secret is not detected. `createBrowserTab`
+  and asks for the site. An unquoted secret is not detected. The scrub uses `Candidates.scrubbable`,
+  which is uncapped: `values` stops at 20 entries and 200-character quotes, fine for a typing list,
+  a leak for a scrubber.
+- **A model's address may not carry the instruction's values either.** The model saw the whole
+  instruction, passwords included; a URL containing any value (raw or form-encoded, the
+  instruction's own addresses aside) is cut to its origin. A search URL the model builds from a
+  quoted term loses its path too, which is the price.
+- An address outside quotes is preferred as the start page: quoted text is for typing. `createBrowserTab`
   runs on Main (it edits split view state) and opens in the active space. The runner waits with
   bounded backoff (`RunLimits.openWaitsMs`, about 13 s), errors included (a script can fail
   mid-navigation). A page counts once it has an address and elements; it then gets `navSettleMs`

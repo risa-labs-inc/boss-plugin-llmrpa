@@ -85,23 +85,28 @@ class HeadlessRunner(
         }
         val tab = if (newTab) null else {
             val browserTabs = tabs().filter { it.url != null }
+            if (browserTabs.isEmpty()) return Result.failure(IllegalStateException("No browser tab is open. Pass new_tab: true to open one."))
             // Not while a run holds a tab: the host resolves browsers through one static "selected tab",
             // so a probe racing a run's rpa_observe could hand that run the wrong tab. Unknown then
-            // reads as drivable, and a NO_BROWSER at the first look still says why.
-            // Re-checked before each tab, since a run can start mid-probe.
-            // On IO: the probe is a host call per tab.
-            val canDrive = withContext(Dispatchers.IO) {
-                browserTabs.associate { it.tabId to (locks.anyBusy() || runCatching { drivable(it.tabId) }.getOrDefault(true)) }
+            // reads as drivable, and a NO_BROWSER at the first look still says why. Re-checked
+            // before each tab, since a run can start mid-probe; on IO, one host call per tab.
+            suspend fun probe(list: List<ActiveTabData>) = withContext(Dispatchers.IO) {
+                list.associate { it.tabId to (locks.anyBusy() || runCatching { drivable(it.tabId) }.getOrDefault(true)) }
             }
-            if (browserTabs.isEmpty()) return Result.failure(IllegalStateException("No browser tab is open. Pass new_tab: true to open one."))
+            // A named tab probes only itself; the listing in an error probes the rest.
+            var canDrive = if (tabId != null) probe(browserTabs.filter { it.tabId == tabId }) else probe(browserTabs)
+            suspend fun listing(): String {
+                if (canDrive.size < browserTabs.size) canDrive = canDrive + probe(browserTabs.filter { it.tabId !in canDrive })
+                return describe(browserTabs, canDrive)
+            }
             // Never an arbitrary tab: it acts in the user's logged-in session, so the focused one or a named one.
             // Drivable tabs are the space on screen, which also makes a panel id unambiguous.
             val wanted = tabId ?: runCatching { activeTabId(browserTabs.filter { canDrive[it.tabId] == true }) }.getOrNull()
-                ?: return Result.failure(IllegalArgumentException("No drivable tab is focused. Pass tab_id, one of: ${describe(browserTabs, canDrive)}; or new_tab: true"))
+                ?: return Result.failure(IllegalArgumentException("No drivable tab is focused. Pass tab_id, one of: ${listing()}; or new_tab: true"))
             val found = browserTabs.firstOrNull { it.tabId == wanted }
-                ?: return Result.failure(IllegalArgumentException("No browser tab with id $wanted. Open browser tabs: ${describe(browserTabs, canDrive)}"))
+                ?: return Result.failure(IllegalArgumentException("No browser tab with id $wanted. Open browser tabs: ${listing()}"))
             if (canDrive[found.tabId] != true) {
-                return Result.failure(IllegalStateException("Tab $wanted: $NO_BROWSER_HINT Pass new_tab: true, or one of: ${describe(browserTabs, canDrive)}"))
+                return Result.failure(IllegalStateException("Tab $wanted: $NO_BROWSER_HINT Pass new_tab: true, or one of: ${listing()}"))
             }
             found
         }

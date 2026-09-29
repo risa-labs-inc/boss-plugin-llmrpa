@@ -430,7 +430,7 @@ private fun OpenedRow(opened: OpenedPage) {
         verticalArrangement = Arrangement.spacedBy(3.dp),
     ) {
         Text("Opened ${opened.url}", color = RpaTokens.Text, fontSize = 13.sp, fontWeight = FontWeight.Medium, maxLines = 2, overflow = TextOverflow.Ellipsis)
-        val why = opened.note?.let { " · searched because $it" }.orEmpty()
+        val why = opened.note?.let { if (opened.source == StartSource.SEARCH) " · searched because $it" else " · $it" }.orEmpty()
         Text("Chosen by ${opened.source.label}$why", color = RpaTokens.TextSecondary, fontSize = 12.sp)
     }
 }

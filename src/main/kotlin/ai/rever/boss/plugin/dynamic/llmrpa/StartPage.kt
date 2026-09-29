@@ -38,8 +38,12 @@ class NewTab(
 internal object StartPages {
     const val TAB_TITLE = "LLM RPA"
 
-    /** The first usable http(s) address in the instruction. */
-    fun fromInstruction(instruction: String): String? = Candidates.urls(instruction).firstNotNullOfOrNull { usable(it, httpsOnly = false) }
+    /** The first usable http(s) address in the instruction, preferring one outside quotes (quoted text is for typing). */
+    fun fromInstruction(instruction: String): String? {
+        val quoted = Candidates.quotedPhrases(instruction)
+        val (inQuotes, bare) = Candidates.urls(instruction).partition { u -> quoted.any { u in it } }
+        return (bare + inQuotes).firstNotNullOfOrNull { usable(it, httpsOnly = false) }
+    }
 
     /**
      * [raw] as an address safe to open, or null: parseable, http(s) (https only when [httpsOnly]),
@@ -80,7 +84,7 @@ internal object StartPages {
      */
     fun searchUrl(instruction: String): String? {
         var q = instruction
-        Candidates.values(instruction).sortedByDescending { it.length }.forEach { q = q.replace(it, " ") }
+        Candidates.scrubbable(instruction).sortedByDescending { it.length }.forEach { q = q.replace(it, " ") }
         q = q.replace(Regex("[\"“”']\\s*[\"“”']"), " ").replace(Regex("\\s+"), " ").trim().take(200)
         if (q.count { it.isLetterOrDigit() } < 3) return null
         return "https://duckduckgo.com/?q=" + URLEncoder.encode(q, Charsets.UTF_8)
@@ -96,7 +100,16 @@ internal object StartPages {
         val suggested = reply.getOrNull()
         val calls = if (suggested != null) 1 else 0
         val cost = suggested?.costUsd ?: 0.0
-        usable(suggested?.url, httpsOnly = true)?.let { return Choice(OpenedPage(it, StartSource.MODEL), calls, cost) }
+        usable(suggested?.url, httpsOnly = true)?.let { url ->
+            // The model saw the whole instruction, secrets included: an address carrying any of its
+            // values (the user's own addresses aside) keeps only its origin.
+            val own = Candidates.urls(instruction).toSet()
+            val leaks = Candidates.scrubbable(instruction).filter { it !in own && it.length >= 3 }
+                .any { v -> url.contains(v, ignoreCase = true) || url.contains(URLEncoder.encode(v, Charsets.UTF_8), ignoreCase = true) }
+            if (!leaks) return Choice(OpenedPage(url, StartSource.MODEL), calls, cost)
+            val origin = URI(url).let { "${it.scheme}://${it.rawAuthority}/" }
+            return Choice(OpenedPage(origin, StartSource.MODEL, "its path carried text from your instruction, so only the site was opened"), calls, cost)
+        }
         val why = reply.exceptionOrNull()?.message
             ?: suggested?.url?.let { "the model's address '${it.take(80)}' is not a safe https address" }
             ?: "the model named no address"

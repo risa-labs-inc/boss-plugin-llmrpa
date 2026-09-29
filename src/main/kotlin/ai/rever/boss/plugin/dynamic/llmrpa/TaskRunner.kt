@@ -132,7 +132,7 @@ class TaskRunner(
     /**
      * Picks a start page, opens it in a new tab and waits until it reads. Only this open may use
      * the chosen address: later "Go to" steps still come from the instruction alone. A tab that
-     * opened but cannot be used is left open for the person to check: the api has no close here.
+     * opened but cannot be used is left open on purpose, so the person can see what it shows.
      */
     private suspend fun openStartPage(): Pair<OpenedPage, PageSnapshot>? {
         val nt = newTab ?: return stop(RunStatus.FAILED, "No tab to run on")
@@ -189,7 +189,7 @@ class TaskRunner(
         if (reply.isError || json == null) {
             lastReadError = when (reply.errorCode) {
                 ToolNames.NO_BROWSER -> NO_BROWSER_HINT.removeSuffix(".")
-                in LOADING_CODES -> null
+                TAB_NOT_FOUND -> null
                 else -> reply.errorMessage
             }
             return null
@@ -421,7 +421,8 @@ class TaskRunner(
     }
 
     companion object {
-        private val LOADING_CODES = setOf(ToolNames.NO_BROWSER, "TAB_NOT_FOUND")
+        /** RPA Engine's code before a new tab is registered; retried silently. */
+        private const val TAB_NOT_FOUND = "TAB_NOT_FOUND"
 
         fun pct(p: Double): String = "${(p * 100).toInt()}%"
     }

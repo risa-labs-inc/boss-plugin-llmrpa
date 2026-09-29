@@ -111,6 +111,24 @@ internal object Candidates {
         return found.toList().take(20)
     }
 
+    private val quotedAll = listOf(Regex("\"([^\"]+)\""), Regex("“([^”]+)”"), Regex("""(?<!\w)'([^']+)'(?!\w)"""))
+
+    /**
+     * Every quoted phrase, email and address in the instruction, uncapped: what must not leave in a
+     * search or a model-chosen address. [values] is capped for the list a model types from.
+     */
+    fun scrubbable(instruction: String): List<String> {
+        val found = LinkedHashSet<String>()
+        quotedAll.forEach { re -> re.findAll(instruction).forEach { m -> m.groupValues[1].trim().takeIf { it.isNotEmpty() }?.let(found::add) } }
+        email.findAll(instruction).forEach { found += it.value }
+        url.findAll(instruction).forEach { found += it.value.trimEnd('.', ',', ')') }
+        return found.toList()
+    }
+
+    /** Quoted phrases alone: text meant to be typed, not a place to go. */
+    fun quotedPhrases(instruction: String): List<String> =
+        quotedAll.flatMap { re -> re.findAll(instruction).map { it.groupValues[1] }.toList() }
+
     fun urls(instruction: String): List<String> = url.findAll(instruction).map { it.value.trimEnd('.', ',', ')') }.distinct().toList()
 
     fun build(page: PageSnapshot, instruction: String): List<Candidate> {

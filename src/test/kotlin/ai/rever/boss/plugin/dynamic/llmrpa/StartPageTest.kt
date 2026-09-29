@@ -116,6 +116,32 @@ class StartPageTest {
     }
 
     @Test
+    fun `a model address that carries text from the instruction keeps only its site`() = runTest {
+        val text = "Log in with password 'hunter2' and check my orders"
+        val leaky = StartPages.choose(text, chatDecider("""{"url":"https://shop.example/login?pw=hunter2"}"""))
+        assertEquals("https://shop.example/", leaky.page.url)
+        assertEquals(StartSource.MODEL, leaky.page.source)
+        val encoded = StartPages.choose("Search for 'wireless keyboard'", chatDecider("""{"url":"https://shop.example/s?k=wireless+keyboard"}"""))
+        assertEquals("https://shop.example/", encoded.page.url)
+        val clean = StartPages.choose(text, chatDecider("""{"url":"https://shop.example/orders"}"""))
+        assertEquals("https://shop.example/orders", clean.page.url)
+    }
+
+    @Test
+    fun `an address outside quotes is the start page before one meant to be typed`() {
+        assertEquals("https://blog.example/new", StartPages.fromInstruction("Paste 'https://paste.example/x' into the post at https://blog.example/new"))
+        assertEquals("https://paste.example/x", StartPages.fromInstruction("Open 'https://paste.example/x'"))
+    }
+
+    @Test
+    fun `the search scrub is not capped like the typing list`() {
+        val long = "x".repeat(250)
+        val many = (1..25).joinToString(" ") { "'secret$it'" }
+        val url = StartPages.searchUrl("Find the page for \"$long\" and $many")!!
+        assertFalse(url.contains("xxxx") || url.contains("secret"), url)
+    }
+
+    @Test
     fun `the search never carries the quoted values, emails or addresses from the instruction`() = runTest {
         val text = "Log in to my bank with username \"ada@bank.example\" and password 'hunter2', then download the statement"
         val choice = StartPages.choose(text, JevDecider(FakeTools(decide = done), JEV))
@@ -180,6 +206,19 @@ class StartPageTest {
         c.refreshDrivable()
         assertEquals("t1", c.selectedTab.value?.tabId)
         assertFalse(c.newTab.value)
+    }
+
+    @Test
+    fun `a probe asked for mid-probe runs again afterwards`() = withMain {
+        val provider = FakeTabs(listOf(tab("t1"), tab("t2")), focused = { "t1" })
+        val c = component(FakeTools(decide = done), provider)
+        var asked = false
+        provider.onProbe = { if (!asked) { asked = true; provider.drivable = setOf("t1"); c.refreshDrivable() } }
+        val before = provider.probes
+        c.refreshDrivable()
+        // Two tabs, probed twice: the second pass sees the change made during the first.
+        assertEquals(before + 4, provider.probes)
+        assertEquals(mapOf("t1" to true, "t2" to false), c.drivable.value)
     }
 
     @Test
