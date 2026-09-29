@@ -40,7 +40,8 @@ internal class LlmrpaMcpToolProvider(
                     "Only tabs in the space on screen can be driven. " +
                     "A model (Jev by default, or any configured chat model) picks each step and RPA Engine performs it. " +
                     "Stops instead of guessing when the model is unsure or the next action looks irreversible, and returns " +
-                    "the steps taken. Put any text to type in quotes in the instruction. Each step is one to three paid model calls, " +
+                    "the steps taken. Put any text to type in quotes in the instruction; with none quoted, words from the instruction " +
+                    "(e.g. a search term) may be typed into a field that is not private. Each step is one to three paid model calls, " +
                     "and a run stops after 10 minutes.",
             inputSchema = """{"type":"object","additionalProperties":false,"properties":{""" +
                 """"instruction":{"type":"string","description":"The task, e.g. Search for 'wireless keyboard' and open the first result"},""" +
@@ -153,6 +154,12 @@ internal class LlmrpaMcpToolProvider(
                     put("action", q.action.description)
                     q.risk?.let { put("risk", it) }
                 })
+                is PendingQuestion.ChooseText -> put("stopped_at_question", buildJsonObject {
+                    put("reason", q.reason)
+                    put("field", q.field)
+                    put("text_options", buildJsonArray { q.options.forEach { add(JsonPrimitive(it)) } })
+                    put("hint", "Put the text to type in quotes in the instruction, or run it in the LLM RPA panel to choose.")
+                })
                 null -> Unit
             }
             put("steps", buildJsonArray {
@@ -162,6 +169,7 @@ internal class LlmrpaMcpToolProvider(
                         put("action", s.description)
                         put("confidence", s.confidence)
                         put("result", s.outcome.name.lowercase())
+                        s.valueSource?.let { put("text_source", it.name.lowercase()) }
                         s.detail?.let { put(if (s.outcome == StepRecord.Outcome.FAILED) "error" else "detail", it) }
                     })
                 }

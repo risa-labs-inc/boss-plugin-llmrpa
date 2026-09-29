@@ -133,7 +133,72 @@ internal object Candidates {
 
     fun urls(instruction: String): List<String> = url.findAll(instruction).map { it.value.trimEnd('.', ',', ')') }.distinct().toList()
 
-    fun build(page: PageSnapshot, instruction: String): List<Candidate> {
+    private const val MAX_PHRASES = 8
+    private const val MAX_PHRASE_WORDS = 4
+
+    // A span may not start or end on one of these: they say what to do, not what to type.
+    private val STOP_WORDS = setOf(
+        "a", "an", "the", "and", "or", "but", "of", "on", "in", "at", "to", "into", "onto", "for", "from", "by", "with",
+        "about", "as", "is", "are", "be", "it", "its", "this", "that", "these", "those", "there", "here", "then", "than",
+        "so", "if", "when", "where", "what", "which", "who", "how", "i", "me", "my", "we", "us", "our", "you", "your",
+        "please", "can", "could", "would", "should", "will", "must", "want", "need", "let", "just", "now", "up", "down",
+        "open", "go", "goto", "visit", "navigate", "follow", "link", "links", "click", "press", "tap", "type", "enter",
+        "search", "find", "look", "show", "get", "till", "until", "reach", "arrive", "keep", "start", "stop", "use",
+        "page", "pages", "home", "homepage", "site", "website", "tab", "result", "results", "first", "next", "select",
+        "choose", "pick", "download", "save", "image", "picture", "article",
+    )
+    private val SITE_SUFFIX = Regex("""^(home ?page|homepage|website|site|main page)\b""", RegexOption.IGNORE_CASE)
+    private val word = Regex("""[\p{L}\p{N}][\p{L}\p{N}'’-]*""")
+
+    /**
+     * Words from the instruction that could be typed when nothing is quoted: contiguous spans of up
+     * to four words, never starting or ending on a stop or task word or on the site's name (a word
+     * before "home page", or a label of [addresses]' hosts or the instruction's own). Quoted
+     * text, emails and addresses are left out: they are [values] already. Longest first, capped.
+     */
+    fun phrases(instruction: String, addresses: List<String> = emptyList()): List<String> {
+        var text = instruction
+        scrubbable(instruction).sortedByDescending { it.length }.forEach { text = text.replace(it, " , ") }
+        val sites = (addresses + urls(instruction)).flatMap { hostLabels(it) }.toMutableSet()
+        // Clauses break on punctuation, so a span never runs across "page, then".
+        val clauses = text.split(Regex("""[.,;:!?()\[\]{}"“”‘’]|\s'|'\s""")).map { c -> word.findAll(c).map { it.value }.toList() }
+        clauses.forEach { words ->
+            words.forEachIndexed { i, w ->
+                if (i + 1 < words.size && SITE_SUFFIX.containsMatchIn(words.drop(i + 1).joinToString(" "))) sites += w.lowercase()
+            }
+        }
+        val found = mutableListOf<Pair<String, Int>>()
+        clauses.forEach { words ->
+            for (start in words.indices) for (len in 1..MAX_PHRASE_WORDS) {
+                val span = words.subList(start, (start + len).coerceAtMost(words.size)).takeIf { it.size == len } ?: break
+                val edge = listOf(span.first().lowercase(), span.last().lowercase())
+                if (edge.any { it in STOP_WORDS || it in sites }) continue
+                found += span.joinToString(" ") to len
+            }
+        }
+        // Stable sort: equal lengths keep the instruction's order.
+        return found.sortedByDescending { it.second }.map { it.first }.distinctBy { it.lowercase() }.take(MAX_PHRASES)
+    }
+
+    /** The name-like labels of [address]'s host: `en.wikipedia.org` gives `wikipedia` (and `en`). */
+    private fun hostLabels(address: String): List<String> {
+        val host = runCatching { java.net.URI(address.trim()).host }.getOrNull()?.lowercase() ?: return emptyList()
+        return host.split('.').dropLast(1).filter { it != "www" }
+    }
+
+    /** A field whose Enter runs a search rather than posting what was typed. */
+    fun isSearchField(el: PageElement): Boolean =
+        el.role == "searchbox" || el.type == "search" || el.label?.contains("search", ignoreCase = true) == true
+
+    /**
+     * [writes] is whether the decider can write text itself (a chat model). A field is offered only
+     * when something can go in it: a private field takes quoted values alone, any other field also
+     * words from the instruction ([phrases]).
+     */
+    fun build(page: PageSnapshot, instruction: String, writes: Boolean): List<Candidate> {
+        val quotedValues = values(instruction).isNotEmpty()
+        val canType = writes || quotedValues || phrases(instruction, listOf(page.url)).isNotEmpty()
+        val canTypePrivate = writes || quotedValues
         val out = mutableListOf<Candidate>()
         var n = 0
         var firstImage = true
@@ -155,7 +220,7 @@ internal object Candidates {
                 if (el.role == "img") continue
             }
             when {
-                isTextField(el) -> out += Candidate(
+                isTextField(el) -> if (if (el.sensitive) canTypePrivate else canType) out += Candidate(
                     next(), Candidate.Kind.TYPE, "Type into $quotedLabel${if (el.sensitive) " (private field)" else ""}",
                     StepAction("input", el.selector), el,
                 )

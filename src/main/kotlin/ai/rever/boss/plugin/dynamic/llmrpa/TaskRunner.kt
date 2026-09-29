@@ -31,11 +31,20 @@ data class StepRecord(
     val alternatives: List<Pair<String, Double>> = emptyList(),
     val outcome: Outcome = Outcome.RUNNING,
     val detail: String? = null,
-    val valueWritten: Boolean = false,
+    /** Where a typed value came from; null for steps that type nothing. */
+    val valueSource: ValueSource? = null,
     val chosenBy: ChosenBy = ChosenBy.MODEL,
 ) {
     enum class Outcome { RUNNING, OK, FAILED }
     enum class ChosenBy { MODEL, USER }
+    enum class ValueSource(val label: String) {
+        QUOTED("quoted in your instruction"),
+        PHRASE("words from your instruction"),
+        MODEL("text written by the model"),
+        USER("text you picked"),
+    }
+
+    val valueWritten: Boolean get() = valueSource == ValueSource.MODEL
 }
 
 /** What the runner needs from the person before it can continue. */
@@ -45,10 +54,14 @@ sealed interface PendingQuestion {
 
     /** The chosen action looks irreversible. [risk] is null when it could not be assessed. */
     data class Confirm(val action: Candidate, val risk: Double?) : PendingQuestion
+
+    /** A type step has no text; [options] are the instruction's quoted values and words. */
+    data class ChooseText(val reason: String, val field: String, val options: List<String>) : PendingQuestion
 }
 
 sealed interface Answer {
     data class Pick(val candidate: Candidate) : Answer
+    data class Text(val value: String) : Answer
     data object Proceed : Answer
     data object Stop : Answer
 }
@@ -231,10 +244,10 @@ class TaskRunner(
         val history = seed.toMutableList()
         var failures = 0
         var doneRejected = false
-        // The field last typed into, and whether the model wrote that text: Enter lands there. Kept
-        // until the page navigates, since focus stays in the field across a harmless click.
+        // The field last typed into, and whether Enter there could post what was typed. Kept until
+        // the page navigates, since focus stays in the field across a harmless click.
         var typedInto: PageElement? = null
-        var typedWritten = false
+        var typedCommits = false
         // Counted in actions taken, so a rejected done check does not use up the budget.
         while (_state.value.steps.size < limits.maxSteps) {
             val stepNo = _state.value.steps.size + 1
@@ -243,8 +256,9 @@ class TaskRunner(
             if (history.isNotEmpty() && !history.last().contains(" → now on ")) {
                 history[history.lastIndex] = "${history.last()} → now on '${page.title.take(80)}'"
             }
-            val candidates = Candidates.build(page, instruction)
-            val ctx = StepContext(instruction, page, candidates, values, history.toList())
+            val candidates = Candidates.build(page, instruction, decider.writesText)
+            val phrases = Candidates.phrases(instruction, listOf(page.url))
+            val ctx = StepContext(instruction, page, candidates, values, history.toList(), phrases)
 
             val decision = decider.decide(ctx).getOrElse {
                 return finish(RunStatus.FAILED, "${decider.option.providerName} could not decide the next step: ${it.message}")
@@ -294,14 +308,28 @@ class TaskRunner(
             var value = chosen.action?.value
             // The model's value only describes the model's own pick.
             val modelValue = decision.value.takeIf { chosenBy == StepRecord.ChosenBy.MODEL }
+            var source: StepRecord.ValueSource? = null
             if (chosen.needsValue) {
                 val field = chosen.element?.label?.take(60) ?: "the field"
-                value = modelValue ?: values.singleOrNull() ?: return finish(
+                value = modelValue ?: values.singleOrNull()
+                // A private field only ever takes a quoted value; words are for the other fields.
+                if (value == null && chosen.element?.sensitive != true) {
+                    val (text, by) = pickText(ctx, field, (values + phrases).distinctBy { it.lowercase() }, stepNo) ?: return state.value
+                    value = text
+                    source = by
+                }
+                if (value == null) return finish(
                     RunStatus.STOPPED,
                     if (values.isEmpty()) "Needs text to type into '$field'. Put it in quotes in the instruction."
                     else "Not sure which text from the instruction goes into '$field'. Name the field next to each quoted value.",
                 )
+                source = source ?: when {
+                    value in values -> StepRecord.ValueSource.QUOTED
+                    phrases.any { it.equals(value, ignoreCase = true) } -> StepRecord.ValueSource.PHRASE
+                    else -> StepRecord.ValueSource.MODEL
+                }
             }
+            // Only quoted text counts: a private field never takes words the runner picked out.
             val fromInstruction = value != null && value in values
             if (chosen.needsValue && chosen.element?.sensitive == true && !fromInstruction) {
                 return finish(RunStatus.STOPPED, "Stopped before typing into the private field '${chosen.element.label?.take(60)}': only text from your instruction goes there.")
@@ -322,8 +350,8 @@ class TaskRunner(
                     }?.first
                 // The label check can only raise a model's answer: a chat model grades its own pick
                 // from page text, so a misleading page could otherwise talk it past a Delete. Enter
-                // after text the model wrote could post it, so that counts too.
-                val label = if (Candidates.soundsCommitting(target) || (field != null && typedWritten)) 1.0 else 0.0
+                // after text the model wrote (or instruction words outside a search box) could post it.
+                val label = if (Candidates.soundsCommitting(target) || (field != null && typedCommits)) 1.0 else 0.0
                 val risk = when {
                     assessed != null -> maxOf(assessed, label)
                     label > 0 -> label
@@ -341,16 +369,21 @@ class TaskRunner(
             val runnersUp = if (chosenBy == StepRecord.ChosenBy.USER) emptyList() else decision.alternatives.mapNotNull { (k, p) ->
                 candidates.firstOrNull { it.key == k }?.let { it.description to p }
             }
-            val record = StepRecord(stepNo, description, decision.confidence, runnersUp, valueWritten = chosen.needsValue && !fromInstruction, chosenBy = chosenBy)
+            val record = StepRecord(stepNo, description, decision.confidence, runnersUp, valueSource = source, chosenBy = chosenBy)
             _state.update { it.copy(steps = it.steps + record) }
 
             val (ok, error, navigated, noBrowser) = act(action.copy(value = value), allowSensitive = chosen.element?.sensitive == true && fromInstruction)
             if (chosen.needsValue && ok) {
                 typedInto = chosen.element
-                typedWritten = !fromInstruction
+                typedCommits = when (source) {
+                    StepRecord.ValueSource.MODEL -> true
+                    // The person's own words, but the field was the model's pick: only a search box is exempt.
+                    StepRecord.ValueSource.PHRASE -> chosen.element?.let(Candidates::isSearchField) != true
+                    else -> false
+                }
             } else if (navigated) {
                 typedInto = null
-                typedWritten = false
+                typedCommits = false
             }
             _state.update { s ->
                 s.copy(steps = s.steps.map {
@@ -370,6 +403,37 @@ class TaskRunner(
             }
         }
         return finish(RunStatus.STOPPED, "Reached the ${limits.maxSteps}-step limit before the task was complete")
+    }
+
+    /**
+     * Text for a type step that came without one: the decider picks from [options] if it can and is
+     * sure, else the person does. Null once the run has finished (stopped, or nothing to offer).
+     */
+    private suspend fun pickText(ctx: StepContext, field: String, options: List<String>, stepNo: Int): Pair<String, StepRecord.ValueSource>? {
+        if (options.isEmpty()) return stop(RunStatus.STOPPED, "Needs text to type into '$field'. Put it in quotes in the instruction.")
+        fun sourceOf(v: String) = if (v in values) StepRecord.ValueSource.QUOTED else StepRecord.ValueSource.PHRASE
+        val asked = decider.chooseText(ctx, field, options)
+        var reason = "The model gave no text for '$field'"
+        if (asked != null) {
+            _state.update { it.copy(calls = it.calls + 1, costUsd = it.costUsd + (asked.getOrNull()?.costUsd ?: 0.0)) }
+            val choice = asked.getOrNull()
+            val pick = choice?.index?.let(options::getOrNull)
+            if (pick != null && choice.confidence >= limits.askBelow) return pick to sourceOf(pick)
+            reason = when {
+                choice == null -> "${decider.option.providerName} could not pick the text (${asked.exceptionOrNull()?.message})"
+                pick == null -> "${decider.option.providerName} found none of these fit '$field'"
+                else -> "${decider.option.providerName} is only ${pct(choice.confidence)} sure of '${pick.take(60)}'"
+            }
+        }
+        return when (val a = waitFor(PendingQuestion.ChooseText(reason, field, options))) {
+            is Answer.Text -> a.value.takeIf { it in options }?.let { it to StepRecord.ValueSource.USER }
+                ?: stop(RunStatus.STOPPED, "Stopped at step $stepNo: that text is not one of the options")
+            else -> stop(
+                RunStatus.STOPPED,
+                "Stopped at step $stepNo: Not sure which text from the instruction goes into '$field' ($reason). " +
+                    "It could be ${options.take(8).joinToString(", ") { "'${it.take(60)}'" }}. Put the text to type in quotes.",
+            )
+        }
     }
 
     private suspend fun observe(): PageSnapshot? {

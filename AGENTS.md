@@ -447,3 +447,29 @@ Found by running, not reviewing:
 - `llmrpa_execute` takes `new_tab` / `start_url`; its tab listing marks tabs that cannot be driven.
   `HeadlessRunner.drivable` and `openTab` have no defaults, for the usual reason.
 - `createBrowserTab` and `getBrowserIntegration` are pre-1.0.87 members: the 1.0.91 floor stands.
+
+## Typing words from the instruction (1.4)
+
+Found live: "Open wikipedia home page, then follow links till you reach breast cancer" with Jev
+stopped at step 0 ("Needs text to type into 'Search Wikipedia'"). Every text field was offered as
+"Type into", Jev rightly picked the search box, and nothing could go in it: `values` is quoted text,
+emails and addresses only, and Jev cannot write.
+
+- **A field is offered only when something can go in it.** A non-private field needs a quoted value,
+  an instruction phrase, or a decider that writes (`StepDecider.writesText`, chat). A private field
+  needs a quoted value or a writer, as before; `build` takes `writes` with no default.
+- `Candidates.phrases`: 1-4 word spans of the unquoted instruction (quoted text, emails and addresses
+  cut first), not starting or ending on a stop/task word or the site's name (a word before "home
+  page", or a label of the page's or the instruction's host). Longest first, at most 8.
+- **With no value and not exactly one quoted value**, Jev gets a `jev_decide` choice ("Which text from
+  the instruction should be typed into '<field>'?", options plus `none`), used at `askBelow` or above.
+  Otherwise the panel asks (`PendingQuestion.ChooseText`, answered with `Answer.Text`, which must be
+  one of the options) and a headless run stops naming them. The call is counted either way.
+- **Phrases never reach a private field.** `fromInstruction` (what allows `allow_sensitive`) is still
+  "in `values`"; a private field skips the text question and keeps the old stop.
+- The timeline and transcript (`text_source`) say where typed text came from: quoted, words from the
+  instruction, written by the model, or picked by you.
+- **Enter after phrase-typed text commits unless the field is a search box** (`isSearchField`: role
+  searchbox, type search, or "search" in the label). The words are the person's, but the field was
+  the model's pick, and "breast cancer" + Enter in a comment box posts it. Quoted and person-picked
+  text keep the old rule (not committing); model-written text still always counts.

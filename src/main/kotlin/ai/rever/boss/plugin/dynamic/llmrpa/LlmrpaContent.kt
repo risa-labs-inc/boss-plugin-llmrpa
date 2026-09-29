@@ -294,6 +294,7 @@ private fun Compose(
     collapsed: Boolean,
 ) {
     val values = remember(instruction) { Candidates.values(instruction) }
+    val phrases = remember(instruction) { Candidates.phrases(instruction) }
     val decision = model?.kind == ModelOption.Kind.DECISION
     val hasTab = component.selectedTab.collectAsState().value != null
     val newTab = component.newTab.collectAsState().value
@@ -310,10 +311,13 @@ private fun Compose(
         if (!collapsed && instruction.isNotBlank()) {
             // What can be typed, shown before the run: a decision model types only these.
             FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text(if (decision) "Jev can type:" else "From your instruction:", color = RpaTokens.TextSecondary, fontSize = 12.sp,
-                    modifier = Modifier.align(Alignment.CenterVertically))
+                val words = decision && values.isEmpty() && phrases.isNotEmpty()
+                Text(
+                    if (words) "Jev can type words from your instruction, e.g. '${phrases.first()}'" else if (decision) "Jev can type:" else "From your instruction:",
+                    color = RpaTokens.TextSecondary, fontSize = 12.sp, modifier = Modifier.align(Alignment.CenterVertically),
+                )
                 values.forEach { Pill(it, Tone.ACCENT, mono = true) }
-                if (values.isEmpty()) {
+                if (values.isEmpty() && !words) {
                     Text(if (decision) "nothing yet. Put text to type in quotes." else "no quoted values; the model may write its own.",
                         color = if (decision) RpaTokens.Warning else RpaTokens.TextMuted, fontSize = 12.sp,
                         modifier = Modifier.align(Alignment.CenterVertically))
@@ -467,7 +471,7 @@ private fun StepRow(step: StepRecord, current: Boolean) {
             Text(step.description, color = RpaTokens.Text, fontSize = 13.sp, fontWeight = FontWeight.Medium)
             val notes = buildList {
                 if (step.chosenBy == StepRecord.ChosenBy.USER) add("you picked this")
-                if (step.valueWritten) add("text written by the model")
+                step.valueSource?.let { add(it.label) }
                 step.detail?.let { add(it) }
             }
             if (notes.isNotEmpty()) Text(notes.joinToString(" · "), color = if (step.outcome == StepRecord.Outcome.FAILED) RpaTokens.Error else RpaTokens.TextSecondary, fontSize = 12.sp)
@@ -500,8 +504,13 @@ private fun QuestionCard(component: LlmrpaComponent, q: PendingQuestion) {
             .border(1.dp, (if (risk) RpaTokens.Error else RpaTokens.Warning).copy(alpha = 0.6f), RoundedCornerShape(8.dp))
             // On the card, not the panel root: digits typed into a text field must stay text.
             .onKeyEvent { e ->
-                if (q !is PendingQuestion.Choose || e.type != KeyEventType.KeyDown || e.key !in NUMBER_KEYS) return@onKeyEvent false
-                q.options.getOrNull(NUMBER_KEYS.indexOf(e.key))?.let { component.answer(Answer.Pick(it.first)) }
+                if (e.type != KeyEventType.KeyDown || e.key !in NUMBER_KEYS) return@onKeyEvent false
+                val i = NUMBER_KEYS.indexOf(e.key)
+                when (q) {
+                    is PendingQuestion.Choose -> q.options.getOrNull(i)?.let { component.answer(Answer.Pick(it.first)) }
+                    is PendingQuestion.ChooseText -> q.options.getOrNull(i)?.let { component.answer(Answer.Text(it)) }
+                    is PendingQuestion.Confirm -> return@onKeyEvent false
+                }
                 true
             }
             .focusRequester(focus).focusable().padding(12.dp)
@@ -513,20 +522,15 @@ private fun QuestionCard(component: LlmrpaComponent, q: PendingQuestion) {
                 Text("Which should I do?", color = RpaTokens.Text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.semantics { heading() })
                 Text("${q.reason}. Pick one, or stop here.", color = RpaTokens.TextSecondary, fontSize = 12.sp)
                 q.options.forEachIndexed { i, (c, p) ->
-                    Row(
-                        Modifier.fillMaxWidth().heightIn(min = 40.dp).clip(RpaTokens.Shape).background(RpaTokens.Content)
-                            .border(1.dp, RpaTokens.Border, RpaTokens.Shape)
-                            .clickable(role = Role.Button) { component.answer(Answer.Pick(c)) }.pointerHoverIcon(PointerIcon.Hand)
-                            .padding(horizontal = 10.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        Text("${i + 1}", color = RpaTokens.TextMuted, fontSize = 11.sp, fontFamily = RpaTokens.Mono)
-                        Text(c.description, color = RpaTokens.Text, fontSize = 13.sp, modifier = Modifier.weight(1f))
-                        // A chat model may name a runner-up without saying how sure it is.
-                        if (p > 0) Text(TaskRunner.pct(p), color = RpaTokens.TextSecondary, fontSize = 12.sp)
-                    }
+                    // A chat model may name a runner-up without saying how sure it is.
+                    OptionRow(i, c.description, p.takeIf { it > 0 }) { component.answer(Answer.Pick(c)) }
                 }
+                OutlineButton("Stop here", { component.answer(Answer.Stop) }, tone = Tone.ERROR)
+            }
+            is PendingQuestion.ChooseText -> {
+                Text("What should I type?", color = RpaTokens.Text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.semantics { heading() })
+                Text("${q.reason}. Pick the text to type into '${q.field}', or stop here.", color = RpaTokens.TextSecondary, fontSize = 12.sp)
+                q.options.forEachIndexed { i, v -> OptionRow(i, v, null, mono = true) { component.answer(Answer.Text(v)) } }
                 OutlineButton("Stop here", { component.answer(Answer.Stop) }, tone = Tone.ERROR)
             }
             is PendingQuestion.Confirm -> {
@@ -541,6 +545,23 @@ private fun QuestionCard(component: LlmrpaComponent, q: PendingQuestion) {
                 }
             }
         }
+    }
+}
+
+/** One answer in a question card; the first three take the number keys. */
+@Composable
+private fun OptionRow(index: Int, text: String, confidence: Double?, mono: Boolean = false, onClick: () -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().heightIn(min = 40.dp).clip(RpaTokens.Shape).background(RpaTokens.Content)
+            .border(1.dp, RpaTokens.Border, RpaTokens.Shape)
+            .clickable(role = Role.Button, onClick = onClick).pointerHoverIcon(PointerIcon.Hand)
+            .padding(horizontal = 10.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(if (index < NUMBER_KEYS.size) "${index + 1}" else "·", color = RpaTokens.TextMuted, fontSize = 11.sp, fontFamily = RpaTokens.Mono)
+        Text(text, color = RpaTokens.Text, fontSize = 13.sp, modifier = Modifier.weight(1f), fontFamily = if (mono) RpaTokens.Mono else null)
+        confidence?.let { Text(TaskRunner.pct(it), color = RpaTokens.TextSecondary, fontSize = 12.sp) }
     }
 }
 

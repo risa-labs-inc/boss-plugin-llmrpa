@@ -43,8 +43,12 @@ internal class FakeTools(
     private val risk: Double = 0.1,
     /** Answers "is the task complete?" in order; the last value repeats. */
     private val complete: List<Double> = listOf(0.9),
+    /** Answers "which text goes into the field?" given its options: the chosen text (null = none) and probability. */
+    private val chooseText: (List<String>) -> Pair<String?, Double> = { null to 0.9 },
     private val decide: (Map<String, String>, Int) -> Triple<String, Double, Int?>,
 ) : ToolInvoker {
+    var textCalls = 0
+    val textOptions = mutableListOf<List<String>>()
     val steps = mutableListOf<JsonObject>()
     /** Full `rpa_step` arguments, for what travels beside the action. */
     val stepArgs = mutableListOf<JsonObject>()
@@ -91,6 +95,14 @@ internal class FakeTools(
                     val p = complete[verifyCalls.coerceAtMost(complete.lastIndex)]
                     verifyCalls++
                     ToolReply("""{"response":{"answers":{"complete":{"type":"noul","noul":$p}},"usage":{"cost":0.00001}}}""", false)
+                } else if ("text" in questions) {
+                    textCalls++
+                    val criteria = questions["text"]!!.jsonObject["criteria"]!!.jsonObject.mapValues { (it.value as JsonPrimitive).content }
+                    val options = criteria.filterKeys { it != JevDecider.NONE_OF_THESE }.values.toList()
+                    textOptions += options
+                    val (text, p) = chooseText(options)
+                    val key = text?.let { t -> criteria.entries.first { it.value == t }.key } ?: JevDecider.NONE_OF_THESE
+                    ToolReply("""{"response":{"answers":{"text":{"type":"choice","choice":"$key","probabilities":{"$key":$p},"confidence":$p}},"usage":{"cost":0.00003}}}""", false)
                 } else if ("irreversible" in questions) {
                     riskCalls++
                     ToolReply("""{"response":{"answers":{"irreversible":{"type":"noul","noul":$risk}},"usage":{"cost":0.00001}}}""", false)

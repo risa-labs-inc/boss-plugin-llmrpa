@@ -10,6 +10,7 @@ import java.nio.file.Files
 import java.nio.file.Path
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertIs
 import kotlin.test.assertTrue
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -48,6 +49,15 @@ class PanelRenderTest {
             assertEquals(RunStatus.WAITING, asking.run.value?.status)
             listOf(280, 360).forEach { render(asking, it, 1000, "asking-$it") }
             render(asking, 960, 760, "asking-wide-960")
+
+            val words = "Open wikipedia home page, then follow links till you reach breast cancer"
+            idle.updateInstruction(words)
+            render(idle, 360, 900, "ready-words-360")
+            val askingText = component(FakeTools(chooseText = { it.first() to 0.3 }) { _, _ -> Triple("Type into 'Search shop'", 0.94, null) })
+            askingText.updateInstruction(words)
+            assertEquals(null, askingText.startRun())
+            assertIs<PendingQuestion.ChooseText>(askingText.run.value?.question)
+            render(askingText, 360, 1000, "asking-text-360")
 
             val done = component(FakeTools { _, call ->
                 when (call) {
