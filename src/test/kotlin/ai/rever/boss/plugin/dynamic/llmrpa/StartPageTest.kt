@@ -72,6 +72,7 @@ class StartPageTest {
         // Credentials in the address are skipped, not opened.
         assertEquals("https://b.example/", StartPages.fromInstruction("Open https://me:pw@a.example/ or https://b.example/"))
         assertNull(StartPages.fromInstruction("Find the weather in Paris"))
+        assertNull(StartPages.fromInstruction("Open http://user:pw@x.example/"))
     }
 
     @Test
@@ -128,6 +129,10 @@ class StartPageTest {
         assertEquals("https://shop.example/", spaced.page.url)
         val inPath = StartPages.choose("Search for 'wireless keyboard'", chatDecider("""{"url":"https://shop.example/search/wireless%20keyboard"}"""))
         assertEquals("https://shop.example/", inPath.page.url)
+        // In the host, cutting to the site does not help: search instead.
+        val inHost = StartPages.choose(text, chatDecider("""{"url":"https://hunter2.shop.example/"}"""))
+        assertEquals(StartSource.SEARCH, inHost.page.source)
+        assertFalse(inHost.page.url.contains("hunter2"), inHost.page.url)
         val clean = StartPages.choose(text, chatDecider("""{"url":"https://shop.example/orders"}"""))
         assertEquals("https://shop.example/orders", clean.page.url)
     }

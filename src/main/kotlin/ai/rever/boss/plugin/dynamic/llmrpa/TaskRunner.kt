@@ -210,7 +210,8 @@ class TaskRunner(
         if (reply.isError || json == null) {
             lastReadError = when (reply.errorCode) {
                 ToolNames.NO_BROWSER -> NO_BROWSER_HINT.removeSuffix(".")
-                TAB_NOT_FOUND -> null
+                // Not yet registered: keep whatever earlier look said.
+                TAB_NOT_FOUND -> lastReadError
                 else -> reply.errorMessage
             }
             return null

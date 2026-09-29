@@ -107,14 +107,18 @@ internal object StartPages {
             // values (the user's own addresses aside) keeps only its origin.
             val own = Candidates.urls(instruction).toSet()
             // Decoded once, so %20, + and any hex case compare as the raw value.
-            val plain = runCatching { URLDecoder.decode(url, Charsets.UTF_8) }.getOrDefault(url)
-            val leaks = Candidates.scrubbable(instruction).filter { it !in own && it.length >= 3 }
-                .any { v -> url.contains(v, ignoreCase = true) || plain.contains(v, ignoreCase = true) }
-            if (!leaks) return Choice(OpenedPage(url, StartSource.MODEL), calls, cost)
+            val secrets = Candidates.scrubbable(instruction).filter { it !in own && it.length >= 3 }
+            fun leaks(u: String): Boolean {
+                val plain = runCatching { URLDecoder.decode(u, Charsets.UTF_8) }.getOrDefault(u)
+                return secrets.any { v -> u.contains(v, ignoreCase = true) || plain.contains(v, ignoreCase = true) }
+            }
+            if (!leaks(url)) return Choice(OpenedPage(url, StartSource.MODEL), calls, cost)
             val origin = URI(url).let { "${it.scheme}://${it.rawAuthority}/" }
-            return Choice(OpenedPage(origin, StartSource.MODEL, "its path carried text from your instruction, so only the site was opened"), calls, cost)
+            // The host itself can carry the value (hunter2.shop.example).
+            if (!leaks(origin)) return Choice(OpenedPage(origin, StartSource.MODEL, "its path carried text from your instruction, so only the site was opened"), calls, cost)
         }
         val why = reply.exceptionOrNull()?.message
+            ?: suggested?.url?.takeIf { usable(it, httpsOnly = true) != null }?.let { "the model's address carried text from your instruction" }
             ?: suggested?.url?.let { "the model's address '${it.take(80)}' is not a safe https address" }
             ?: "the model named no address"
         val search = searchUrl(instruction)
@@ -132,11 +136,13 @@ internal object StartPages {
      * has a drivable tab is on screen, so its browser is just not loaded.
      */
     fun awayReason(tab: ActiveTabData, tabs: List<ActiveTabData>, probed: Map<String, Boolean>?): String =
-        if (tabs.any { it.workspaceId == tab.workspaceId && drivableIn(probed, it.tabId) }) "Not loaded yet — open it once to use this tab"
+        if (tabs.any { it.workspaceId == tab.workspaceId && probed?.get(it.tabId) == true }) "Not loaded yet — open it once to use this tab"
         else "In another space (${tab.workspaceName.take(40)}) — switch to it to use this tab"
 
-    /** Whether the host can drive [tabId] now, as RPA Engine resolves it. */
-    // A throw is unknown, which reads as drivable: the NO_BROWSER mapping then explains a failure.
+    /**
+     * Whether the host can drive [tabId] now, as RPA Engine resolves it. A throw is unknown, which
+     * reads as drivable: the NO_BROWSER mapping then explains a failure.
+     */
     fun drivable(provider: ActiveTabsProvider, tabId: String): Boolean =
         runCatching { provider.getBrowserIntegration(tabId)?.isBrowserAvailable() == true }.getOrDefault(true)
 }
