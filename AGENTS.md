@@ -489,4 +489,8 @@ emails and addresses only, and Jev cannot write.
   the text choice, which is the one relaxation, and this is its limit. The same holds for the single
   quoted value shortcut and for Jev's own value pick, which 1.4 makes the common route. The check
   (`isKeywordSecret`) is narrower than the search scrub: a username may go into a username box.
-  Such a value is masked in the step, the history and the transcript wherever it lands.
+  Such a value is masked in the step, the history and the transcript wherever it lands. The keyword
+  regexes also take the word after an "is", "=" or ":" up to three words on ("password for github is
+  hunter2").
+- **Text the person picks (`USER`) does not make Enter commit.** The card names the field ("Pick the
+  text to type into '<field>'"), so the person chose both; this is deliberate, like quoted text.

@@ -159,6 +159,7 @@ class StartPageTest {
             "log into my bank, username bob, password hunter2",
             "log into my bank with password: hunter2 and username=bob",
             "log into my bank, the password is hunter2, user name bob",
+            "log into my bank; the password for github is hunter2 and the username to use is bob",
         ).forEach { text ->
             val q = java.net.URLDecoder.decode(StartPages.searchUrl(text)!!.substringAfter("q="), Charsets.UTF_8)
             assertTrue("hunter2" !in q && "bob" !in q, q)

@@ -49,6 +49,10 @@ class PhraseTypingTest {
         val prefix = Candidates.phrases("log into my bank, username bob, password bob123")
         assertTrue(prefix.none { "123" in it || "bob" in it }, prefix.toString())
         assertTrue("tomato soup" in Candidates.phrases("Login to Amazon and search for tomato soup"))
+        listOf("the password for github is hunter2, then search cats", "the password to use is hunter2, then search cats").forEach { t ->
+            assertTrue(Candidates.phrases(t).none { "hunter2" in it }, Candidates.phrases(t).toString())
+            assertTrue(Candidates.isKeywordSecret(t, "hunter2"), t)
+        }
         assertTrue(Candidates.phrases("red green blue cyan magenta yellow black white orange purple").size <= 8)
         assertEquals(emptyList(), Candidates.phrases("Open the home page"))
     }

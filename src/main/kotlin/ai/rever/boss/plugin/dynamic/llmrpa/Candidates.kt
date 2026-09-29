@@ -128,20 +128,20 @@ internal object Candidates {
     }
 
     private val SECRET_AFTER = Regex(
-        """\b(?:passwords?|passcode|passwd|pwd|pin|otp|token|secret|ssn|cvv|cvc|card(?: number)?|account(?: number)?|api key|user ?name)\b(?:\s*(?:is\b|=|:))?\s*("[^"]*"|“[^”]*”|‘[^’]*’|'[^']*'|[^\s,;]+)""",
+        """\b(?:passwords?|passcode|passwd|pwd|pin|otp|token|secret|ssn|cvv|cvc|card(?: number)?|account(?: number)?|api key|user ?name)\b(?:\s*(?:is\b|=|:))?\s*("[^"]*"|“[^”]*”|‘[^’]*’|'[^']*'|[^\s,;]+)(?:(?:\s+[^\s,;:=]+){0,3}?\s*(?:\bis\b|=|:)\s*("[^"]*"|“[^”]*”|‘[^’]*’|'[^']*'|[^\s,;]+))?""",
         RegexOption.IGNORE_CASE,
     )
 
     /**
-     * The unquoted word after a secret-sounding keyword ("password hunter2", "pin: 1234"), with the
-     * keyword. Crude, and it over-cuts ("pin the tab"), which only costs a search some words.
+     * The unquoted word after a secret-sounding keyword ("password hunter2", "pin: 1234"), and the
+     * one after an "is", "=" or ":" a few words on ("password for github is hunter2"), with the match. Crude, and it over-cuts ("pin the tab"), which only costs a search some words.
      */
     fun keywordSecrets(instruction: String): List<String> =
-        SECRET_AFTER.findAll(instruction).flatMap { listOf(it.value, it.groupValues[1]) }.distinct().toList()
+        SECRET_AFTER.findAll(instruction).flatMap { listOf(it.value, it.groupValues[1], it.groupValues[2]) }.filter { it.isNotEmpty() }.distinct().toList()
 
     // Narrower than SECRET_AFTER: a username is fine in a username box, a password is not.
     private val PRIVATE_AFTER = Regex(
-        """\b(?:passwords?|passcode|passwd|pwd|pin|otp|token|secret|ssn|cvv|cvc|card number|account number|api key)\b(?:\s*(?:is\b|=|:))?\s*("[^"]*"|“[^”]*”|‘[^’]*’|'[^']*'|[^\s,;]+)""",
+        """\b(?:passwords?|passcode|passwd|pwd|pin|otp|token|secret|ssn|cvv|cvc|card number|account number|api key)\b(?:\s*(?:is\b|=|:))?\s*("[^"]*"|“[^”]*”|‘[^’]*’|'[^']*'|[^\s,;]+)(?:(?:\s+[^\s,;:=]+){0,3}?\s*(?:\bis\b|=|:)\s*("[^"]*"|“[^”]*”|‘[^’]*’|'[^']*'|[^\s,;]+))?""",
         RegexOption.IGNORE_CASE,
     )
 
@@ -150,7 +150,7 @@ internal object Candidates {
      * field or the person may place, and masked wherever it is shown.
      */
     fun isKeywordSecret(instruction: String, value: String): Boolean =
-        PRIVATE_AFTER.findAll(instruction).any { it.groupValues[1].trim('"', '\'', '“', '”', '‘', '’') == value }
+        PRIVATE_AFTER.findAll(instruction).any { m -> m.groupValues.drop(1).any { it.isNotEmpty() && it.trim('"', '\'', '“', '”', '‘', '’') == value } }
 
     /**
      * [instruction] with each secret keyword and its word, then its values ([scrubbable]), replaced
