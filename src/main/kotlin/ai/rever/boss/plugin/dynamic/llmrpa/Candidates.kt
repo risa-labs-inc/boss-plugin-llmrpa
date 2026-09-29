@@ -93,6 +93,8 @@ internal object Candidates {
     private val quoted = listOf(
         Regex("\"([^\"]{1,200})\""),
         Regex("“([^”]{1,200})”"),
+        // macOS smart quotes turn 'x' into ‘x’.
+        Regex("‘([^’]{1,200})’"),
         Regex("""(?<!\w)'([^']{1,200})'(?!\w)"""),
     )
     private val email = Regex("""[\w.+-]+@[\w-]+(\.[\w-]+)+""")
@@ -111,7 +113,7 @@ internal object Candidates {
         return found.toList().take(20)
     }
 
-    private val quotedAll = listOf(Regex("\"([^\"]+)\""), Regex("“([^”]+)”"), Regex("""(?<!\w)'([^']+)'(?!\w)"""))
+    private val quotedAll = listOf(Regex("\"([^\"]+)\""), Regex("“([^”]+)”"), Regex("‘([^’]+)’"), Regex("""(?<!\w)'([^']+)'(?!\w)"""))
 
     /**
      * Every quoted phrase, email and address in the instruction, uncapped: what must not leave in a

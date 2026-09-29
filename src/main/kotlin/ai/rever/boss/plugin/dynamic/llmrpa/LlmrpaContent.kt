@@ -331,7 +331,7 @@ private fun Compose(
                 Box(center) { StepLimit(component, maxSteps, enabled = true) }
             }
             if (newTab && !decision && instruction.isNotBlank()) {
-                Text("Draft steps needs an open page: pick a tab.", color = RpaTokens.TextMuted, fontSize = 11.sp)
+                Text(LlmrpaComponent.DRAFT_NEEDS_TAB, color = RpaTokens.TextMuted, fontSize = 11.sp)
             }
         }
         if (!active && blocker != null && instruction.isNotBlank()) Notice(blocker.detail, Tone.WARNING)

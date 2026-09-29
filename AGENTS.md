@@ -403,7 +403,8 @@ Found by running, not reviewing:
 - **New tab**: start URL is the first usable http(s) address in the instruction, else the selected
   decider's (chat only; `jev_decide` answers choice/noul/score and cannot write one), https-only and
   validated (no credentials; a dotted host with an alphabetic TLD, so no localhost, `.local`/`.internal`
-  style suffixes, trailing dots or IP literals such as `0x7f.1`), else a DuckDuckGo search.
+  style suffixes, reserved TLDs such as `.test`/`.example`, trailing dots or IP literals such as
+  `0x7f.1`), else a DuckDuckGo search. Smart quotes (‘x’) count as quotes for typing and scrubbing.
 - **The search never carries the instruction's values.** Quoted text, emails and addresses are what
   a run may type, passwords included, so they are cut from the query; with nothing left the run stops
   and asks for the site. An unquoted secret is not detected. The scrub uses `Candidates.scrubbable`,

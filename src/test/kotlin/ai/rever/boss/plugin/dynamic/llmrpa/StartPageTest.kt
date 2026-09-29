@@ -86,6 +86,7 @@ class StartPageTest {
             "https://localhost/", "https://127.0.0.1/", "https://[::1]/", "https://exa mple.com", "example.com", "", null,
             "https://0x7f.1/", "https://127.1/", "https://localhost./", "https://foo.localhost/", "https://nas.local/",
             "https://git.internal/", "https://router.lan/", "https://box.home.arpa/", "https://example.com./",
+            "https://site.test/", "https://www.example/", "https://x.invalid/",
         ).forEach { assertNull(StartPages.usable(it, httpsOnly = true), "$it") }
     }
 
@@ -96,8 +97,8 @@ class StartPageTest {
         assertEquals(OpenedPage("https://news.example/today", StartSource.INSTRUCTION), fromText.page)
         assertTrue(calls.isEmpty(), "the model is not asked when the instruction names the page")
 
-        val picked = StartPages.choose("Check the weather in Paris", chatDecider("""Sure: {"url": "https://weather.example/paris"}""", calls))
-        assertEquals(OpenedPage("https://weather.example/paris", StartSource.MODEL), picked.page)
+        val picked = StartPages.choose("Check the weather in Paris", chatDecider("""Sure: {"url": "https://weather.example.com/paris"}""", calls))
+        assertEquals(OpenedPage("https://weather.example.com/paris", StartSource.MODEL), picked.page)
         assertEquals(1, picked.calls)
         assertEquals(1, calls.size)
         // Same routing as decide: the chosen provider and model, never the active one.
@@ -123,21 +124,21 @@ class StartPageTest {
     @Test
     fun `a model address that carries text from the instruction keeps only its site`() = runTest {
         val text = "Log in with password 'hunter2' and check my orders"
-        val leaky = StartPages.choose(text, chatDecider("""{"url":"https://shop.example/login?pw=hunter2"}"""))
-        assertEquals("https://shop.example/", leaky.page.url)
+        val leaky = StartPages.choose(text, chatDecider("""{"url":"https://shop.example.com/login?pw=hunter2"}"""))
+        assertEquals("https://shop.example.com/", leaky.page.url)
         assertEquals(StartSource.MODEL, leaky.page.source)
-        val encoded = StartPages.choose("Search for 'wireless keyboard'", chatDecider("""{"url":"https://shop.example/s?k=wireless+keyboard"}"""))
-        assertEquals("https://shop.example/", encoded.page.url)
-        val spaced = StartPages.choose("Sign in with passphrase 'my secret phrase'", chatDecider("""{"url":"https://shop.example/login?pw=my%20Secret%20phrase"}"""))
-        assertEquals("https://shop.example/", spaced.page.url)
-        val inPath = StartPages.choose("Search for 'wireless keyboard'", chatDecider("""{"url":"https://shop.example/search/wireless%20keyboard"}"""))
-        assertEquals("https://shop.example/", inPath.page.url)
+        val encoded = StartPages.choose("Search for 'wireless keyboard'", chatDecider("""{"url":"https://shop.example.com/s?k=wireless+keyboard"}"""))
+        assertEquals("https://shop.example.com/", encoded.page.url)
+        val spaced = StartPages.choose("Sign in with passphrase 'my secret phrase'", chatDecider("""{"url":"https://shop.example.com/login?pw=my%20Secret%20phrase"}"""))
+        assertEquals("https://shop.example.com/", spaced.page.url)
+        val inPath = StartPages.choose("Search for 'wireless keyboard'", chatDecider("""{"url":"https://shop.example.com/search/wireless%20keyboard"}"""))
+        assertEquals("https://shop.example.com/", inPath.page.url)
         // In the host, cutting to the site does not help: search instead.
-        val inHost = StartPages.choose(text, chatDecider("""{"url":"https://hunter2.shop.example/"}"""))
+        val inHost = StartPages.choose(text, chatDecider("""{"url":"https://hunter2.shop.example.com/"}"""))
         assertEquals(StartSource.SEARCH, inHost.page.source)
         assertFalse(inHost.page.url.contains("hunter2"), inHost.page.url)
-        val clean = StartPages.choose(text, chatDecider("""{"url":"https://shop.example/orders"}"""))
-        assertEquals("https://shop.example/orders", clean.page.url)
+        val clean = StartPages.choose(text, chatDecider("""{"url":"https://shop.example.com/orders"}"""))
+        assertEquals("https://shop.example.com/orders", clean.page.url)
     }
 
     @Test
@@ -188,6 +189,9 @@ class StartPageTest {
         assertEquals(StartSource.SEARCH, choice.page.source)
         listOf("hunter2", "ada", "bank.example", "%22", "%27").forEach { assertFalse(url.contains(it), "$it in $url") }
         assertTrue(url.contains("Log+in+to+my+bank"), url)
+        // Smart quotes, as macOS types them.
+        val smart = StartPages.searchUrl("Sign in with password ‘hunter2’ and check the balance")!!
+        assertFalse(smart.contains("hunter2") || smart.contains("%E2%80"), smart)
 
         // Nothing left to search for: stop and ask for the site rather than search for the secret.
         val bare = TaskRunner(FakeTools(decide = done), JevDecider(FakeTools(decide = done), JEV), null, "'hunter2'", fast,

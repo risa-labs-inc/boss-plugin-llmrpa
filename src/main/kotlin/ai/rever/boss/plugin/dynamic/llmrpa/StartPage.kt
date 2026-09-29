@@ -51,6 +51,7 @@ internal object StartPages {
      * a real host, no credentials. javascript:, data: and file: fail the scheme check.
      */
     fun usable(raw: String?, httpsOnly: Boolean): String? {
+        // java.net.URI has no host for a Unicode IDN (https://münchen.de), which is then skipped; kept strict on purpose.
         val s = raw?.trim()?.takeIf { it.isNotEmpty() && it.length <= 2_000 } ?: return null
         if (s.any { it.isWhitespace() || it.isISOControl() }) return null
         val uri = runCatching { URI(s) }.getOrNull() ?: return null
@@ -62,7 +63,8 @@ internal object StartPages {
         return uri.toString()
     }
 
-    private val LOCAL_SUFFIXES = listOf(".localhost", ".local", ".internal", ".lan", ".home.arpa", ".intranet", ".corp")
+    // Includes the reserved TLDs (RFC 2606/6761), which never resolve publicly.
+    private val LOCAL_SUFFIXES = listOf(".localhost", ".local", ".internal", ".lan", ".home.arpa", ".arpa", ".intranet", ".corp", ".test", ".example", ".invalid")
     private val TLD = Regex("[a-z]{2,63}|xn--[a-z0-9-]{1,59}")
     private val HEX_LABEL = Regex("0x[0-9a-f]*")
 
@@ -87,7 +89,7 @@ internal object StartPages {
     fun searchUrl(instruction: String): String? {
         var q = instruction
         Candidates.scrubbable(instruction).sortedByDescending { it.length }.forEach { q = q.replace(it, " ") }
-        q = q.replace(Regex("[\"“”']\\s*[\"“”']"), " ").replace(Regex("\\s+"), " ").trim().take(200)
+        q = q.replace(Regex("[\"“”‘’']\\s*[\"“”‘’']"), " ").replace(Regex("\\s+"), " ").trim().take(200)
         if (q.count { it.isLetterOrDigit() } < 3) return null
         return "https://duckduckgo.com/?q=" + URLEncoder.encode(q, Charsets.UTF_8)
     }

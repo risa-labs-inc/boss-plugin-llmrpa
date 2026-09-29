@@ -373,7 +373,7 @@ class TaskRunner(
     }
 
     private suspend fun observe(): PageSnapshot? {
-        val reply = tools.invoke(ToolNames.OBSERVE, buildJsonObject { put("tab_id", tabId) })
+        val reply = tools.invoke(ToolNames.OBSERVE, buildJsonObject { put("tab_id", checkNotNull(tabId) { "No tab to observe" }) })
         if (reply.isError || reply.json == null) {
             val why = if (reply.errorCode == ToolNames.NO_BROWSER) NO_BROWSER_HINT else reply.errorMessage
             finish(RunStatus.FAILED, "Could not read the page: $why")
@@ -387,7 +387,7 @@ class TaskRunner(
 
     private suspend fun act(action: StepAction, allowSensitive: Boolean): StepResult {
         val reply = tools.invoke(ToolNames.STEP, buildJsonObject {
-            put("tab_id", tabId)
+            put("tab_id", checkNotNull(tabId) { "No tab to act on" })
             // RPA Engine refuses typing into a sensitive field without this; older engines ignore it.
             if (allowSensitive) put("allow_sensitive", true)
             putJsonObject("action") {
