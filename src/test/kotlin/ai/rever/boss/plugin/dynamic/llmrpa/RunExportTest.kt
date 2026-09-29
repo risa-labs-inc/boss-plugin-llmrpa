@@ -58,8 +58,8 @@ class RunExportTest {
 
     private val now = 1_790_000_000_000L
 
-    private fun step(index: Int, type: String, outcome: StepRecord.Outcome = StepRecord.Outcome.OK, value: String? = null, private: Boolean = false, description: String = "Step $index") =
-        StepRecord(index, description, 0.9, outcome = outcome, action = StepAction(type, SelectorInfo("css", "#e$index"), value), privateValue = private)
+    private fun step(index: Int, type: String, outcome: StepRecord.Outcome = StepRecord.Outcome.OK, value: String? = null, private: Boolean = false, description: String = "Step $index", navigated: Boolean = false) =
+        StepRecord(index, description, 0.9, outcome = outcome, action = StepAction(type, SelectorInfo("css", "#e$index"), value), privateValue = private, navigated = navigated)
 
     private fun run(status: RunStatus, steps: List<StepRecord>, instruction: String = "Search the shop for keyboards") = RunState(
         instruction, "jev-1.13", 12, status = status, steps = steps, startedAt = 0, startUrl = "https://shop.example/",
@@ -73,18 +73,20 @@ class RunExportTest {
         val r = run(RunStatus.STOPPED, listOf(
             step(1, "input", value = "keyboards", description = "Type 'keyboards' into 'Search shop'"),
             step(2, "click", StepRecord.Outcome.FAILED, description = "Click 'Go' button"),
-            step(3, "keypress", value = "Enter", description = "Press Enter"),
+            step(3, "keypress", value = "Enter", description = "Press Enter", navigated = true),
         ))
         val e = RpaEngineHandoff.exportRun(r, dir, now).getOrThrow()
         val config = read(e.file)
-        assertEquals(listOf("navigate", "input", "keypress"), config.actions.map { it.type })
-        assertEquals(3, e.actionCount)
+        // A settle after the start page and after each step that loaded a new page, as the live run waited.
+        assertEquals(listOf("navigate", "wait", "input", "keypress", "wait"), config.actions.map { it.type })
+        assertEquals(5, e.actionCount)
         assertEquals("https://shop.example/", config.actions[0].value)
         assertEquals("none", config.actions[0].selector.type)
-        assertEquals("keyboards", config.actions[1].value)
-        assertEquals(EngineSelectorInfo("css", "#e1", true), config.actions[1].selector)
-        assertEquals("Type 'keyboards' into 'Search shop'", config.actions[1].name)
-        assertEquals(mapOf("source" to "llm-rpa", "step" to "1"), config.actions[1].meta)
+        assertEquals("1500", config.actions[1].value)
+        assertEquals("keyboards", config.actions[2].value)
+        assertEquals(EngineSelectorInfo("css", "#e1", true), config.actions[2].selector)
+        assertEquals("Type 'keyboards' into 'Search shop'", config.actions[2].name)
+        assertEquals(mapOf("source" to "llm-rpa", "step" to "1"), config.actions[2].meta)
         assertTrue(e.notes.isEmpty())
         assertTrue(config.description.startsWith("Exported from LLM RPA on "))
         listOf("Search the shop for keyboards", "Jev typesafe/jev-1.13", "2 of 3 steps worked").forEach { assertTrue(config.description.contains(it), config.description) }
@@ -113,7 +115,8 @@ class RunExportTest {
 
     @Test
     fun `a run that stopped before its private field writes none of the quoted values`() = runTest {
-        val page = SEARCH_PAGE.copy(elements = listOf(element("u1", "textbox", "Username"), element("p1", "textbox", "Password").copy(sensitive = true)))
+        // The password field is on a page the run never reached.
+        val page = SEARCH_PAGE.copy(elements = listOf(element("u1", "textbox", "Username"), element("e2", "button", "Next")))
         val tools = FakeTools(page = page) { _, _ -> Triple("Type into 'Username'", 0.95, 1) }
         val instruction = "Log in to shop.example as \"bob\" with \"hunter2x\""
         val state = TaskRunner(tools, JevDecider(tools, JEV), "t1", instruction, RunLimits(maxSteps = 1, navSettleMs = 0, stepSettleMs = 0)) { Answer.Stop }.run()
@@ -137,7 +140,7 @@ class RunExportTest {
     fun `a download is left out with a note, since plans cannot download`() {
         val r = run(RunStatus.DONE, listOf(step(1, "click"), step(2, "download", description = "Download image 'cat.jpg'")))
         val e = RpaEngineHandoff.exportRun(r, dir, now).getOrThrow()
-        assertEquals(listOf("navigate", "click"), read(e.file).actions.map { it.type })
+        assertEquals(listOf("navigate", "wait", "click"), read(e.file).actions.map { it.type })
         assertTrue(e.notes.single().contains("Download image 'cat.jpg'") && e.notes.single().contains("cannot download"), e.notes.toString())
         assertTrue(read(e.file).description.contains("cannot download"))
     }
@@ -149,7 +152,7 @@ class RunExportTest {
         val e = RpaEngineHandoff.exportRun(r.copy(shareableInstruction = Secrets.mask(r.instruction, Secrets.of(r.instruction))), dir, now).getOrThrow()
         val raw = e.file.readText()
         assertFalse(raw.contains("hunter2x"), raw)
-        val input = read(e.file).actions[1]
+        val input = read(e.file).actions[2]
         assertEquals("", input.value)
         assertEquals("true", input.meta?.get("private"))
         assertTrue(e.notes.single().contains("private field"))
@@ -172,8 +175,8 @@ class RunExportTest {
         val e = RpaEngineHandoff.exportRun(state, dir, now).getOrThrow()
         val raw = e.file.readText()
         assertFalse(raw.contains("s3cretvalue"), raw)
-        assertEquals(listOf("navigate", "input", "click"), read(e.file).actions.map { it.type })
-        assertEquals("#p1", read(e.file).actions[1].selector.value)
+        assertEquals(listOf("navigate", "wait", "input", "click"), read(e.file).actions.map { it.type })
+        assertEquals("#p1", read(e.file).actions[2].selector.value)
     }
 
     @Test
@@ -219,7 +222,7 @@ class RunExportTest {
         val result = call("{}")
         assertFalse(result.isError, result.text)
         val out = Json.parseToJsonElement(result.text) as JsonObject
-        assertEquals(2, (out["actions"] as JsonPrimitive).intOrNull)
+        assertEquals(3, (out["actions"] as JsonPrimitive).intOrNull)
         val path = (out["path"] as JsonPrimitive).content
         assertTrue(File(path).exists() && File(path).parentFile.canonicalFile == dir.canonicalFile)
         assertNotNull(out["notes"])
@@ -247,7 +250,7 @@ class RunExportTest {
             val notice = assertNotNull(c.export.value)
             assertEquals(done.startedAt, notice.runStartedAt)
             val e = assertNotNull(notice.export, notice.error)
-            assertEquals(listOf("navigate", "click"), read(e.file).actions.map { it.type })
+            assertEquals(listOf("navigate", "wait", "click"), read(e.file).actions.map { it.type })
             // RPA Engine's rpa_load is not registered by these fakes' answers, so the load reports what it said.
             c.openInEngine(notice)
             assertEquals("unknown tool", c.export.value?.loaded)

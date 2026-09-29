@@ -127,6 +127,8 @@ class JevDecider(private val tools: ToolInvoker, override val option: ModelOptio
      * One `jev_decide` call, recorded with its questions, Jev's probabilities and what it parsed
      * to. A throw from the tool is recorded and returned as a failure, like any decider's.
      */
+    private fun stub(kind: CallKind) = ModelCall.stub(kind, ToolNames.JEV_DECIDE, option.modelId)
+
     private suspend fun <T> ask(kind: CallKind, args: JsonObject, parse: (JsonObject) -> T, outcome: (T) -> CallOutcome): Result<T> {
         val started = System.nanoTime()
         fun record(reply: ToolReply?, result: Result<T>) = ModelCall(
@@ -141,12 +143,12 @@ class JevDecider(private val tools: ToolInvoker, override val option: ModelOptio
         } catch (e: CancellationException) {
             throw e
         } catch (e: Throwable) {
-            recordCall { record(null, Result.failure(e)) }
+            recordCall(stub(kind)) { record(null, Result.failure(e)) }
             return Result.failure(e)
         }
         val result = if (reply.isError) Result.failure(IllegalStateException(reply.errorMessage))
         else guarded { Result.success(parse(reply.json ?: error("Jev returned no JSON"))) }
-        recordCall { record(reply, result) }
+        recordCall(stub(kind)) { record(reply, result) }
         return result
     }
 
@@ -344,6 +346,8 @@ class ChatDecider(
      * One gateway request, recorded with its prompt, the reply and what it parsed to. The reply is
      * null when the request itself failed; a throw is recorded, then rethrown for the caller's guard.
      */
+    private fun stub(kind: CallKind) = ModelCall.stub(kind, ModelCall.GATEWAY, "${option.providerId}/${option.modelId}")
+
     private suspend fun <T> call(
         api: AiGatewayAPI,
         kind: CallKind,
@@ -365,12 +369,12 @@ class ChatDecider(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Throwable) {
-            recordCall { record(null, Result.failure(e)) }
+            recordCall(stub(kind)) { record(null, Result.failure(e)) }
             throw e
         }
-        val text = reply.getOrElse { e -> recordCall { record(null, Result.failure(e)) }; return null to Result.failure(e) }
+        val text = reply.getOrElse { e -> recordCall(stub(kind)) { record(null, Result.failure(e)) }; return null to Result.failure(e) }
         val result = runCatching { parse(text.text) }
-        recordCall { record(text, result) }
+        recordCall(stub(kind)) { record(text, result) }
         return text to result
     }
 

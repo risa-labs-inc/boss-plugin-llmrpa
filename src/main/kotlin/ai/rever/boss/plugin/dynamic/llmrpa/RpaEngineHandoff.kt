@@ -158,28 +158,34 @@ internal object RpaEngineHandoff {
             val found = checkNotNull(run.startUrl)
             val start = Secrets.mask(if (run.opened != null) withoutUserInfo(found) else withoutQuery(found), secrets)
             if (run.opened == null && start != found) notes += "The start address was cut to $start: its query or fragment can carry a session or sign-in token."
+            // The live run waited for each new page to settle before looking again; pages rebuild
+            // widgets on load (a search box becomes a combobox), so the replay waits there too.
+            fun settle() = EngineAction(name = "Let the page settle", type = "wait", selector = SelectorInfo(type = "none"), value = REPLAY_SETTLE_MS.toString(), meta = mapOf("source" to "llm-rpa"))
             val actions = listOf(
                 EngineAction(name = "Open the start page", type = "navigate", selector = SelectorInfo(type = "none"), value = start, meta = mapOf("source" to "llm-rpa")),
-            ) + run.steps.filter { it.outcome == StepRecord.Outcome.OK }.mapNotNull { step ->
-                val a = step.action ?: return@mapNotNull null
+                settle(),
+            ) + run.steps.filter { it.outcome == StepRecord.Outcome.OK }.flatMap { step ->
+                val a = step.action ?: return@flatMap emptyList()
                 if (a.type !in PLAN_VERBS) {
                     notes += "Step ${step.index} (${step.description}) was left out: RPA Engine plans cannot ${a.type}."
-                    return@mapNotNull null
+                    return@flatMap emptyList()
                 }
                 if (step.privateValue) notes += "Step ${step.index} types into a private field and was written with no text: fill it in before running."
                 EngineAction(
                     name = step.description,
                     type = a.type,
                     selector = a.selector ?: SelectorInfo(type = "none"),
+                    // A "Go to" address comes from the instruction alone, so its query is the person's own.
+                    // A page-derived address would need withoutQuery, as the start of a found tab does.
                     value = if (step.privateValue) "" else a.value?.let { v -> Secrets.mask(if (a.type == "navigate") withoutUserInfo(v) else v, secrets) },
                     meta = buildMap {
                         put("source", "llm-rpa")
                         put("step", step.index.toString())
                         if (step.privateValue) put("private", "true")
                     },
-                )
+                ).let { if (step.navigated) listOf(it, settle()) else listOf(it) }
             }
-            if (actions.size == 1) notes += "Only the start page: no step of the run worked or could be exported."
+            if (actions.size == 2) notes += "Only the start page: no step of the run worked or could be exported."
             // Every quoted value, email and address is masked here, not only known secrets: a run
             // that stopped before its private field never learned which value was private.
             val instruction = Candidates.scrub(run.instruction, Secrets.MASK)
@@ -290,4 +296,5 @@ internal object RpaEngineHandoff {
     private const val MAX_SLUG_CHARS = 40
     private const val MAX_NAME_CHARS = 80
     private const val MAX_EXPORT_SUFFIX = 100
+    private const val REPLAY_SETTLE_MS = 1_500L
 }

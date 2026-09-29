@@ -525,3 +525,10 @@ emails and addresses only, and Jev cannot write.
 - **A tab the run found open is exported without its query and fragment** (a session or sign-in
   token rides there); an address the run opened itself is kept, since a search fallback needs its `?q=`.
 - `RunHistory` keeps call text for the newest 3 runs only; export needs just the steps.
+- **Quoted values are masked in calls once a page shows a private field**, unless already typed into a
+  plain one: the run cannot know which value is the password until it types it. Accepted gap: before
+  any private field is seen, a quoted password with no keyword in front is in the call text (the
+  person's own instruction, shown only locally). Exports scrub every quoted value regardless.
+- A record that cannot be built or stored becomes a text-less stub, so `calls` still counts it.
+- The export adds a 1.5 s `wait` after the start page and after each step that navigated, where the
+  live run waited before looking again. Selectors are written as the page gave them.

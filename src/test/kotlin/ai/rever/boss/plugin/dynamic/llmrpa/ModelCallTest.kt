@@ -183,8 +183,38 @@ class ModelCallTest {
         history.add(run.copy(startedAt = 1))
         val (newest, older) = history.recent()
         assertEquals("req", newest.modelCalls.single().request.text)
-        assertEquals(CappedText("", truncated = true), older.modelCalls.single().request)
+        assertEquals(CappedText("", dropped = true), older.modelCalls.single().request)
         assertEquals("x" to 0.1, older.modelCalls.single().pick to older.costUsd)
+        val detail = LlmrpaMcpToolProvider.callDetail(older.modelCalls.single())
+        assertEquals(JsonPrimitive("kept for the 3 newest runs only"), detail["text_dropped"])
+        assertNull(detail["request"])
+    }
+
+    @Test
+    fun `a call whose record cannot be built still counts`() = runTest {
+        val stub = ModelCall.stub(CallKind.RISK, ToolNames.JEV_DECIDE, "m")
+        // Building the record throws (an api mismatch reading the reply).
+        kotlinx.coroutines.withContext(CallRecorder(1) { recorded += it }) { recordCall(stub) { throw NoSuchMethodError("AiReply.getUsage") } }
+        // Storing it throws (masking, say): the stub goes in its place.
+        var n = 0
+        kotlinx.coroutines.withContext(CallRecorder(2) { c -> if (n++ == 0) error("masking failed") else recorded += c }) { recordCall(stub) { stub.copy(error = null, pick = "x") } }
+        assertEquals(listOf(1, 2), recorded.map { it.step })
+        assertTrue(recorded.all { it.kind == CallKind.RISK && it.error == "This call happened but could not be recorded" })
+    }
+
+    private val recorded = mutableListOf<ModelCall>()
+
+    @Test
+    fun `quoted values are masked once a page shows a private field, even if the run stops before typing`() = runTest {
+        val page = SEARCH_PAGE.copy(elements = listOf(element("u1", "textbox", "Username"), element("p1", "textbox", "Password").copy(sensitive = true)))
+        val tools = FakeTools(page = page) { _, _ -> Triple("Type into 'Username'", 0.95, 1) }
+        val instruction = "Log in to shop.example as \"bob\" with \"hunter2x\""
+        val state = TaskRunner(tools, JevDecider(tools, JEV), "t1", instruction, RunLimits(maxSteps = 1, navSettleMs = 0, stepSettleMs = 0)) { Answer.Stop }.run()
+        assertEquals(RunStatus.STOPPED, state.status, state.summary)
+        val full = LlmrpaMcpToolProvider.transcript(state, includeCalls = true).toString()
+        assertFalse(full.contains("hunter2x"), full)
+        // The username went into a plain field, which the timeline shows as usual.
+        assertEquals("Type 'bob' into 'Username'", state.steps.single().description)
     }
 
     @Test
@@ -197,6 +227,8 @@ class ModelCallTest {
         assertEquals("the pin is ${Secrets.MASK}, not 12345", Secrets.mask("the pin is 1234, not 12345", setOf("1234")))
         assertEquals("""{"v1":"${Secrets.MASK}"}""", Secrets.mask("""{"v1":"pa\"ss"}""", setOf("pa\"ss")))
         assertEquals("there", Secrets.mask("there", setOf("the")))
+        // An end that is punctuation needs no word boundary.
+        assertEquals("pw${Secrets.MASK}", Secrets.mask("pw#abc", setOf("#abc")))
     }
 
     @Test

@@ -213,9 +213,12 @@ internal class LlmrpaMcpToolProvider(
                     })
                 }
             })
-            put("request", c.request.text)
-            if (c.request.truncated) put("request_truncated", true)
-            c.response?.let { put("response", it.text); if (it.truncated) put("response_truncated", true) }
+            // An older run's text is let go to save memory; saying so reads better than an empty string.
+            if (c.request.dropped) put("text_dropped", "kept for the 3 newest runs only") else {
+                put("request", c.request.text)
+                if (c.request.truncated) put("request_truncated", true)
+                c.response?.let { put("response", it.text); if (it.truncated) put("response_truncated", true) }
+            }
             c.pick?.let { put("pick", it) }
             c.confidence?.let { put("confidence", it) }
             c.risk?.let { put("risk", it) }

@@ -85,6 +85,8 @@ private fun CallCard(call: ModelCall) {
                 ranked.take(SHOWN_OPTIONS).forEach { OptionBar(it, picked = it.key == q.pick) }
                 if (ranked.size > SHOWN_OPTIONS) Text("+${ranked.size - SHOWN_OPTIONS} more", color = RpaTokens.TextMuted, fontSize = 11.sp)
             }
+        } else if (call.request.dropped) {
+            Text("The prompt and reply are kept for the 3 newest runs only.", color = RpaTokens.TextMuted, fontSize = 11.sp)
         } else {
             call.response?.let { r ->
                 Text("Reply", color = RpaTokens.TextMuted, fontSize = 11.sp)

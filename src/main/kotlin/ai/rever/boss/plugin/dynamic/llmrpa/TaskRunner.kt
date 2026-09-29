@@ -38,6 +38,8 @@ data class StepRecord(
     val action: StepAction? = null,
     /** The typed text is masked: a private field, or text after a word like "password". */
     val privateValue: Boolean = false,
+    /** The step loaded a new page, so a replay should wait after it. */
+    val navigated: Boolean = false,
 ) {
     enum class Outcome { RUNNING, OK, FAILED }
     enum class ChosenBy { MODEL, USER }
@@ -140,6 +142,9 @@ class TaskRunner(
     val state: StateFlow<RunState> = _state.asStateFlow()
 
     private val values = Candidates.values(instruction)
+
+    /** Quoted values typed into a field the page does not mark private: evidently not a secret. */
+    private val typedPlain = mutableSetOf<String>()
 
     /** Text never shown or written: keyword secrets, plus whatever went into a private field. */
     private val secrets = Secrets.of(instruction).toMutableSet()
@@ -283,6 +288,9 @@ class TaskRunner(
             val stepNo = _state.value.steps.size + 1
             val page = pending?.also { pending = null } ?: observe() ?: return state.value
             if (_state.value.startUrl == null) _state.update { it.copy(startUrl = page.url) }
+            // Once a page shows a private field, any quoted value not yet typed into a plain one may
+            // be its text, so the calls mask it; the run cannot know which until it types.
+            if (page.elements.any { it.sensitive }) values.filter { it !in typedPlain }.forEach(::keepSecret)
             // Where the last step landed, so the model can tell a search results page from the article.
             if (history.isNotEmpty() && !history.last().contains(" → now on ")) {
                 history[history.lastIndex] = "${history.last()} → now on '${page.title.take(80)}'"
@@ -406,6 +414,7 @@ class TaskRunner(
             _state.update { it.copy(steps = it.steps + record) }
 
             val (ok, error, navigated, noBrowser) = act(action.copy(value = value), allowSensitive = chosen.element?.sensitive == true && fromInstruction)
+            if (chosen.needsValue && ok && !private && value != null) typedPlain += value
             if (chosen.needsValue && ok) {
                 typedInto = chosen.element
                 typedCommits = when (source) {
@@ -420,7 +429,7 @@ class TaskRunner(
             }
             _state.update { s ->
                 s.copy(steps = s.steps.map {
-                    if (it.index == stepNo) it.copy(outcome = if (ok) StepRecord.Outcome.OK else StepRecord.Outcome.FAILED, detail = error) else it
+                    if (it.index == stepNo) it.copy(outcome = if (ok) StepRecord.Outcome.OK else StepRecord.Outcome.FAILED, detail = error, navigated = navigated) else it
                 })
             }
             if (noBrowser) return finish(RunStatus.FAILED, "Stopped at step $stepNo: $NO_BROWSER_HINT")

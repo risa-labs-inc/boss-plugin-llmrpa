@@ -14,8 +14,11 @@ enum class CallKind(val label: String) {
     START_URL("start page"),
 }
 
-/** Text as stored in a [ModelCall]: masked and capped at [ModelCall.MAX_TEXT_BYTES] of UTF-8. */
-data class CappedText(val text: String, val truncated: Boolean = false)
+/**
+ * Text as stored in a [ModelCall]: masked and capped at [ModelCall.MAX_TEXT_BYTES] of UTF-8.
+ * [dropped] means an older run let the text go to save memory.
+ */
+data class CappedText(val text: String, val truncated: Boolean = false, val dropped: Boolean = false)
 
 /** One option in a Jev question: its key, its label, and the probability Jev gave it (null when not reported). */
 data class CallOption(val key: String, val label: String, val probability: Double?)
@@ -68,10 +71,14 @@ data class ModelCall(
     }
 
     /** Without the request and reply text, which is most of its size. */
-    fun withoutText(): ModelCall = copy(request = CappedText("", request.text.isNotEmpty()), response = response?.let { CappedText("", it.text.isNotEmpty()) })
+    fun withoutText(): ModelCall = copy(request = CappedText("", dropped = true), response = response?.let { CappedText("", dropped = true) })
 
     companion object {
         const val GATEWAY = "ai_gateway"
+
+        /** What is known of a call whose record could not be built, so the count still holds. */
+        internal fun stub(kind: CallKind, tool: String, model: String) =
+            ModelCall(0, kind, tool, model, request = CappedText(""), latencyMs = 0, error = "This call happened but could not be recorded")
         const val MAX_TEXT_BYTES = 8 * 1024
 
         /** [text] cut to [MAX_TEXT_BYTES] of UTF-8 on a character boundary, and before any of [avoid] it would split. */
@@ -116,15 +123,18 @@ internal class CallRecorder(val step: Int, private val sink: (ModelCall) -> Unit
 
 /**
  * Reports the call [build] describes to the run's recorder, if any. Best-effort: it runs after the
- * answer is in, so a throw here (an api mismatch reading the reply, say) must not fail a good pick.
+ * answer is in, so a throw here (an api mismatch reading the reply, say) must not fail a good pick;
+ * [stub] is recorded instead.
  */
-internal suspend fun recordCall(build: () -> ModelCall) {
+internal suspend fun recordCall(stub: ModelCall, build: () -> ModelCall) {
     val recorder = currentCoroutineContext()[CallRecorder] ?: return
     try {
         recorder.record(build())
     } catch (e: CancellationException) {
         throw e
     } catch (_: Throwable) {
+        // [stub] carries no text, so the count and the timeline still show the call.
+        runCatching { recorder.record(stub) }
     }
 }
 
@@ -141,8 +151,11 @@ internal object Secrets {
     fun mask(text: String, secrets: Collection<String>): String {
         var out = text
         secrets.flatMap { listOf(it, jsonEscaped(it), java.net.URLEncoder.encode(it, Charsets.UTF_8), java.net.URLEncoder.encode(it, Charsets.UTF_8).replace("+", "%20")) }.distinct().filter { it.isNotEmpty() }.sortedByDescending { it.length }.forEach { s ->
-            // An escape like \n in JSON text, or %20 in an address, ends in a letter or digit and still separates words.
-            out = out.replace(Regex("(?:(?<![\\p{L}\\p{N}])|(?<=\\\\[nrtbf])|(?<=%[0-9A-Fa-f]{2}))${Regex.escape(s)}(?![\\p{L}\\p{N}])"), Regex.escapeReplacement(MASK))
+            // Word boundaries only at an end that is itself a word character. An escape like \n in
+            // JSON text, or %20 in an address, ends in a letter or digit and still separates words.
+            val before = if (s.first().isLetterOrDigit()) "(?:(?<![\\p{L}\\p{N}])|(?<=\\\\[nrtbf])|(?<=%[0-9A-Fa-f]{2}))" else ""
+            val after = if (s.last().isLetterOrDigit()) "(?![\\p{L}\\p{N}])" else ""
+            out = out.replace(Regex(before + Regex.escape(s) + after), Regex.escapeReplacement(MASK))
         }
         return out
     }
