@@ -318,7 +318,7 @@ private fun Compose(
         draftPath?.let { Notice("Draft saved for RPA Engine as ${java.io.File(it).name}. Load it there to run the whole plan.", Tone.SUCCESS) }
         if (!collapsed && model != null) {
             val where = if (decision) "OpenRouter" else model.providerName
-            Text("Each step sends your instruction (including anything quoted in it), element labels and the page address to $where. Text already in fields is never read.",
+            Text("Every step sends your instruction, with all quoted text (even text meant for a password field), element labels and the page address to $where. Text already in fields is never read.",
                 color = RpaTokens.TextMuted, fontSize = 11.sp)
         }
     }
@@ -485,7 +485,8 @@ private fun QuestionCard(component: LlmrpaComponent, q: PendingQuestion) {
                     ) {
                         Text("${i + 1}", color = RpaTokens.TextMuted, fontSize = 11.sp, fontFamily = RpaTokens.Mono)
                         Text(c.description, color = RpaTokens.Text, fontSize = 13.sp, modifier = Modifier.weight(1f))
-                        Text(TaskRunner.pct(p), color = RpaTokens.TextSecondary, fontSize = 12.sp)
+                        // A chat model may name a runner-up without saying how sure it is.
+                        if (p > 0) Text(TaskRunner.pct(p), color = RpaTokens.TextSecondary, fontSize = 12.sp)
                     }
                 }
                 OutlineButton("Stop here", { component.answer(Answer.Stop) }, tone = Tone.ERROR)

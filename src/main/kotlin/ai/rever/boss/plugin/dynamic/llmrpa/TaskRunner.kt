@@ -2,6 +2,9 @@ package ai.rever.boss.plugin.dynamic.llmrpa
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -118,6 +121,9 @@ class TaskRunner(
         val history = mutableListOf<String>()
         var failures = 0
         var doneRejected = false
+        // The field the last step typed into, and whether the model wrote that text: Enter lands there.
+        var typedInto: PageElement? = null
+        var typedWritten = false
         // Counted in actions taken, so a rejected done check does not use up the budget.
         while (_state.value.steps.size < limits.maxSteps) {
             val stepNo = _state.value.steps.size + 1
@@ -194,15 +200,19 @@ class TaskRunner(
             val description = if (chosen.needsValue) "Type $shown into '${chosen.element?.label?.take(60)}'" else chosen.description
 
             if (chosen.canCommit) {
+                // Enter is judged by the field it lands in, which "Press Enter" alone does not name.
+                val field = typedInto?.takeIf { chosen.kind == Candidate.Kind.KEY }
+                val target = field?.let { chosen.copy(description = "Press Enter in '${it.label?.take(60)}'", element = it) } ?: chosen
                 // Fails closed: an unassessed risk asks (and stops a headless run). The model's flag
                 // describes its own pick, never an alternative the person chose.
                 val assessed = decision.risk.takeIf { chosenBy == StepRecord.ChosenBy.MODEL }
-                    ?: decider.risk(ctx, chosen).getOrNull()?.also { (_, cost) ->
+                    ?: decider.risk(ctx, target).getOrNull()?.also { (_, cost) ->
                         _state.update { it.copy(calls = it.calls + 1, costUsd = it.costUsd + cost) }
                     }?.first
                 // The label check can only raise a model's answer: a chat model grades its own pick
-                // from page text, so a misleading page could otherwise talk it past a Delete.
-                val label = if (Candidates.soundsCommitting(chosen)) 1.0 else 0.0
+                // from page text, so a misleading page could otherwise talk it past a Delete. Enter
+                // after text the model wrote could post it, so that counts too.
+                val label = if (Candidates.soundsCommitting(target) || (field != null && typedWritten)) 1.0 else 0.0
                 val risk = when {
                     assessed != null -> maxOf(assessed, label)
                     label > 0 -> label
@@ -210,17 +220,20 @@ class TaskRunner(
                     chosenBy == StepRecord.ChosenBy.USER -> 0.0
                     else -> null
                 }
-                if ((risk == null || risk >= limits.confirmAbove) && waitFor(PendingQuestion.Confirm(chosen, risk)) != Answer.Proceed) {
-                    return finish(RunStatus.STOPPED, "Stopped before \"${chosen.description}\"")
+                if ((risk == null || risk >= limits.confirmAbove) && waitFor(PendingQuestion.Confirm(target, risk)) != Answer.Proceed) {
+                    return finish(RunStatus.STOPPED, "Stopped before \"${target.description}\"")
                 }
             }
+            val action = chosen.action ?: return finish(RunStatus.FAILED, "'${chosen.description}' has nothing to perform")
 
             val record = StepRecord(stepNo, description, decision.confidence, decision.alternatives.mapNotNull { (k, p) ->
                 candidates.firstOrNull { it.key == k }?.let { it.description to p }
             }, valueWritten = chosen.needsValue && !fromInstruction, chosenBy = chosenBy)
             _state.update { it.copy(steps = it.steps + record) }
 
-            val (ok, error, navigated) = act(chosen.action!!.copy(value = value), allowSensitive = chosen.element?.sensitive == true && fromInstruction)
+            val (ok, error, navigated) = act(action.copy(value = value), allowSensitive = chosen.element?.sensitive == true && fromInstruction)
+            typedInto = chosen.element.takeIf { chosen.needsValue && ok }
+            typedWritten = typedInto != null && !fromInstruction
             _state.update { s ->
                 s.copy(steps = s.steps.map {
                     if (it.index == stepNo) it.copy(outcome = if (ok) StepRecord.Outcome.OK else StepRecord.Outcome.FAILED, detail = error) else it
@@ -273,8 +286,13 @@ class TaskRunner(
     }
 
     private suspend fun waitFor(q: PendingQuestion): Answer {
-        _state.update { it.copy(status = RunStatus.WAITING, question = q, lastQuestion = q) }
-        val answer = ask(q)
+        // Start asking before the question is shown, so an answer the moment it appears has a
+        // place to land: ask runs up to its first suspension, then the question is published.
+        val answer = coroutineScope {
+            val pending = async(start = CoroutineStart.UNDISPATCHED) { ask(q) }
+            _state.update { it.copy(status = RunStatus.WAITING, question = q, lastQuestion = q) }
+            pending.await()
+        }
         _state.update { it.copy(status = RunStatus.RUNNING, question = null) }
         return answer
     }

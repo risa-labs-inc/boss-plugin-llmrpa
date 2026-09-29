@@ -29,6 +29,8 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.emptyFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
@@ -222,21 +224,28 @@ class RunnerSafetyTest {
     @Test
     fun `a tab with a run on it refuses a second one from the panel or headless`() = withMain {
         val locks = TabLocks()
-        assertTrue(locks.tryAcquire("t1"))
+        assertNull(locks.tryAcquire("t1", TabLocks.Owner.HEADLESS))
         val tools = FakeTools { _, _ -> Triple("The task is complete", 0.9, null) }
         val c = component(tools, locks)
         c.updateInstruction(instruction)
-        assertEquals(TabLocks.BUSY, c.startRun())
-        assertEquals(TabLocks.BUSY, c.errorMessage.value)
-
-        val headless = HeadlessRunner(tools, { null }, { null }, tabs = { listOf(tab("t1")) }, activeTabId = { null }, locks = locks)
-        assertEquals(TabLocks.BUSY, kotlinx.coroutines.runBlocking { headless.execute(instruction, "t1", 3, null) }.exceptionOrNull()?.message)
+        assertEquals(TabLocks.Owner.HEADLESS.busy, c.startRun())
+        assertEquals(TabLocks.Owner.HEADLESS.busy, c.errorMessage.value)
 
         // Released, a run goes ahead and gives the tab back when it ends.
         locks.release("t1")
         assertNull(c.startRun())
         assertEquals(RunStatus.DONE, c.run.value?.status)
-        assertTrue(locks.tryAcquire("t1"))
+        assertNull(locks.tryAcquire("t1", TabLocks.Owner.HEADLESS))
+    }
+
+    @Test
+    fun `a headless call on a tab the panel holds says the panel may be waiting for an answer`() = runTest {
+        val locks = TabLocks()
+        assertNull(locks.tryAcquire("t1", TabLocks.Owner.PANEL))
+        val tools = FakeTools { _, _ -> Triple("The task is complete", 0.9, null) }
+        val headless = HeadlessRunner(tools, { null }, { null }, tabs = { listOf(tab("t1")) }, activeTabId = { null }, locks = locks)
+        val err = headless.execute(instruction, "t1", 3, null).exceptionOrNull()?.message.orEmpty()
+        assertTrue(err.contains("panel") && err.contains("waiting for an answer"), err)
     }
 
     @Test
@@ -526,6 +535,73 @@ class RunnerSafetyTest {
         assertEquals("gemma4", fromActive.single().models.single().modelId)
 
         assertTrue(ModelDirectory(tools, { null }, { null }).load().isEmpty())
+    }
+
+    @Test
+    fun `enter after text the model wrote into a message box asks first`() = runTest {
+        val box = element("e8", "textbox", "Write a reply", tag = "textarea")
+        val page = SEARCH_PAGE.copy(elements = listOf(box))
+        val tools = FakeTools(page = page) { _, _ -> error("jev is not used") }
+        val decider = chatDecider(
+            """{"action":"${key("Type into 'Write a reply'", page)}","value":"Sounds good, see you then","confidence":0.9,"irreversible":false}""",
+            """{"action":"${key("Press Enter", page)}","confidence":0.9,"irreversible":false}""",
+        )
+        var asked: PendingQuestion? = null
+        val state = TaskRunner(tools, decider, "t1", "Reply to the message") { asked = it; Answer.Stop }.run()
+        val confirm = assertIs<PendingQuestion.Confirm>(asked)
+        assertEquals("Press Enter in 'Write a reply'", confirm.action.description)
+        assertEquals(RunStatus.STOPPED, state.status)
+        assertEquals(1, tools.steps.size)
+    }
+
+    @Test
+    fun `a chat model's runners-up are offered when it is unsure or stuck`() = runTest {
+        val ctx = StepContext(instruction, SEARCH_PAGE, Candidates.build(SEARCH_PAGE, instruction), Candidates.values(instruction), emptyList())
+        val signIn = key("Open 'Sign in' link")
+        val order = key("Click 'Place your order' button")
+        val d = ChatDecider.parseReply(
+            """{"action":"stuck","confidence":0.4,"irreversible":false,"alternatives":[{"action":"$signIn","confidence":0.3},"$order",{"action":"a999"},{"action":"stuck"}]}""",
+            ctx,
+        )
+        assertEquals(listOf(signIn to 0.3, order to 0.0), d.alternatives)
+
+        val tools = FakeTools { _, _ -> error("jev is not used") }
+        var asked: PendingQuestion? = null
+        TaskRunner(tools, chatDecider("""{"action":"stuck","confidence":0.9,"alternatives":[{"action":"$signIn","confidence":0.3}]}"""), "t1", instruction) {
+            asked = it; Answer.Stop
+        }.run()
+        assertEquals(listOf("Open 'Sign in' link"), assertIs<PendingQuestion.Choose>(asked).options.map { it.first.description })
+    }
+
+    @Test
+    fun `an answer given the moment a question appears is not lost`() = runTest {
+        val tools = FakeTools { _, _ -> Triple("Open 'Sign in' link", 0.4, null) }
+        val asker = PanelAsker()
+        val runner = TaskRunner(tools, JevDecider(tools, JEV), "t1", instruction) { asker.ask(it) }
+        // Unconfined: the watcher answers inside the very update that publishes the question.
+        val watcher = launch(kotlinx.coroutines.Dispatchers.Unconfined) {
+            runner.state.first { it.question != null }
+            asker.answer(Answer.Stop)
+        }
+        val state = kotlinx.coroutines.withTimeout(5_000) { runner.run() }
+        watcher.cancel()
+        assertEquals(RunStatus.STOPPED, state.status)
+    }
+
+    @Test
+    fun `headless with a Jev model and no jev_decide says Jev is missing`() = runTest {
+        val tools = FakeTools { _, _ -> Triple("The task is complete", 0.9, null) }
+        val runner = HeadlessRunner(tools, { null }, { null }, tabs = { listOf(tab("t1")) }, activeTabId = { "t1" }, locks = TabLocks())
+        // The catalog saw Jev, then it unloaded before the run started.
+        var calls = 0
+        tools.registered = null
+        val flaky = object : ToolInvoker by tools {
+            override fun has(toolName: String) = if (toolName == ToolNames.JEV_DECIDE) calls++ == 0 else tools.has(toolName)
+        }
+        val err = HeadlessRunner(flaky, { null }, { null }, tabs = { listOf(tab("t1")) }, activeTabId = { "t1" }, locks = TabLocks())
+            .execute(instruction, null, 3, null).exceptionOrNull()?.message.orEmpty()
+        assertTrue(err.contains("Jev is not installed"), err)
+        assertEquals(RunStatus.DONE, runner.execute(instruction, null, 3, null).getOrThrow().status)
     }
 
     private fun tab(id: String, title: String = "Shop") = ActiveTabData(id, "fluck", title, "w", "Work", "p", "win", url = "https://shop.example/$id")

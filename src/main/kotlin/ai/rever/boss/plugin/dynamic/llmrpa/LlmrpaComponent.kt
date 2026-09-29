@@ -513,7 +513,7 @@ class LlmrpaComponent(
         if (isRunning) return "A task is already running"
         val tab = _selectedTab.value!!
         val model = _selectedModel.value!!
-        if (!tabLocks.tryAcquire(tab.tabId)) return TabLocks.BUSY
+        tabLocks.tryAcquire(tab.tabId, TabLocks.Owner.PANEL)?.let { return it }
         _errorMessage.value = null
         val decider = if (model.kind == ModelOption.Kind.DECISION) JevDecider(tools, model) else ChatDecider(aiGateway, model)
         val r = TaskRunner(tools, decider, tab.tabId, instruction, baseLimits.copy(maxSteps = _maxSteps.value)) { asker.ask(it) }

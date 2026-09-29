@@ -162,7 +162,7 @@ internal object Candidates {
     )
 
     /** A cheap label check, used only when the model could not say whether [c] can be undone. */
-    fun soundsCommitting(c: Candidate): Boolean = COMMIT_WORDS.containsMatchIn(c.element?.label ?: c.description)
+    fun soundsCommitting(c: Candidate): Boolean = COMMIT_WORDS.containsMatchIn("${c.description} ${c.element?.label.orEmpty()}")
 
     private val TEXT_ROLES = setOf("textbox", "searchbox")
     private val TEXT_INPUT_TYPES = setOf(null, "", "text", "search", "email", "url", "tel", "number", "password")

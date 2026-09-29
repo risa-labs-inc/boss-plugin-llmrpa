@@ -14,13 +14,16 @@ import java.util.concurrent.ConcurrentHashMap
  * runs never interleave steps on one tab.
  */
 class TabLocks {
-    private val busy = ConcurrentHashMap.newKeySet<String>()
-    fun tryAcquire(tabId: String): Boolean = busy.add(tabId)
-    fun release(tabId: String) { busy.remove(tabId) }
-
-    companion object {
-        const val BUSY = "Another task is already running on this tab. Stop it or wait for it to finish."
+    enum class Owner(val busy: String) {
+        PANEL("The LLM RPA panel is running a task on this tab. If it is waiting for an answer, answer it or press Stop there."),
+        HEADLESS("An llmrpa_execute run is already acting on this tab. Wait for it to finish."),
     }
+
+    private val busy = ConcurrentHashMap<String, Owner>()
+
+    /** Takes [tabId] for [owner]; null when taken, else why not. */
+    fun tryAcquire(tabId: String, owner: Owner): String? = busy.putIfAbsent(tabId, owner)?.busy
+    fun release(tabId: String) { busy.remove(tabId) }
 }
 
 /**
@@ -75,8 +78,11 @@ class HeadlessRunner(
                 else "Unknown model '$model'. Available: ${models.take(25).joinToString { it.key }}${if (models.size > 25) ", …" else ""}",
             ),
         )
+        if (option.kind == ModelOption.Kind.DECISION && !tools.has(ToolNames.JEV_DECIDE)) {
+            return Result.failure(IllegalStateException("Jev is not installed or not loaded (no jev_decide tool). Install it from Toolbox, or pass a chat model."))
+        }
         val decider = if (option.kind == ModelOption.Kind.DECISION) JevDecider(tools, option) else ChatDecider(gateway, option)
-        if (!locks.tryAcquire(tab.tabId)) return Result.failure(IllegalStateException(TabLocks.BUSY))
+        locks.tryAcquire(tab.tabId, TabLocks.Owner.HEADLESS)?.let { return Result.failure(IllegalStateException(it)) }
         return try {
             val runner = TaskRunner(tools, decider, tab.tabId, instruction, RunLimits(maxSteps = maxSteps)) { Answer.Stop }
             // Bounded, so a caller that times out does not leave a run going on the user's tab.
