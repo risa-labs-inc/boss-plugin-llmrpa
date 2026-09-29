@@ -219,6 +219,12 @@ class PhraseTypingTest {
     }
 
     @Test
+    fun `a smart apostrophe stays inside its word`() {
+        assertEquals(listOf("breast cancer", "breast", "cancer"), Candidates.phrases("Let’s find breast cancer, don’t stop"))
+        assertEquals(listOf("password isabel1", "isabel1"), Candidates.keywordSecrets("password isabel1"))
+    }
+
+    @Test
     fun `spans with no inner stop word rank first`() {
         assertEquals("cats", Candidates.phrases("search google for cats", listOf("https://duckduckgo.com/")).first())
     }

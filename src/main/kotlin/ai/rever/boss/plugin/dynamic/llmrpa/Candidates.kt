@@ -128,7 +128,7 @@ internal object Candidates {
     }
 
     private val SECRET_AFTER = Regex(
-        """\b(?:passwords?|passcode|passwd|pwd|pin|otp|token|secret|ssn|cvv|cvc|card(?: number)?|account(?: number)?|api key|user ?name)\b(?:\s*(?:is|=|:))?\s*("[^"]*"|“[^”]*”|‘[^’]*’|'[^']*'|[^\s,;]+)""",
+        """\b(?:passwords?|passcode|passwd|pwd|pin|otp|token|secret|ssn|cvv|cvc|card(?: number)?|account(?: number)?|api key|user ?name)\b(?:\s*(?:is\b|=|:))?\s*("[^"]*"|“[^”]*”|‘[^’]*’|'[^']*'|[^\s,;]+)""",
         RegexOption.IGNORE_CASE,
     )
 
@@ -176,6 +176,7 @@ internal object Candidates {
         "search", "find", "look", "show", "get", "till", "until", "reach", "arrive", "keep", "start", "stop", "use",
         "page", "pages", "home", "homepage", "site", "website", "tab", "result", "results", "first", "next", "select",
         "choose", "pick", "download", "save", "image", "picture", "article",
+        "let's", "don't", "doesn't", "didn't", "can't", "won't", "isn't", "it's", "that's", "i'm", "i'd", "i'll", "you're",
     )
     private val SITE_SUFFIX = Regex("""^(home ?page|homepage|website|site|main page)\b""", RegexOption.IGNORE_CASE)
     private val word = Regex("""[\p{L}\p{N}][\p{L}\p{N}'’-]*""")
@@ -192,7 +193,8 @@ internal object Candidates {
         val text = scrub(instruction, " , ")
         val sites = (addresses + urls(instruction)).flatMap { hostLabels(it) }.toMutableSet()
         // Clauses break on punctuation, so a span never runs across "page, then".
-        val clauses = text.split(Regex("""[.,;:!?()\[\]{}"“”‘’]|\s'|'\s""")).map { c -> word.findAll(c).map { it.value }.toList() }
+        // ’ between letters is an apostrophe (macOS "Let’s"), not a quote.
+        val clauses = text.split(Regex("""[.,;:!?()\[\]{}"“”‘]|(?<!\p{L})’|’(?!\p{L})|\s'|'\s""")).map { c -> word.findAll(c).map { it.value }.toList() }
         clauses.forEach { words ->
             words.forEachIndexed { i, w ->
                 if (i + 1 < words.size && SITE_SUFFIX.containsMatchIn(words.drop(i + 1).joinToString(" "))) sites += w.lowercase()
@@ -204,14 +206,15 @@ internal object Candidates {
         clauses.forEach { words ->
             for (start in words.indices) for (len in 1..MAX_PHRASE_WORDS) {
                 val span = words.subList(start, (start + len).coerceAtMost(words.size)).takeIf { it.size == len } ?: break
-                val edge = listOf(span.first().lowercase(), span.last().lowercase())
+                val edge = listOf(span.first(), span.last()).map { it.lowercase().replace('’', '\'') }
                 if (edge.any { it in STOP_WORDS || it in sites }) continue
+                if (len == 1 && span[0].length < 2) continue
                 found += span.joinToString(" ") to len
             }
         }
         // Spans with no inner stop word first ("cats" over "google for cats"), then longest. The sort
         // is stable, so ties keep the instruction's order.
-        fun clean(p: String) = p.split(' ').none { it.lowercase() in STOP_WORDS }
+        fun clean(p: String) = p.split(' ').none { it.lowercase().replace('’', '\'') in STOP_WORDS }
         return found.sortedWith(compareByDescending<Pair<String, Int>> { clean(it.first) }.thenByDescending { it.second })
             .map { it.first }.distinctBy { it.lowercase() }.take(MAX_PHRASES)
     }
