@@ -205,6 +205,53 @@ class PhraseTypingTest {
     }
 
     @Test
+    fun `a search field is a real search box`() {
+        fun f(role: String, label: String, tag: String = "input", type: String? = null) =
+            PageElement("e1", role, tag, label, type = type, selector = SelectorInfo("css", "#e1"))
+        assertTrue(Candidates.isSearchField(f("textbox", "Search Wikipedia")))
+        assertTrue(Candidates.isSearchField(f("searchbox", "Find")))
+        assertTrue(Candidates.isSearchField(f("textbox", "Query", type = "search")))
+        assertFalse(Candidates.isSearchField(f("textbox", "Research notes")))
+        assertFalse(Candidates.isSearchField(f("textbox", "Researcher")))
+        assertFalse(Candidates.isSearchField(f("textbox", "Search terms you tried", tag = "textarea")))
+        assertFalse(Candidates.isSearchField(f("button", "Search")))
+    }
+
+    @Test
+    fun `a single quoted password is not typed into a search box, and the phrase wins`() = runTest {
+        val text = "log in with password \"hunter2\", then search breast cancer"
+        val tools = FakeTools(page = wiki, chooseText = { it.first() to 0.9 }) { _, call ->
+            if (call == 0) Triple("Type into 'Search Wikipedia'", 0.9, 1) else Triple("The task is complete", 0.95, null)
+        }
+        val state = TaskRunner(tools, JevDecider(tools, JEV), "t1", text, RunLimits(navSettleMs = 0, stepSettleMs = 0)) { Answer.Stop }.run()
+        assertTrue(tools.textOptions.single().none { "hunter2" in it }, tools.textOptions.toString())
+        assertEquals("breast cancer", (tools.steps.single()["value"] as JsonPrimitive).content)
+        assertEquals(RunStatus.DONE, state.status, state.summary)
+        // A username still goes into a username box.
+        val user = FakeTools(page = wiki.copy(elements = listOf(element("e4", "textbox", "Username")))) { _, call ->
+            if (call == 0) Triple("Type into 'Username'", 0.9, 1) else Triple("The task is complete", 0.95, null)
+        }
+        TaskRunner(user, JevDecider(user, JEV), "t1", "Sign in with username \"ada\"") { Answer.Stop }.run()
+        assertEquals("ada", (user.steps.single()["value"] as JsonPrimitive).content)
+    }
+
+    @Test
+    fun `a password the person places in a plain field is masked in the timeline and transcript`() = runTest {
+        val email = element("e4", "textbox", "Email")
+        val tools = FakeTools(page = wiki.copy(elements = listOf(email))) { _, call ->
+            if (call == 0) Triple("Type into 'Email'", 0.9, null) else Triple("The task is complete", 0.95, null)
+        }
+        var q: PendingQuestion? = null
+        val state = TaskRunner(tools, JevDecider(tools, JEV), "t1", "Log in with password \"hunter2\"", RunLimits(navSettleMs = 0, stepSettleMs = 0)) {
+            q = it; if (it is PendingQuestion.ChooseText) Answer.Text("hunter2") else Answer.Stop
+        }.run()
+        assertTrue(assertIs<PendingQuestion.ChooseText>(q).reason.contains("password"), (q as PendingQuestion.ChooseText).reason)
+        assertEquals("hunter2", (tools.steps.single()["value"] as JsonPrimitive).content)
+        assertEquals("Type •••••• into 'Email'", state.steps.single().description)
+        assertTrue("hunter2" !in LlmrpaMcpToolProvider.transcript(state).toString())
+    }
+
+    @Test
     fun `enter after instruction words outside a search box asks first`() = runTest {
         val comment = element("e5", "textbox", "Add a comment")
         val tools = FakeTools(page = wiki.copy(elements = listOf(comment)), chooseText = { it.first() to 0.9 }) { _, call ->

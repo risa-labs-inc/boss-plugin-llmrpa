@@ -311,7 +311,10 @@ class TaskRunner(
             var source: StepRecord.ValueSource? = null
             if (chosen.needsValue) {
                 val field = chosen.element?.label?.take(60) ?: "the field"
-                value = modelValue ?: values.singleOrNull()
+                // A password-like value goes into a plain field only when the person places it.
+                val plain = chosen.element?.sensitive != true
+                fun allowed(v: String) = !(plain && !decider.writesText && Candidates.isKeywordSecret(instruction, v))
+                value = modelValue?.takeIf(::allowed) ?: values.singleOrNull()?.takeIf(::allowed)
                 // A private field only ever takes a quoted value; words are for the other fields.
                 if (value == null && chosen.element?.sensitive != true) {
                     val (text, by) = pickText(ctx, field, (values + phrases).distinctBy { it.lowercase() }, stepNo) ?: return state.value
@@ -336,7 +339,7 @@ class TaskRunner(
                 return finish(RunStatus.STOPPED, "Stopped before typing into the private field '${chosen.element.label?.take(60)}': only text from your instruction goes there.")
             }
             // A private field's text never reaches the timeline, the history the model sees, or the transcript.
-            val shown = if (chosen.element?.sensitive == true) "••••••" else "'${value?.take(60)}'"
+            val shown = if (chosen.element?.sensitive == true || (value != null && Candidates.isKeywordSecret(instruction, value))) "••••••" else "'${value?.take(60)}'"
             val description = if (chosen.needsValue) "Type $shown into '${chosen.element?.label?.take(60)}'" else chosen.description
 
             if (chosen.canCommit) {
@@ -417,7 +420,8 @@ class TaskRunner(
         // not mark private, never the model's.
         val offered = options.filterNot { Candidates.isKeywordSecret(instruction, it) }
         val asked = offered.takeIf { it.isNotEmpty() }?.let { decider.chooseText(ctx, field, it) }
-        var reason = "The model gave no text for '$field'"
+        var reason = if (offered.isEmpty()) "Only text after a word like 'password' fits, which the model may not place in '$field'"
+        else "The model gave no text for '$field'"
         if (asked != null) {
             _state.update { it.copy(calls = it.calls + 1, costUsd = it.costUsd + (asked.getOrNull()?.costUsd ?: 0.0)) }
             val choice = asked.getOrNull()

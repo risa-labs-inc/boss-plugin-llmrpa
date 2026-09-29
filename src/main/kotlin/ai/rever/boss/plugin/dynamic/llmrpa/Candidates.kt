@@ -139,9 +139,18 @@ internal object Candidates {
     fun keywordSecrets(instruction: String): List<String> =
         SECRET_AFTER.findAll(instruction).flatMap { listOf(it.value, it.groupValues[1]) }.distinct().toList()
 
-    /** Whether [value] is the word after a secret keyword, as quoted or bare. */
+    // Narrower than SECRET_AFTER: a username is fine in a username box, a password is not.
+    private val PRIVATE_AFTER = Regex(
+        """\b(?:passwords?|passcode|passwd|pwd|pin|otp|token|secret|ssn|cvv|cvc|card number|account number|api key)\b(?:\s*(?:is\b|=|:))?\s*("[^"]*"|“[^”]*”|‘[^’]*’|'[^']*'|[^\s,;]+)""",
+        RegexOption.IGNORE_CASE,
+    )
+
+    /**
+     * Whether [value] is the word after a password-like keyword, quoted or bare: text only a private
+     * field or the person may place, and masked wherever it is shown.
+     */
     fun isKeywordSecret(instruction: String, value: String): Boolean =
-        SECRET_AFTER.findAll(instruction).any { it.groupValues[1].trim('"', '\'', '“', '”', '‘', '’') == value }
+        PRIVATE_AFTER.findAll(instruction).any { it.groupValues[1].trim('"', '\'', '“', '”', '‘', '’') == value }
 
     /**
      * [instruction] with each secret keyword and its word, then its values ([scrubbable]), replaced
@@ -225,9 +234,15 @@ internal object Candidates {
         return host.split('.').dropLast(1).filter { it != "www" }
     }
 
-    /** A field whose Enter runs a search rather than posting what was typed. */
+    private val SEARCH_WORD = Regex("""\bsearch\b""", RegexOption.IGNORE_CASE)
+
+    /**
+     * A field whose Enter runs a search rather than posting what was typed. By label only for a
+     * plain text field, and as a whole word: "Research notes" is a form field.
+     */
     fun isSearchField(el: PageElement): Boolean =
-        el.role == "searchbox" || el.type == "search" || el.label?.contains("search", ignoreCase = true) == true
+        el.role == "searchbox" || el.type == "search" ||
+            (el.tag != "textarea" && isTextField(el) && el.label?.let { SEARCH_WORD.containsMatchIn(it) } == true)
 
     /**
      * [writes] is whether the decider can write text itself (a chat model). A field is offered only

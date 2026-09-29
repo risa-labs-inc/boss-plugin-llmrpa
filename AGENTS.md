@@ -474,7 +474,8 @@ emails and addresses only, and Jev cannot write.
 - The timeline and transcript (`text_source`) say where typed text came from: quoted, words from the
   instruction, written by the model, or picked by you.
 - **Enter after phrase-typed text commits unless the field is a search box** (`isSearchField`: role
-  searchbox, type search, or "search" in the label). The words are the person's, but the field was
+  searchbox, type search, or a one-line text field with "search" as a whole word in its label, so
+  "Research notes" is not one). The words are the person's, but the field was
   the model's pick, and "breast cancer" + Enter in a comment box posts it. Quoted and person-picked
   text keep the old rule (not committing); model-written text still always counts.
 - **Only a decider that cannot write gets `PHRASE`.** A chat model's text that happens to match a
@@ -485,4 +486,7 @@ emails and addresses only, and Jev cannot write.
 - **Jev is never offered a value that follows a secret keyword** for a field the page does not mark
   private (`password "hunter2"` into 'Email'). The panel still lists it for the person, and a headless
   stop masks it. Several quoted values for a plain field used to stop outright; they now go through
-  the text choice, which is the one relaxation, and this is its limit.
+  the text choice, which is the one relaxation, and this is its limit. The same holds for the single
+  quoted value shortcut and for Jev's own value pick, which 1.4 makes the common route. The check
+  (`isKeywordSecret`) is narrower than the search scrub: a username may go into a username box.
+  Such a value is masked in the step, the history and the transcript wherever it lands.

@@ -400,7 +400,7 @@ private fun RunPane(component: LlmrpaComponent, run: RunState?, pastRuns: List<R
                     if (active && run.tabId != null && run.question == null && run.steps.lastOrNull()?.outcome != StepRecord.Outcome.RUNNING) {
                         Text("Reading the page…", color = RpaTokens.TextSecondary, fontSize = 12.sp)
                     }
-                    run.question?.let { QuestionCard(component, it) }
+                    run.question?.let { QuestionCard(component, it, run.instruction) }
                     if (!active) ResultCard(component, run)
                 }
             }
@@ -498,7 +498,7 @@ private fun StepRow(step: StepRecord, current: Boolean) {
 
 /** A question takes focus and is announced, so it is never missed. Keys 1–3 answer a choice. */
 @Composable
-private fun QuestionCard(component: LlmrpaComponent, q: PendingQuestion) {
+private fun QuestionCard(component: LlmrpaComponent, q: PendingQuestion, instruction: String) {
     val focus = remember { FocusRequester() }
     LaunchedEffect(q) { runCatching { focus.requestFocus() } }
     val risk = q is PendingQuestion.Confirm
@@ -533,7 +533,11 @@ private fun QuestionCard(component: LlmrpaComponent, q: PendingQuestion) {
             is PendingQuestion.ChooseText -> {
                 Text("What should I type?", color = RpaTokens.Text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.semantics { heading() })
                 Text("${q.reason}. Pick the text to type into '${q.field}', or stop here.", color = RpaTokens.TextSecondary, fontSize = 12.sp)
-                q.options.forEachIndexed { i, v -> OptionRow(i, v, null, mono = true) { component.answer(Answer.Text(v)) } }
+                q.options.forEachIndexed { i, v ->
+                    // Masked like a private field's text; screenshots of this card get shared.
+                    val label = if (Candidates.isKeywordSecret(instruction, v)) "•••••• (the text after 'password' or similar)" else v
+                    OptionRow(i, label, null, mono = true) { component.answer(Answer.Text(v)) }
+                }
                 OutlineButton("Stop here", { component.answer(Answer.Stop) }, tone = Tone.ERROR)
             }
             is PendingQuestion.Confirm -> {
