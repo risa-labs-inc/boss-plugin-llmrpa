@@ -12,9 +12,6 @@ import ai.rever.boss.plugin.api.AiRequest
 import ai.rever.boss.plugin.api.AiToolCall
 import ai.rever.boss.plugin.api.AiToolOutcome
 import ai.rever.boss.plugin.api.AiToolSpec
-import ai.rever.boss.plugin.api.BrowserIntegration
-import androidx.compose.ui.graphics.painter.Painter
-import androidx.compose.ui.graphics.vector.ImageVector
 import com.arkivanov.decompose.DefaultComponentContext
 import com.arkivanov.essenty.lifecycle.LifecycleRegistry
 import kotlin.test.Test
@@ -26,8 +23,6 @@ import kotlin.test.assertTrue
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -243,7 +238,7 @@ class RunnerSafetyTest {
         val locks = TabLocks()
         assertNull(locks.tryAcquire("t1", TabLocks.Owner.PANEL))
         val tools = FakeTools { _, _ -> Triple("The task is complete", 0.9, null) }
-        val headless = HeadlessRunner(tools, { null }, { null }, tabs = { listOf(tab("t1")) }, activeTabId = { null }, locks = locks)
+        val headless = HeadlessRunner(tools, { null }, { null }, tabs = { listOf(tab("t1")) }, activeTabId = { null }, drivable = { true }, openTab = { _, _ -> null }, locks = locks)
         val err = headless.execute(instruction, "t1", 3, null).exceptionOrNull()?.message.orEmpty()
         assertTrue(err.contains("panel") && err.contains("waiting for an answer"), err)
     }
@@ -259,11 +254,11 @@ class RunnerSafetyTest {
     fun `headless runs use the focused tab, or ask for one and list what is open`() = runTest {
         val tools = FakeTools { _, _ -> Triple("The task is complete", 0.9, null) }
         val open = listOf(tab("t1", "Mail"), tab("t2", "Shop"))
-        val none = HeadlessRunner(tools, { null }, { null }, tabs = { open }, activeTabId = { null }, locks = TabLocks())
+        val none = HeadlessRunner(tools, { null }, { null }, tabs = { open }, activeTabId = { null }, drivable = { true }, openTab = { _, _ -> null }, locks = TabLocks())
         val err = none.execute(instruction, null, 3, null).exceptionOrNull()!!.message!!
         assertTrue(err.contains("tab_id") && err.contains("t1 ('Mail'") && err.contains("t2 ('Shop'"), err)
 
-        val focused = HeadlessRunner(tools, { null }, { null }, tabs = { open }, activeTabId = { "t2" }, locks = TabLocks())
+        val focused = HeadlessRunner(tools, { null }, { null }, tabs = { open }, activeTabId = { "t2" }, drivable = { true }, openTab = { _, _ -> null }, locks = TabLocks())
         assertEquals(RunStatus.DONE, focused.execute(instruction, null, 3, null).getOrThrow().status)
 
         val unknown = none.execute(instruction, "t9", 3, null).exceptionOrNull()!!.message!!
@@ -382,7 +377,7 @@ class RunnerSafetyTest {
                 ai.rever.boss.plugin.api.AiProviderModels("ANTHROPIC", "Anthropic", listOf(ai.rever.boss.plugin.api.AiAvailableModel("claude-haiku", "Haiku"))),
             )
         }
-        val runner = HeadlessRunner(tools, { api }, { null }, tabs = { listOf(tab("t1")) }, activeTabId = { "t1" }, locks = TabLocks())
+        val runner = HeadlessRunner(tools, { api }, { null }, tabs = { listOf(tab("t1")) }, activeTabId = { "t1" }, drivable = { true }, openTab = { _, _ -> null }, locks = TabLocks())
         val byDefault = runner.execute(instruction, null, 3, null).getOrThrow()
         assertEquals("Haiku", byDefault.modelLabel)
         assertEquals(RunStatus.DONE, byDefault.status)
@@ -442,9 +437,10 @@ class RunnerSafetyTest {
     }
 
     @Test
-    fun `with no focused tab the panel falls back to the first`() = withMain {
-        val c = component(FakeTools { _, _ -> Triple("The task is complete", 0.9, null) })
-        assertEquals("t1", c.selectedTab.value?.tabId)
+    fun `with no focused tab the panel opens a new tab rather than use an arbitrary one`() = withMain {
+        val c = component(FakeTools { _, _ -> Triple("The task is complete", 0.9, null) }, provider = tabs(listOf(tab("t1"))) { null })
+        assertNull(c.selectedTab.value)
+        assertTrue(c.newTab.value)
     }
 
     @Test
@@ -468,7 +464,7 @@ class RunnerSafetyTest {
         val tools = FakeTools { _, _ -> Triple("Open 'Sign in' link", 0.9, null) }
         val provider = LlmrpaMcpToolProvider(
             "p", component = { null },
-            headless = HeadlessRunner(tools, { null }, { null }, tabs = { listOf(tab("t1")) }, activeTabId = { "t1" }, locks = TabLocks()),
+            headless = HeadlessRunner(tools, { null }, { null }, tabs = { listOf(tab("t1")) }, activeTabId = { "t1" }, drivable = { true }, openTab = { _, _ -> null }, locks = TabLocks()),
         )
         val execute = provider.tools().first { it.name == "llmrpa_execute" }.handler
         suspend fun call(raw: String) = execute.call(ai.rever.boss.plugin.api.McpToolArgs(emptyMap(), raw))
@@ -591,14 +587,14 @@ class RunnerSafetyTest {
     @Test
     fun `headless with a Jev model and no jev_decide says Jev is missing`() = runTest {
         val tools = FakeTools { _, _ -> Triple("The task is complete", 0.9, null) }
-        val runner = HeadlessRunner(tools, { null }, { null }, tabs = { listOf(tab("t1")) }, activeTabId = { "t1" }, locks = TabLocks())
+        val runner = HeadlessRunner(tools, { null }, { null }, tabs = { listOf(tab("t1")) }, activeTabId = { "t1" }, drivable = { true }, openTab = { _, _ -> null }, locks = TabLocks())
         // The catalog saw Jev, then it unloaded before the run started.
         var calls = 0
         tools.registered = null
         val flaky = object : ToolInvoker by tools {
             override fun has(toolName: String) = if (toolName == ToolNames.JEV_DECIDE) calls++ == 0 else tools.has(toolName)
         }
-        val err = HeadlessRunner(flaky, { null }, { null }, tabs = { listOf(tab("t1")) }, activeTabId = { "t1" }, locks = TabLocks())
+        val err = HeadlessRunner(flaky, { null }, { null }, tabs = { listOf(tab("t1")) }, activeTabId = { "t1" }, drivable = { true }, openTab = { _, _ -> null }, locks = TabLocks())
             .execute(instruction, null, 3, null).exceptionOrNull()?.message.orEmpty()
         assertTrue(err.contains("Jev is not installed"), err)
         assertEquals(RunStatus.DONE, runner.execute(instruction, null, 3, null).getOrThrow().status)
@@ -672,19 +668,5 @@ class RunnerSafetyTest {
     }
 
     /** [focused] is the tab selected in the focused pane, as the host reports it. */
-    private fun tabs(list: List<ActiveTabData>, focused: () -> String? = { null }) = object : ActiveTabsProvider {
-        override val activeTabs: StateFlow<List<ActiveTabData>> = MutableStateFlow(list)
-        override val activePanelId: String? get() = focused()?.let { id -> list.first { it.tabId == id }.panelId }
-        override fun selectedTabId(workspaceId: String, panelId: String): String? =
-            focused()?.takeIf { id -> list.any { it.tabId == id && it.workspaceId == workspaceId && it.panelId == panelId } }
-        override suspend fun refreshTabs() {}
-        override fun selectTab(tabId: String, panelId: String) {}
-        override fun getTabUrl(tabId: String): String? = list.firstOrNull { it.tabId == tabId }?.url
-        override fun getFaviconCacheKey(tabId: String): String? = null
-        @androidx.compose.runtime.Composable override fun loadFavicon(cacheKey: String?): Painter? = null
-        override fun getFallbackIcon(typeId: String): ImageVector? = null
-        override fun getBrowserIntegration(tabId: String): BrowserIntegration? = null
-        override fun createBrowserTab(url: String, title: String): String? = null
-        override fun closeTab(tabId: String): Boolean = false
-    }
+    private fun tabs(list: List<ActiveTabData>, focused: () -> String? = { list.firstOrNull()?.tabId }) = FakeTabs(list, focused)
 }

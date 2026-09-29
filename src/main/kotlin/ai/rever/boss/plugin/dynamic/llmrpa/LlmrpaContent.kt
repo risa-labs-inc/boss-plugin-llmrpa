@@ -90,6 +90,8 @@ fun LlmrpaContent(component: LlmrpaComponent) {
     val instruction by component.currentInstruction.collectAsState()
     val tabs by component.availableTabs.collectAsState()
     val selectedTab by component.selectedTab.collectAsState()
+    val newTab by component.newTab.collectAsState()
+    val drivable by component.drivable.collectAsState()
     val groups by component.modelGroups.collectAsState()
     val model by component.selectedModel.collectAsState()
     val run by component.run.collectAsState()
@@ -117,7 +119,7 @@ fun LlmrpaContent(component: LlmrpaComponent) {
             val compact = maxWidth < CompactWidth
             val showHost = maxWidth >= HostVisibleWidth
             Column(Modifier.fillMaxSize()) {
-                Header(component, tabs, selectedTab, groups, model, blocker, compact, showHost, active)
+                Header(component, TabTarget(tabs, selectedTab, newTab, drivable), groups, model, blocker, compact, showHost, active)
                 Box(Modifier.fillMaxWidth().height(1.dp).background(RpaTokens.Border))
                 if (twoPane) {
                     Row(Modifier.fillMaxSize()) {
@@ -144,8 +146,7 @@ private val NUMBER_KEYS = listOf(Key.One, Key.Two, Key.Three)
 @Composable
 private fun Header(
     component: LlmrpaComponent,
-    tabs: List<ActiveTabData>,
-    selected: ActiveTabData?,
+    target: TabTarget,
     groups: List<ModelGroup>,
     model: ModelOption?,
     blocker: LlmrpaComponent.Blocker?,
@@ -158,27 +159,43 @@ private fun Header(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        Box(Modifier.weight(1f)) { TabPicker(component, tabs, selected, showHost, enabled = !active) }
+        Box(Modifier.weight(1f)) { TabPicker(component, target, showHost, enabled = !active) }
         ModelPicker(component, groups, model, blocker, compact, enabled = !active)
     }
 }
 
+/** What Run acts on: an open tab, or a new one it opens itself. */
+private data class TabTarget(val tabs: List<ActiveTabData>, val selected: ActiveTabData?, val newTab: Boolean, val drivable: Set<String>?) {
+    fun canDrive(tabId: String) = drivable?.contains(tabId) ?: true
+}
+
+private const val NEW_TAB_LABEL = "New tab (pick the page for me)"
+private const val AWAY_DETAIL = "In another space — switch to it to use this tab"
+
 /** The tab every action lands on. Always visible, because it is where clicks will happen. */
 @Composable
-private fun TabPicker(component: LlmrpaComponent, tabs: List<ActiveTabData>, selected: ActiveTabData?, showHost: Boolean, enabled: Boolean) {
+private fun TabPicker(component: LlmrpaComponent, target: TabTarget, showHost: Boolean, enabled: Boolean) {
+    val (tabs, selected0, newTab, _) = target
+    val selected = selected0.takeIf { !newTab }
+    val away = selected != null && !target.canDrive(selected.tabId)
     var open by remember { mutableStateOf(false) }
     Box {
         Row(
-            Modifier.clip(RpaTokens.Shape).clickable(enabled = enabled, role = Role.Button) { open = true }
+            Modifier.clip(RpaTokens.Shape).clickable(enabled = enabled, role = Role.Button) { component.refreshDrivable(); open = true }
                 .pointerHoverIcon(PointerIcon.Hand).padding(horizontal = 6.dp, vertical = 4.dp)
-                .semantics { contentDescription = "Target tab: ${selected?.title ?: "none"}. Change" },
+                .semantics { contentDescription = "Target tab: ${if (newTab) NEW_TAB_LABEL else selected?.title ?: "none"}. Change" },
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            SmallIcon(Icons.Outlined.Public, null, if (selected == null) RpaTokens.Warning else RpaTokens.TextSecondary)
-            Text(selected?.title?.ifBlank { null } ?: if (tabs.isEmpty()) "No web page open" else "Pick a tab",
-                color = if (selected == null) RpaTokens.Warning else RpaTokens.Text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
+            val warn = (selected == null && !newTab) || away
+            SmallIcon(Icons.Outlined.Public, null, if (warn) RpaTokens.Warning else RpaTokens.TextSecondary)
+            Text(if (newTab) "New tab" else selected?.title?.ifBlank { null } ?: if (tabs.isEmpty()) "No web page open" else "Pick a tab",
+                color = if (warn) RpaTokens.Warning else RpaTokens.Text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
                 maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
+            if (showHost && newTab) {
+                Text("page picked for you", color = RpaTokens.TextMuted, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false))
+            }
             if (showHost && selected != null) {
                 Text(host(selected.url), color = RpaTokens.TextMuted, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f, fill = false))
@@ -188,13 +205,14 @@ private fun TabPicker(component: LlmrpaComponent, tabs: List<ActiveTabData>, sel
         if (open) {
             RpaMenu(onDismiss = { open = false }, width = 300) {
                 MenuHeading("Run on")
-                if (tabs.isEmpty()) {
-                    Text("Open a web page in a browser tab, then pick it here.", color = RpaTokens.TextSecondary, fontSize = 12.sp,
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp))
-                }
-                tabs.forEach { t ->
-                    MenuRow(t.title.ifBlank { host(t.url) }, onClick = { open = false; component.selectTab(t) }, detail = host(t.url),
-                        selected = t.tabId == selected?.tabId)
+                MenuRow(NEW_TAB_LABEL, onClick = { open = false; component.selectNewTab() },
+                    detail = "Opens the address in your task, or one the model picks", selected = newTab)
+                if (tabs.isNotEmpty()) MenuDivider()
+                // Drivable first; a tab in another space is listed but cannot be picked, since the host cannot reach its browser.
+                tabs.sortedByDescending { target.canDrive(it.tabId) }.forEach { t ->
+                    val canDrive = target.canDrive(t.tabId)
+                    MenuRow(t.title.ifBlank { host(t.url) }, onClick = { open = false; component.selectTab(t) },
+                        detail = if (canDrive) host(t.url) else AWAY_DETAIL, selected = t.tabId == selected?.tabId, enabled = canDrive)
                 }
             }
         }
@@ -213,7 +231,7 @@ private fun ModelPicker(
 ) {
     var open by remember { mutableStateOf(false) }
     var query by remember { mutableStateOf("") }
-    val ready = blocker == null || blocker == LlmrpaComponent.Blocker.TAB
+    val ready = blocker == null || blocker == LlmrpaComponent.Blocker.TAB || blocker == LlmrpaComponent.Blocker.AWAY
     val label = model?.label ?: "Pick a model"
     Box {
         Row(
@@ -249,7 +267,7 @@ private fun ModelPicker(
                         }
                     }
                 }
-                if (blocker != null && blocker != LlmrpaComponent.Blocker.TAB) {
+                if (blocker != null && blocker != LlmrpaComponent.Blocker.TAB && blocker != LlmrpaComponent.Blocker.AWAY) {
                     MenuDivider()
                     Text(blocker.detail, color = RpaTokens.Warning, fontSize = 12.sp, modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp))
                 }
@@ -365,8 +383,10 @@ private fun RunPane(component: LlmrpaComponent, run: RunState?, pastRuns: List<R
                 if (run == null) {
                     Empty(component)
                 } else {
+                    run.opened?.let { OpenedRow(it) }
+                    if (active && run.tabId == null) Text("Finding the page to start on…", color = RpaTokens.TextSecondary, fontSize = 12.sp)
                     run.steps.forEach { StepRow(it, current = active && it == run.steps.last() && it.outcome == StepRecord.Outcome.RUNNING) }
-                    if (active && run.question == null && run.steps.lastOrNull()?.outcome != StepRecord.Outcome.RUNNING) {
+                    if (active && run.tabId != null && run.question == null && run.steps.lastOrNull()?.outcome != StepRecord.Outcome.RUNNING) {
                         Text("Reading the page…", color = RpaTokens.TextSecondary, fontSize = 12.sp)
                     }
                     run.question?.let { QuestionCard(component, it) }
@@ -400,6 +420,20 @@ private fun RunHeader(component: LlmrpaComponent, run: RunState, active: Boolean
         if (active) OutlineButton("Stop", component::stopRun, tone = Tone.ERROR)
     }
     Box(Modifier.fillMaxWidth().height(1.dp).background(RpaTokens.Border))
+}
+
+/** The page a run opened in a tab of its own, before its first step. */
+@Composable
+private fun OpenedRow(opened: OpenedPage) {
+    Column(
+        Modifier.fillMaxWidth().clip(RpaTokens.Shape).background(RpaTokens.Panel).border(1.dp, RpaTokens.Border, RpaTokens.Shape).padding(10.dp)
+            .semantics(mergeDescendants = true) { contentDescription = opened.description },
+        verticalArrangement = Arrangement.spacedBy(3.dp),
+    ) {
+        Text("Opened ${opened.url}", color = RpaTokens.Text, fontSize = 13.sp, fontWeight = FontWeight.Medium, maxLines = 2, overflow = TextOverflow.Ellipsis)
+        val why = opened.note?.let { " · searched because $it" }.orEmpty()
+        Text("Chosen by ${opened.source.label}$why", color = RpaTokens.TextSecondary, fontSize = 12.sp)
+    }
 }
 
 @Composable

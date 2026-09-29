@@ -361,8 +361,8 @@ Found by running, not reviewing:
 - **The commit-word check only raises a chat model's risk.** The model grades its own pick from
   page text, so a misleading page could talk it into `irreversible:false` on a Delete. A person's
   pick with a harmless label is not confirmed a second time.
-- **The panel's tab follows the focused one** until the person picks a tab; `first()` is only the
-  fallback when the host cannot say. `llmrpa_execute` is bounded at 10 minutes.
+- **The panel's tab follows the focused one** until the person picks a tab. With none focused it
+  targets a new tab (1.4); it never falls back to an arbitrary open tab. `llmrpa_execute` is bounded at 10 minutes.
 - RPA Engine (`>=1.3.0`) and Jev are declared optional dependencies, for the same unload guard as
   the gateway. `TabLocks` has no default anywhere: a forgotten one splits the panel from headless.
 - With nothing installed, the empty model reload backs off to 32 s instead of every 2 s.
@@ -385,3 +385,29 @@ Found by running, not reviewing:
 - **`waitFor` starts `ask` before publishing the question** (`async(UNDISPATCHED)`), so an answer
   the instant the buttons appear is not dropped. The test answers from an Unconfined watcher.
 - `TabLocks` records who holds a tab, so a refusal can say the panel may be waiting for an answer.
+
+## Tabs in other spaces, and opening the page (1.4)
+
+- **The host resolves browsers only in the space on screen.** BossConsole's `findBrowserForTab` reads
+  the split view of the current space, so a tab in another running space is in `activeTabs` but
+  `getBrowserIntegration` is null and RPA Engine answers `NO_BROWSER` ("is not a browser tab").
+  Found live: every tab in the other space failed at step 0. Not fixable here.
+- Drivable = `getBrowserIntegration(id)?.isBrowserAvailable()`, the same test RPA Engine applies. The
+  panel probes off the UI thread on tab changes, every readiness tick and when the picker opens; other
+  tabs are listed disabled. `NO_BROWSER` from observe or a step ends the run with `NO_BROWSER_HINT`.
+- **Never probe while a run holds a tab.** `getBrowserIntegration` works through one static
+  `BrowserAccessor.selectedTabId`, so a probe racing a run's `rpa_observe` could hand that run the
+  wrong tab's browser. `TabLocks.anyBusy()` gates it; unknown reads as drivable, and the run-time
+  mapping still explains a failure. Direct `rpa_*` callers outside this plugin are not covered.
+- **New tab**: start URL is the first usable http(s) address in the instruction, else the selected
+  decider's (chat only; `jev_decide` answers choice/noul/score and cannot write one), https-only and
+  validated (no credentials, no localhost or bare IP), else a DuckDuckGo search. `createBrowserTab`
+  runs on Main (it edits split view state) and opens in the active space. The runner waits with
+  bounded backoff (`RunLimits.openWaitsMs`, about 13 s; about:blank is not loaded).
+- The chosen address is used **only for that open**. "Go to" candidates still come from the
+  instruction alone, so a model-picked origin is never offered again mid-run.
+- The new tab's lock is taken by the runner once it exists (`NewTab.claim`) and released from
+  `RunState.tabId`, so the panel and `llmrpa_execute` keep one run per tab.
+- `llmrpa_execute` takes `new_tab` / `start_url`; its tab listing marks tabs that cannot be driven.
+  `HeadlessRunner.drivable` and `openTab` have no defaults, for the usual reason.
+- `createBrowserTab` and `getBrowserIntegration` are pre-1.0.87 members: the 1.0.91 floor stands.

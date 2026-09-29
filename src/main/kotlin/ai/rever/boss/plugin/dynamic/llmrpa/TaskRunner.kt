@@ -62,6 +62,10 @@ data class RunState(
     val calls: Int = 0,
     val costUsd: Double = 0.0,
     val startedAt: Long,
+    /** The tab the run acts on; null until a new tab is open. */
+    val tabId: String? = null,
+    /** Set when the run opened its own tab. */
+    val opened: OpenedPage? = null,
 )
 
 data class RunLimits(
@@ -76,23 +80,30 @@ data class RunLimits(
     /** Settle times after a step, so the next look sees the rebuilt page; tests set them to zero. */
     val navSettleMs: Long = 900,
     val stepSettleMs: Long = 250,
+    /** Waits before each look at a new tab, until the page reads; about 13 s in all. */
+    val openWaitsMs: List<Long> = listOf(300, 500, 800, 1_200, 2_000, 2_000, 3_000, 3_000),
 )
 
 /**
  * Observe → decide → act, one step at a time, on one tab. RPA Engine does every browser action
  * (`rpa_observe`, `rpa_step`); [decider] picks each step. Questions for the person go through
  * [ask], which the panel answers with buttons and a headless caller answers with [Answer.Stop].
+ * With no [tabId], the run first opens a page in a tab of its own through [newTab].
  */
 class TaskRunner(
     private val tools: ToolInvoker,
     private val decider: StepDecider,
-    private val tabId: String,
+    tabId: String?,
     private val instruction: String,
     private val limits: RunLimits = RunLimits(),
     clock: () -> Long = System::currentTimeMillis,
+    private val newTab: NewTab? = null,
     private val ask: suspend (PendingQuestion) -> Answer,
 ) {
-    private val _state = MutableStateFlow(RunState(instruction, decider.option.label, limits.maxSteps, startedAt = clock()))
+    init { require(tabId != null || newTab != null) { "A run needs a tab or a way to open one" } }
+
+    private var tabId: String? = tabId
+    private val _state = MutableStateFlow(RunState(instruction, decider.option.label, limits.maxSteps, startedAt = clock(), tabId = tabId))
     val state: StateFlow<RunState> = _state.asStateFlow()
 
     private val values = Candidates.values(instruction)
@@ -102,7 +113,8 @@ class TaskRunner(
      * boundary ends the run as FAILED with the reason, not as "Stopped by you".
      */
     suspend fun run(): RunState = try {
-        loop()
+        if (tabId == null) openStartPage()?.let { loop(listOf(it.description)) } ?: state.value
+        else loop(emptyList())
     } catch (e: CancellationException) {
         throw e
     } catch (e: Throwable) {
@@ -117,8 +129,40 @@ class TaskRunner(
         return state.value
     }
 
-    private suspend fun loop(): RunState {
-        val history = mutableListOf<String>()
+    /**
+     * Picks a start page, opens it in a new tab and waits until it reads. Only this open may use
+     * the chosen address: later "Go to" steps still come from the instruction alone.
+     */
+    private suspend fun openStartPage(): OpenedPage? {
+        val nt = newTab ?: return null.also { finish(RunStatus.FAILED, "No tab to run on") }
+        val choice = nt.startUrl?.let { StartPages.Choice(OpenedPage(it, StartSource.CALLER), 0, 0.0) }
+            ?: StartPages.choose(instruction, decider)
+        _state.update { it.copy(calls = it.calls + choice.calls, costUsd = it.costUsd + choice.costUsd) }
+        val url = choice.page.url
+        val id = nt.open(url, StartPages.TAB_TITLE)
+            ?: return null.also { finish(RunStatus.FAILED, "Could not open a new tab for $url: BOSS did not create one. Open the page yourself and pick its tab.") }
+        nt.claim(id)?.let { refusal -> return null.also { finish(RunStatus.FAILED, refusal) } }
+        tabId = id
+        _state.update { it.copy(tabId = id, opened = choice.page) }
+        if (!awaitPage(id)) {
+            return null.also { finish(RunStatus.FAILED, "Opened $url, but the page could not be read after ${limits.openWaitsMs.sum() / 1000} s. Check the new tab and run again on it.") }
+        }
+        return choice.page
+    }
+
+    /** Bounded retries, since the page is still loading; about:blank does not count as loaded. */
+    private suspend fun awaitPage(id: String): Boolean {
+        for (wait in limits.openWaitsMs) {
+            delay(wait)
+            val reply = tools.invoke(ToolNames.OBSERVE, buildJsonObject { put("tab_id", id) })
+            val url = (reply.json?.get("url") as? JsonPrimitive)?.content.orEmpty()
+            if (!reply.isError && reply.json != null && url.isNotBlank() && url != "about:blank") return true
+        }
+        return false
+    }
+
+    private suspend fun loop(seed: List<String>): RunState {
+        val history = seed.toMutableList()
         var failures = 0
         var doneRejected = false
         // The field last typed into, and whether the model wrote that text: Enter lands there. Kept
@@ -234,7 +278,7 @@ class TaskRunner(
             val record = StepRecord(stepNo, description, decision.confidence, runnersUp, valueWritten = chosen.needsValue && !fromInstruction, chosenBy = chosenBy)
             _state.update { it.copy(steps = it.steps + record) }
 
-            val (ok, error, navigated) = act(action.copy(value = value), allowSensitive = chosen.element?.sensitive == true && fromInstruction)
+            val (ok, error, navigated, noBrowser) = act(action.copy(value = value), allowSensitive = chosen.element?.sensitive == true && fromInstruction)
             if (chosen.needsValue && ok) {
                 typedInto = chosen.element
                 typedWritten = !fromInstruction
@@ -247,6 +291,7 @@ class TaskRunner(
                     if (it.index == stepNo) it.copy(outcome = if (ok) StepRecord.Outcome.OK else StepRecord.Outcome.FAILED, detail = error) else it
                 })
             }
+            if (noBrowser) return finish(RunStatus.FAILED, "Stopped at step $stepNo: $NO_BROWSER_HINT")
             // Let the page finish rendering before the next look: scripts often rebuild widgets on load.
             delay(if (navigated) limits.navSettleMs else limits.stepSettleMs)
             if (ok) {
@@ -264,14 +309,15 @@ class TaskRunner(
     private suspend fun observe(): PageSnapshot? {
         val reply = tools.invoke(ToolNames.OBSERVE, buildJsonObject { put("tab_id", tabId) })
         if (reply.isError || reply.json == null) {
-            finish(RunStatus.FAILED, "Could not read the page: ${reply.errorMessage}")
+            val why = if (reply.errorCode == ToolNames.NO_BROWSER) NO_BROWSER_HINT else reply.errorMessage
+            finish(RunStatus.FAILED, "Could not read the page: $why")
             return null
         }
         return PageSnapshot.parse(reply.json!!)
     }
 
     /** What one `rpa_step` did. [detail] is the error on failure, or a note such as the saved file. */
-    private data class StepResult(val ok: Boolean, val detail: String?, val navigated: Boolean)
+    private data class StepResult(val ok: Boolean, val detail: String?, val navigated: Boolean, val noBrowser: Boolean = false)
 
     private suspend fun act(action: StepAction, allowSensitive: Boolean): StepResult {
         val reply = tools.invoke(ToolNames.STEP, buildJsonObject {
@@ -284,7 +330,10 @@ class TaskRunner(
                 action.value?.let { put("value", it) }
             }
         })
-        if (reply.isError) return StepResult(false, reply.errorMessage, false)
+        if (reply.isError) {
+            val noBrowser = reply.errorCode == ToolNames.NO_BROWSER
+            return StepResult(false, if (noBrowser) NO_BROWSER_HINT else reply.errorMessage, false, noBrowser)
+        }
         val ok = (reply.json?.get("ok") as? JsonPrimitive)?.booleanOrNull ?: false
         val navigated = (reply.json?.get("navigated") as? JsonPrimitive)?.booleanOrNull ?: false
         val error = (reply.json?.get("error") as? JsonPrimitive)?.takeIf { it.isString }?.content

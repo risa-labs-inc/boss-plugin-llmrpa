@@ -4,6 +4,8 @@ import ai.rever.boss.plugin.api.AiGatewayAPI
 import ai.rever.boss.plugin.api.DynamicPlugin
 import ai.rever.boss.plugin.api.PluginContext
 import com.arkivanov.essenty.lifecycle.doOnDestroy
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /**
  * LLM RPA dynamic plugin - Loaded from external JAR.
@@ -77,9 +79,14 @@ class LlmrpaDynamicPlugin : DynamicPlugin {
                     tabs = { activeTabsProvider?.activeTabs?.value.orEmpty() },
                     activeTabId = {
                         activeTabsProvider?.let { p ->
-                            HeadlessRunner.activeTab(p.activeTabs.value, p.activePanelId) { ws, panel -> p.selectedTabId(ws, panel) }
+                            // Drivable tabs only: they are the space on screen, which also makes a panel id unambiguous.
+                            val onScreen = if (tabLocks.anyBusy()) p.activeTabs.value else p.activeTabs.value.filter { StartPages.drivable(p, it.tabId) }
+                            HeadlessRunner.activeTab(onScreen, p.activePanelId) { ws, panel -> p.selectedTabId(ws, panel) }
                         }
                     },
+                    drivable = { id -> activeTabsProvider?.let { StartPages.drivable(it, id) } == true },
+                    // On Main: the host adds the tab to its split view state.
+                    openTab = { url, title -> activeTabsProvider?.let { p -> withContext(Dispatchers.Main) { p.createBrowserTab(url, title) } } },
                     locks = tabLocks,
                 ),
             ),

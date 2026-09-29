@@ -1,12 +1,8 @@
 package ai.rever.boss.plugin.dynamic.llmrpa
 
 import ai.rever.boss.plugin.api.ActiveTabData
-import ai.rever.boss.plugin.api.ActiveTabsProvider
-import ai.rever.boss.plugin.api.BrowserIntegration
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.ImageComposeScene
-import androidx.compose.ui.graphics.painter.Painter
-import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.Density
 import com.arkivanov.decompose.DefaultComponentContext
 import com.arkivanov.essenty.lifecycle.LifecycleRegistry
@@ -17,8 +13,6 @@ import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
@@ -29,18 +23,7 @@ import org.jetbrains.skia.EncodedImageFormat
 class PanelRenderTest {
     private val tab = ActiveTabData("t1", "fluck", "Shop · Wireless keyboards", "w", "Work", "p", "win", url = "https://shop.example/search")
 
-    private fun tabs(list: List<ActiveTabData>) = object : ActiveTabsProvider {
-        override val activeTabs: StateFlow<List<ActiveTabData>> = MutableStateFlow(list)
-        override suspend fun refreshTabs() {}
-        override fun selectTab(tabId: String, panelId: String) {}
-        override fun getTabUrl(tabId: String): String? = list.firstOrNull { it.tabId == tabId }?.url
-        override fun getFaviconCacheKey(tabId: String): String? = null
-        @androidx.compose.runtime.Composable override fun loadFavicon(cacheKey: String?): Painter? = null
-        override fun getFallbackIcon(typeId: String): ImageVector? = null
-        override fun getBrowserIntegration(tabId: String): BrowserIntegration? = null
-        override fun createBrowserTab(url: String, title: String): String? = null
-        override fun closeTab(tabId: String): Boolean = false
-    }
+    private fun tabs(list: List<ActiveTabData>) = FakeTabs(list, focused = { list.firstOrNull()?.tabId })
 
     private fun component(tools: ToolInvoker, openTabs: List<ActiveTabData> = listOf(tab)) =
         LlmrpaComponent(DefaultComponentContext(LifecycleRegistry()), LlmrpaInfo, tabs(openTabs), { null }, tools = tools, llmProvider = { null }, tabLocks = TabLocks(),
@@ -82,6 +65,14 @@ class PanelRenderTest {
             val noTab = component(FakeTools { _, _ -> Triple("The task is complete", 0.9, null) }, openTabs = emptyList())
             noTab.updateInstruction(instruction)
             render(noTab, 360, 800, "no-tab-360")
+
+            val opened = LlmrpaComponent(DefaultComponentContext(LifecycleRegistry()), LlmrpaInfo, FakeTabs(emptyList(), create = { "new1" }), { null },
+                tools = FakeTools { _, _ -> Triple("The task is complete", 0.9, null) }, llmProvider = { null }, tabLocks = TabLocks(),
+                io = Dispatchers.Main, work = Dispatchers.Main, baseLimits = RunLimits(navSettleMs = 0, stepSettleMs = 0, openWaitsMs = listOf(0)))
+            opened.updateInstruction("Check the weather in Paris")
+            assertEquals(null, opened.startRun())
+            assertEquals("new1", opened.run.value?.tabId)
+            render(opened, 360, 900, "opened-360")
         } finally {
             Dispatchers.resetMain()
         }

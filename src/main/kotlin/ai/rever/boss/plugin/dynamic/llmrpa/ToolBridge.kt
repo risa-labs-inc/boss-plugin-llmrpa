@@ -14,6 +14,10 @@ data class ToolReply(val text: String, val isError: Boolean) {
     /** The `{"error":{"message"}}` convention Jev and RPA Engine use, or the raw text. */
     val errorMessage: String
         get() = ((json?.get("error") as? JsonObject)?.get("message") as? JsonPrimitive)?.content ?: text
+
+    /** The `{"error":{"code"}}` RPA Engine sets, e.g. [ToolNames.NO_BROWSER]. */
+    val errorCode: String?
+        get() = ((json?.get("error") as? JsonObject)?.get("code") as? JsonPrimitive)?.content
 }
 
 /**
@@ -57,4 +61,7 @@ internal object ToolNames {
     const val OBSERVE = "rpa_observe"
     const val STEP = "rpa_step"
     const val JEV_DECIDE = "jev_decide"
+
+    /** RPA Engine's code when the host resolves no live browser for a tab. */
+    const val NO_BROWSER = "NO_BROWSER"
 }

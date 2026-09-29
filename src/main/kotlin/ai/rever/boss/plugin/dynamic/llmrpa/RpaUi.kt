@@ -191,16 +191,17 @@ internal fun MenuRow(
     detail: String? = null,
     selected: Boolean = false,
     leading: (@Composable () -> Unit)? = null,
+    enabled: Boolean = true,
 ) {
     Row(
-        Modifier.fillMaxWidth().heightIn(min = 32.dp).clickable(role = Role.Button, onClick = onClick)
-            .pointerHoverIcon(PointerIcon.Hand).padding(horizontal = 12.dp, vertical = 6.dp),
+        Modifier.fillMaxWidth().heightIn(min = 32.dp).clickable(enabled = enabled, role = Role.Button, onClick = onClick)
+            .then(if (enabled) Modifier.pointerHoverIcon(PointerIcon.Hand) else Modifier).padding(horizontal = 12.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         leading?.invoke()
         Column(Modifier.weight(1f)) {
-            Text(text, color = RpaTokens.Text, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
+            Text(text, color = if (enabled) RpaTokens.Text else RpaTokens.TextMuted, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
                 fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal)
             detail?.let { Text(it, color = RpaTokens.TextMuted, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis) }
         }
