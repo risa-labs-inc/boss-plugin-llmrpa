@@ -46,6 +46,9 @@ class PhraseTypingTest {
         val pw = Candidates.phrases("log in with username bob and password hunter2, then search cats")
         assertTrue(pw.none { "hunter2" in it || "bob" in it || "password" in it }, pw.toString())
         assertTrue("cats" in pw, pw.toString())
+        val prefix = Candidates.phrases("log into my bank, username bob, password bob123")
+        assertTrue(prefix.none { "123" in it || "bob" in it }, prefix.toString())
+        assertTrue("tomato soup" in Candidates.phrases("Login to Amazon and search for tomato soup"))
         assertTrue(Candidates.phrases("red green blue cyan magenta yellow black white orange purple").size <= 8)
         assertEquals(emptyList(), Candidates.phrases("Open the home page"))
     }
@@ -176,6 +179,29 @@ class PhraseTypingTest {
         val s2 = TaskRunner(two, JevDecider(two, JEV), "t1", "Sign in with 'ada' and 'secret', then reach breast cancer") { Answer.Stop }.run()
         assertEquals(0, two.textCalls)
         assertTrue(s2.summary!!.contains("Not sure which text"), s2.summary)
+    }
+
+    @Test
+    fun `jev is never offered a quoted password for a plain field`() = runTest {
+        val email = element("e4", "textbox", "Email")
+        val text = "Log in with \"ada@x.com\" and password \"hunter2\""
+        val tools = FakeTools(page = wiki.copy(elements = listOf(email)), chooseText = { it.first() to 0.95 }) { _, call ->
+            if (call == 0) Triple("Type into 'Email'", 0.9, null) else Triple("The task is complete", 0.95, null)
+        }
+        var q: PendingQuestion? = null
+        val state = TaskRunner(tools, JevDecider(tools, JEV), "t1", text, RunLimits(navSettleMs = 0, stepSettleMs = 0)) { q = it; Answer.Stop }.run()
+        assertTrue(tools.textOptions.single().none { "hunter2" in it }, tools.textOptions.toString())
+        assertEquals("ada@x.com", (tools.steps.single()["value"] as JsonPrimitive).content)
+        assertEquals(null, q)
+        assertEquals(RunStatus.DONE, state.status, state.summary)
+
+        // Offered nothing else, it asks the person, who sees the value; a headless stop masks it.
+        val pwOnly = FakeTools(page = wiki.copy(elements = listOf(email))) { _, _ -> Triple("Type into 'Email'", 0.9, null) }
+        val s2 = TaskRunner(pwOnly, JevDecider(pwOnly, JEV), "t1", "Log in with password \"hunter2\" and pin \"4321\"") { q = it; Answer.Stop }.run()
+        assertEquals(0, pwOnly.textCalls)
+        assertTrue("hunter2" in assertIs<PendingQuestion.ChooseText>(q).options)
+        assertTrue("hunter2" !in s2.summary!!, s2.summary)
+        assertTrue("hunter2" !in LlmrpaMcpToolProvider.transcript(s2).toString())
     }
 
     @Test

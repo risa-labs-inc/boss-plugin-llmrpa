@@ -157,7 +157,7 @@ internal class LlmrpaMcpToolProvider(
                 is PendingQuestion.ChooseText -> put("stopped_at_question", buildJsonObject {
                     put("reason", q.reason)
                     put("field", q.field)
-                    put("text_options", buildJsonArray { q.options.forEach { add(JsonPrimitive(it)) } })
+                    put("text_options", buildJsonArray { q.options.forEach { add(JsonPrimitive(if (Candidates.isKeywordSecret(state.instruction, it)) "••••••" else it)) } })
                     put("hint", "Put the text to type in quotes in the instruction, or run it in the LLM RPA panel to choose.")
                 })
                 null -> Unit

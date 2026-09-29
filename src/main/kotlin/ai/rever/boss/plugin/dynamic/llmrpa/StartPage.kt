@@ -88,10 +88,7 @@ internal object StartPages {
      * nothing is left to search for.
      */
     fun searchUrl(instruction: String): String? {
-        var q = instruction
-        // Values first, then whatever follows "password", "pin" and the like, which is unquoted.
-        (Candidates.scrubbable(instruction).sortedByDescending { it.length } + Candidates.keywordSecrets(instruction)).forEach { q = q.replace(it, " ") }
-        q = q.replace(Regex("[\"“”‘’']\\s*[\"“”‘’']"), " ").replace(Regex("\\s+"), " ").trim().take(200)
+        val q = Candidates.scrub(instruction, " ").replace(Regex("[\"“”‘’']\\s*[\"“”‘’']"), " ").replace(Regex("\\s+"), " ").trim().take(200)
         if (q.count { it.isLetterOrDigit() } < 3) return null
         return "https://duckduckgo.com/?q=" + URLEncoder.encode(q, Charsets.UTF_8)
     }

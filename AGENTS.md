@@ -408,8 +408,9 @@ Found by running, not reviewing:
 - **The search never carries the instruction's values.** Quoted text, emails and addresses are what
   a run may type, passwords included, so they are cut from the query; with nothing left the run stops
   and asks for the site. So is the word after "password", "pin", "username" and the like
-  (`Candidates.keywordSecrets`, also in the model-address leak check and cut from `phrases`, so Jev
-  never types an unquoted password): crude, and it over-cuts, but New
+  (`Candidates.scrub`, shared with `phrases` so Jev never types an unquoted password; the model-address
+  leak check uses `keywordSecrets`). Values are cut as whole words, longest first, and keywords in one
+  regex pass: replacing captured words one by one let `username bob` shield `password bob123`.: crude, and it over-cuts, but New
   tab is the default route to this search. Any other unquoted secret is not detected. The scrub uses `Candidates.scrubbable`,
   which is uncapped: `values` stops at 20 entries and 200-character quotes, fine for a typing list,
   a leak for a scrubber.
@@ -481,3 +482,7 @@ emails and addresses only, and Jev cannot write.
 - Phrase ranking puts spans with no inner stop word first, then longest: "search google for cats"
   offers `cats` before `google for cats` (and `google`, between "search" and "for", counts as the site).
 - The panel hint passes the picked tab's address, so it leaves out the same site name the runner does.
+- **Jev is never offered a value that follows a secret keyword** for a field the page does not mark
+  private (`password "hunter2"` into 'Email'). The panel still lists it for the person, and a headless
+  stop masks it. Several quoted values for a plain field used to stop outright; they now go through
+  the text choice, which is the one relaxation, and this is its limit.

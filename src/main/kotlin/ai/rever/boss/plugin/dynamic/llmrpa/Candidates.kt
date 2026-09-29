@@ -128,7 +128,7 @@ internal object Candidates {
     }
 
     private val SECRET_AFTER = Regex(
-        """\b(?:passwords?|passcode|passwd|pwd|pin|otp|token|secret|ssn|cvv|cvc|card(?: number)?|account(?: number)?|api key|user ?name|login)\b(?:\s*(?:is|=|:))?\s*([^\s,;]+)""",
+        """\b(?:passwords?|passcode|passwd|pwd|pin|otp|token|secret|ssn|cvv|cvc|card(?: number)?|account(?: number)?|api key|user ?name)\b(?:\s*(?:is|=|:))?\s*("[^"]*"|“[^”]*”|‘[^’]*’|'[^']*'|[^\s,;]+)""",
         RegexOption.IGNORE_CASE,
     )
 
@@ -138,6 +138,24 @@ internal object Candidates {
      */
     fun keywordSecrets(instruction: String): List<String> =
         SECRET_AFTER.findAll(instruction).flatMap { listOf(it.value, it.groupValues[1]) }.distinct().toList()
+
+    /** Whether [value] is the word after a secret keyword, as quoted or bare. */
+    fun isKeywordSecret(instruction: String, value: String): Boolean =
+        SECRET_AFTER.findAll(instruction).any { it.groupValues[1].trim('"', '\'', '“', '”', '‘', '’') == value }
+
+    /**
+     * [instruction] with each secret keyword and its word, then its values ([scrubbable]), replaced
+     * by [with]. Keywords go in one regex pass, so a username that prefixes the password cannot
+     * shield it; values go longest first and only as whole words, so "cat" leaves "category" alone.
+     */
+    fun scrub(instruction: String, with: String): String {
+        // Keywords first, on the untouched text, so a quoted secret goes with its quotes.
+        var text = SECRET_AFTER.replace(instruction, Regex.escapeReplacement(with))
+        scrubbable(instruction).sortedByDescending { it.length }.forEach { v ->
+            text = text.replace(Regex("(?<![\\p{L}\\p{N}])${Regex.escape(v)}(?![\\p{L}\\p{N}])"), Regex.escapeReplacement(with))
+        }
+        return text
+    }
 
     /** Quoted phrases alone: text meant to be typed, not a place to go. */
     fun quotedPhrases(instruction: String): List<String> =
@@ -154,7 +172,7 @@ internal object Candidates {
         "about", "as", "is", "are", "be", "it", "its", "this", "that", "these", "those", "there", "here", "then", "than",
         "so", "if", "when", "where", "what", "which", "who", "how", "i", "me", "my", "we", "us", "our", "you", "your",
         "please", "can", "could", "would", "should", "will", "must", "want", "need", "let", "just", "now", "up", "down",
-        "open", "go", "goto", "visit", "navigate", "follow", "link", "links", "click", "press", "tap", "type", "enter",
+        "log", "login", "logout", "sign", "signin", "open", "go", "goto", "visit", "navigate", "follow", "link", "links", "click", "press", "tap", "type", "enter",
         "search", "find", "look", "show", "get", "till", "until", "reach", "arrive", "keep", "start", "stop", "use",
         "page", "pages", "home", "homepage", "site", "website", "tab", "result", "results", "first", "next", "select",
         "choose", "pick", "download", "save", "image", "picture", "article",
@@ -170,9 +188,8 @@ internal object Candidates {
      * Spans with no inner stop word first, then longest; capped.
      */
     fun phrases(instruction: String, addresses: List<String> = emptyList()): List<String> {
-        var text = instruction
         // The word after "password" and the like goes too: before 1.4 unquoted text was never typed.
-        (scrubbable(instruction).sortedByDescending { it.length } + keywordSecrets(instruction)).forEach { text = text.replace(it, " , ") }
+        val text = scrub(instruction, " , ")
         val sites = (addresses + urls(instruction)).flatMap { hostLabels(it) }.toMutableSet()
         // Clauses break on punctuation, so a span never runs across "page, then".
         val clauses = text.split(Regex("""[.,;:!?()\[\]{}"“”‘’]|\s'|'\s""")).map { c -> word.findAll(c).map { it.value }.toList() }
@@ -214,9 +231,9 @@ internal object Candidates {
      * when something can go in it: a private field takes quoted values alone, any other field also
      * words from the instruction ([phrases]).
      */
-    fun build(page: PageSnapshot, instruction: String, writes: Boolean): List<Candidate> {
+    fun build(page: PageSnapshot, instruction: String, writes: Boolean, phrases: List<String> = phrases(instruction, listOf(page.url))): List<Candidate> {
         val quotedValues = values(instruction).isNotEmpty()
-        val canType = writes || quotedValues || phrases(instruction, listOf(page.url)).isNotEmpty()
+        val canType = writes || quotedValues || phrases.isNotEmpty()
         val canTypePrivate = writes || quotedValues
         val out = mutableListOf<Candidate>()
         var n = 0

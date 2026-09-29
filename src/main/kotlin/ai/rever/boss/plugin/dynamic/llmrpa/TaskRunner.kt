@@ -256,8 +256,8 @@ class TaskRunner(
             if (history.isNotEmpty() && !history.last().contains(" → now on ")) {
                 history[history.lastIndex] = "${history.last()} → now on '${page.title.take(80)}'"
             }
-            val candidates = Candidates.build(page, instruction, decider.writesText)
             val phrases = Candidates.phrases(instruction, listOf(page.url))
+            val candidates = Candidates.build(page, instruction, decider.writesText, phrases)
             val ctx = StepContext(instruction, page, candidates, values, history.toList(), phrases)
 
             val decision = decider.decide(ctx).getOrElse {
@@ -413,12 +413,15 @@ class TaskRunner(
     private suspend fun pickText(ctx: StepContext, field: String, options: List<String>, stepNo: Int): Pair<String, StepRecord.ValueSource>? {
         if (options.isEmpty()) return stop(RunStatus.STOPPED, "Needs text to type into '$field'. Put it in quotes in the instruction.")
         fun sourceOf(v: String) = if (v in values) StepRecord.ValueSource.QUOTED else StepRecord.ValueSource.PHRASE
-        val asked = decider.chooseText(ctx, field, options)
+        // A value after "password" and the like is the person's to place in a field the page does
+        // not mark private, never the model's.
+        val offered = options.filterNot { Candidates.isKeywordSecret(instruction, it) }
+        val asked = offered.takeIf { it.isNotEmpty() }?.let { decider.chooseText(ctx, field, it) }
         var reason = "The model gave no text for '$field'"
         if (asked != null) {
             _state.update { it.copy(calls = it.calls + 1, costUsd = it.costUsd + (asked.getOrNull()?.costUsd ?: 0.0)) }
             val choice = asked.getOrNull()
-            val pick = choice?.index?.let(options::getOrNull)
+            val pick = choice?.index?.let(offered::getOrNull)
             if (pick != null && choice.confidence >= limits.askBelow) return pick to sourceOf(pick)
             reason = when {
                 choice == null -> "${decider.option.providerName} could not pick the text (${asked.exceptionOrNull()?.message})"
@@ -432,7 +435,7 @@ class TaskRunner(
             else -> stop(
                 RunStatus.STOPPED,
                 "Stopped at step $stepNo: Not sure which text from the instruction goes into '$field' ($reason). " +
-                    "It could be ${options.take(8).joinToString(", ") { "'${it.take(60)}'" }}. Put the text to type in quotes.",
+                    "It could be ${options.take(8).joinToString(", ") { if (Candidates.isKeywordSecret(instruction, it)) "••••••" else "'${it.take(60)}'" }}. Put the text to type in quotes.",
             )
         }
     }

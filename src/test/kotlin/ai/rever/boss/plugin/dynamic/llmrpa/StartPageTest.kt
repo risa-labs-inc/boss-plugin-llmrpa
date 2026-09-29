@@ -168,6 +168,17 @@ class StartPageTest {
     }
 
     @Test
+    fun `a username that prefixes the password does not shield it, and other words stay whole`() {
+        fun q(text: String) = java.net.URLDecoder.decode(StartPages.searchUrl(text)!!.substringAfter("q="), Charsets.UTF_8)
+        val leak = q("log into my bank, username bob, password bob123")
+        assertTrue("bob" !in leak && "123" !in leak, leak)
+        assertEquals("Login to Amazon and search for tomato soup", q("Login to Amazon and search for tomato soup"))
+        assertTrue("weather in Paris" in q("pin the weather widget, then search weather in Paris"))
+        // A quoted value is cut as a whole word only.
+        assertEquals("Open the category for", q("Open the category for 'cat'"))
+    }
+
+    @Test
     fun `an empty page followed by NO_BROWSER reports the hint, not the stale page`() = runTest {
         val tools = FakeTools(decide = done)
         var n = 0
