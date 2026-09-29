@@ -242,7 +242,7 @@ class ChatDecider(
         }
         val reply = api.complete(
             AiRequest(system = "You check whether a browser task is finished. Be strict: a search or results page is not an opened article.",
-                messages = listOf(AiMessage.user(user)), temperature = 0f, maxTokens = 1_000, timeoutMs = 90_000, extras = routingExtras(option)),
+                messages = listOf(AiMessage.user(user)), temperature = 0f, maxTokens = 2_000, timeoutMs = 90_000, extras = routingExtras(option)),
         ).getOrElse { return Result.failure(it) }
         return runCatching {
             val obj = Json.parseToJsonElement(LlmApiClient.firstJsonObject(reply.text) ?: error("The model did not reply with JSON")).jsonObject

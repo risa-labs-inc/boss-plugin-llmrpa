@@ -43,7 +43,7 @@ class PanelRenderTest {
     }
 
     private fun component(tools: ToolInvoker, openTabs: List<ActiveTabData> = listOf(tab)) =
-        LlmrpaComponent(DefaultComponentContext(LifecycleRegistry()), LlmrpaInfo, tabs(openTabs), { null }, tools = tools, llmProvider = { null }, io = Dispatchers.Main)
+        LlmrpaComponent(DefaultComponentContext(LifecycleRegistry()), LlmrpaInfo, tabs(openTabs), { null }, tools = tools, llmProvider = { null }, tabLocks = TabLocks(), io = Dispatchers.Main)
 
     @Test
     fun `renders every state at every width`() {

@@ -180,7 +180,7 @@ class TaskRunner(
             }
             val fromInstruction = value != null && value in values
             if (chosen.needsValue && chosen.element?.sensitive == true && !fromInstruction) {
-                return finish(RunStatus.STOPPED, "Stopped before typing into the private field '${chosen.element?.label?.take(60)}': only text from your instruction goes there.")
+                return finish(RunStatus.STOPPED, "Stopped before typing into the private field '${chosen.element.label?.take(60)}': only text from your instruction goes there.")
             }
             val description = if (chosen.needsValue) "Type '${value!!.take(60)}' into '${chosen.element?.label?.take(60)}'" else chosen.description
 
@@ -191,7 +191,16 @@ class TaskRunner(
                     ?: decider.risk(ctx, chosen).getOrNull()?.also { (_, cost) ->
                         _state.update { it.copy(calls = it.calls + 1, costUsd = it.costUsd + cost) }
                     }?.first
-                val risk = assessed ?: if (Candidates.soundsCommitting(chosen)) 1.0 else null
+                // The label check can only raise a model's answer: a chat model grades its own pick
+                // from page text, so a misleading page could otherwise talk it past a Delete.
+                val label = if (Candidates.soundsCommitting(chosen)) 1.0 else 0.0
+                val risk = when {
+                    assessed != null -> maxOf(assessed, label)
+                    label > 0 -> label
+                    // The person picked it from the list, and nothing on it says it commits.
+                    chosenBy == StepRecord.ChosenBy.USER -> 0.0
+                    else -> null
+                }
                 if ((risk == null || risk >= limits.confirmAbove) && waitFor(PendingQuestion.Confirm(chosen, risk)) != Answer.Proceed) {
                     return finish(RunStatus.STOPPED, "Stopped before \"${chosen.description}\"")
                 }
@@ -203,13 +212,13 @@ class TaskRunner(
             _state.update { it.copy(steps = it.steps + record) }
 
             val (ok, error, navigated) = act(chosen.action!!.copy(value = value), allowSensitive = chosen.element?.sensitive == true && fromInstruction)
-            // Let the page finish rendering before the next look: scripts often rebuild widgets on load.
-            delay(if (navigated) NAV_SETTLE_MS else STEP_SETTLE_MS)
             _state.update { s ->
                 s.copy(steps = s.steps.map {
                     if (it.index == stepNo) it.copy(outcome = if (ok) StepRecord.Outcome.OK else StepRecord.Outcome.FAILED, detail = error) else it
                 })
             }
+            // Let the page finish rendering before the next look: scripts often rebuild widgets on load.
+            delay(if (navigated) NAV_SETTLE_MS else STEP_SETTLE_MS)
             if (ok) {
                 failures = 0
                 history += if (error != null) "$description ($error)" else description
@@ -264,6 +273,13 @@ class TaskRunner(
     private fun finish(status: RunStatus, summary: String): RunState {
         _state.update { it.copy(status = status, summary = summary, question = null) }
         return state.value
+    }
+
+    /** Ends a live run that ran past [limitMs]. */
+    fun timedOut(limitMs: Long) {
+        if (_state.value.status == RunStatus.RUNNING || _state.value.status == RunStatus.WAITING) {
+            finish(RunStatus.STOPPED, "Stopped at step ${_state.value.steps.size + 1}: the run reached its ${limitMs / 60_000}-minute limit")
+        }
     }
 
     /** Called when the coroutine is cancelled by Stop. */

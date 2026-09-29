@@ -79,8 +79,10 @@ internal object Candidates {
     const val STUCK = "stuck"
 
     /**
-     * Jev's choice questions take at most 255 options, but a decision over ~200 links is both slow
-     * and diluted. RPA Engine lists in-viewport elements first, so the cut drops what is off screen.
+     * Cap on page-derived candidates plus Enter; done and stuck come on top, so a list is at most
+     * MAX + 2. Jev's choice questions take at most 255 options, but a decision over ~200 links is
+     * both slow and diluted. RPA Engine lists in-viewport elements first, so the cut drops what is
+     * off screen.
      */
     const val MAX = 150
     private const val MAX_SELECT_OPTIONS = 12
@@ -114,7 +116,7 @@ internal object Candidates {
         var n = 0
         var firstImage = true
         fun next() = "a${++n}"
-        urls(instruction).filter { it != page.url }.forEach { u ->
+        urls(instruction).filter { it.trimEnd('/') != page.url.trimEnd('/') }.forEach { u ->
             out += Candidate(next(), Candidate.Kind.NAVIGATE, "Go to $u", StepAction("navigate", value = u))
         }
         for (el in page.elements) {

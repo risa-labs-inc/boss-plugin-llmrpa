@@ -231,7 +231,7 @@ class RunnerSafetyTest {
         assertEquals(TabLocks.BUSY, c.startRun())
         assertEquals(TabLocks.BUSY, c.errorMessage.value)
 
-        val headless = HeadlessRunner(tools, { null }, { null }, tabs = { listOf(tab("t1")) }, locks = locks)
+        val headless = HeadlessRunner(tools, { null }, { null }, tabs = { listOf(tab("t1")) }, activeTabId = { null }, locks = locks)
         assertEquals(TabLocks.BUSY, kotlinx.coroutines.runBlocking { headless.execute(instruction, "t1", 3, null) }.exceptionOrNull()?.message)
 
         // Released, a run goes ahead and gives the tab back when it ends.
@@ -252,11 +252,11 @@ class RunnerSafetyTest {
     fun `headless runs use the focused tab, or ask for one and list what is open`() = runTest {
         val tools = FakeTools { _, _ -> Triple("The task is complete", 0.9, null) }
         val open = listOf(tab("t1", "Mail"), tab("t2", "Shop"))
-        val none = HeadlessRunner(tools, { null }, { null }, tabs = { open }, activeTabId = { null })
+        val none = HeadlessRunner(tools, { null }, { null }, tabs = { open }, activeTabId = { null }, locks = TabLocks())
         val err = none.execute(instruction, null, 3, null).exceptionOrNull()!!.message!!
         assertTrue(err.contains("tab_id") && err.contains("t1 ('Mail'") && err.contains("t2 ('Shop'"), err)
 
-        val focused = HeadlessRunner(tools, { null }, { null }, tabs = { open }, activeTabId = { "t2" })
+        val focused = HeadlessRunner(tools, { null }, { null }, tabs = { open }, activeTabId = { "t2" }, locks = TabLocks())
         assertEquals(RunStatus.DONE, focused.execute(instruction, null, 3, null).getOrThrow().status)
 
         val unknown = none.execute(instruction, "t9", 3, null).exceptionOrNull()!!.message!!
@@ -375,7 +375,7 @@ class RunnerSafetyTest {
                 ai.rever.boss.plugin.api.AiProviderModels("ANTHROPIC", "Anthropic", listOf(ai.rever.boss.plugin.api.AiAvailableModel("claude-haiku", "Haiku"))),
             )
         }
-        val runner = HeadlessRunner(tools, { api }, { null }, tabs = { listOf(tab("t1")) }, activeTabId = { "t1" })
+        val runner = HeadlessRunner(tools, { api }, { null }, tabs = { listOf(tab("t1")) }, activeTabId = { "t1" }, locks = TabLocks())
         val byDefault = runner.execute(instruction, null, 3, null).getOrThrow()
         assertEquals("Haiku", byDefault.modelLabel)
         assertEquals(RunStatus.DONE, byDefault.status)
@@ -394,18 +394,101 @@ class RunnerSafetyTest {
         assertEquals("ok", (step["result"] as JsonPrimitive).content)
     }
 
+    @Test
+    fun `a chat model rating a Delete button safe is still asked`() = runTest {
+        val del = element("e6", "button", "Delete account")
+        val page = SEARCH_PAGE.copy(elements = listOf(del))
+        val tools = FakeTools(page = page) { _, _ -> error("jev is not used") }
+        val k = key("Click 'Delete account' button", page)
+        var asked: PendingQuestion? = null
+        val state = TaskRunner(tools, chatDecider("""{"action":"$k","confidence":0.97,"irreversible":false}"""), "t1", instruction) { asked = it; Answer.Stop }.run()
+        assertEquals(1.0, assertIs<PendingQuestion.Confirm>(asked).risk)
+        assertEquals(RunStatus.STOPPED, state.status)
+        assertTrue(tools.steps.isEmpty())
+    }
+
+    @Test
+    fun `a person's pick with a harmless label is not confirmed a second time`() = runTest {
+        val tools = FakeTools { _, _ -> error("jev is not used") }
+        val decider = chatDecider(
+            """{"action":"${key("Open 'Sign in' link")}","confidence":0.3,"irreversible":false}""",
+        )
+        val asked = mutableListOf<PendingQuestion>()
+        val signIn = Candidates.build(SEARCH_PAGE, instruction).first { it.description == "Open 'Sign in' link" }
+        TaskRunner(tools, decider, "t1", instruction, RunLimits(maxSteps = 1)) { q -> asked += q; Answer.Pick(signIn) }.run()
+        assertEquals(1, asked.size)
+        assertEquals(1, tools.steps.size)
+    }
+
+    @Test
+    fun `the panel follows the focused tab until the person picks one`() = withMain {
+        val open = listOf(tab("t1", "Mail").copy(panelId = "left"), tab("t2", "Shop").copy(panelId = "right"))
+        var focused: String? = "t2"
+        val c = component(FakeTools { _, _ -> Triple("The task is complete", 0.9, null) }, provider = tabs(open) { focused })
+        assertEquals("t2", c.selectedTab.value?.tabId)
+        focused = "t1"
+        c.recheck()
+        assertEquals("t1", c.selectedTab.value?.tabId)
+        c.selectTab(open[1])
+        c.recheck()
+        assertEquals("t2", c.selectedTab.value?.tabId)
+    }
+
+    @Test
+    fun `with no focused tab the panel falls back to the first`() = withMain {
+        val c = component(FakeTools { _, _ -> Triple("The task is complete", 0.9, null) })
+        assertEquals("t1", c.selectedTab.value?.tabId)
+    }
+
+    @Test
+    fun `a headless run that runs past its time limit stops and returns what it did`() = runTest {
+        val tools = FakeTools { _, _ -> Triple("Open 'Sign in' link", 0.9, null) }
+        val slow = object : StepDecider by JevDecider(tools, JEV) {
+            override suspend fun decide(ctx: StepContext): Result<Decision> {
+                if (ctx.history.isNotEmpty()) kotlinx.coroutines.awaitCancellation()
+                return JevDecider(tools, JEV).decide(ctx)
+            }
+        }
+        val runner = TaskRunner(tools, slow, "t1", instruction) { Answer.Stop }
+        val state = kotlinx.coroutines.withTimeoutOrNull(60_000) { runner.run() } ?: runner.also { it.timedOut(60_000) }.state.value
+        assertEquals(RunStatus.STOPPED, state.status)
+        assertEquals(1, state.steps.size)
+        assertTrue(state.summary!!.contains("1-minute limit"), state.summary)
+    }
+
+    @Test
+    fun `llmrpa_execute checks its arguments and clamps the step limit`() = runTest {
+        val tools = FakeTools { _, _ -> Triple("Open 'Sign in' link", 0.9, null) }
+        val provider = LlmrpaMcpToolProvider(
+            "p", component = { null },
+            headless = HeadlessRunner(tools, { null }, { null }, tabs = { listOf(tab("t1")) }, activeTabId = { "t1" }, locks = TabLocks()),
+        )
+        val execute = provider.tools().first { it.name == "llmrpa_execute" }.handler
+        suspend fun call(raw: String) = execute.call(ai.rever.boss.plugin.api.McpToolArgs(emptyMap(), raw))
+        assertTrue(call("""{}""").let { it.isError && it.text.contains("instruction") })
+        assertTrue(call("""not json""").isError)
+        val t = json(call("""{"instruction":"$instruction","max_steps":0}""").text)
+        assertEquals(1, (t["steps"] as kotlinx.serialization.json.JsonArray).size)
+        val bad = call("""{"instruction":"x","model":"nope"}""")
+        assertTrue(bad.isError && bad.text.contains("DECISION:JEV:typesafe/jev-1.13"), bad.text)
+    }
+
     private fun tab(id: String, title: String = "Shop") = ActiveTabData(id, "fluck", title, "w", "Work", "p", "win", url = "https://shop.example/$id")
 
-    private fun component(tools: ToolInvoker, locks: TabLocks = TabLocks()) =
-        LlmrpaComponent(DefaultComponentContext(LifecycleRegistry()), LlmrpaInfo, tabs(listOf(tab("t1"))), { null }, tools = tools, llmProvider = { null }, tabLocks = locks, io = Dispatchers.Main)
+    private fun component(tools: ToolInvoker, locks: TabLocks = TabLocks(), provider: ActiveTabsProvider = tabs(listOf(tab("t1")))) =
+        LlmrpaComponent(DefaultComponentContext(LifecycleRegistry()), LlmrpaInfo, provider, { null }, tools = tools, llmProvider = { null }, tabLocks = locks, io = Dispatchers.Main)
 
     private fun withMain(block: () -> Unit) {
         Dispatchers.setMain(UnconfinedTestDispatcher())
         try { block() } finally { Dispatchers.resetMain() }
     }
 
-    private fun tabs(list: List<ActiveTabData>) = object : ActiveTabsProvider {
+    /** [focused] is the tab selected in the focused pane, as the host reports it. */
+    private fun tabs(list: List<ActiveTabData>, focused: () -> String? = { null }) = object : ActiveTabsProvider {
         override val activeTabs: StateFlow<List<ActiveTabData>> = MutableStateFlow(list)
+        override val activePanelId: String? get() = focused()?.let { id -> list.first { it.tabId == id }.panelId }
+        override fun selectedTabId(workspaceId: String, panelId: String): String? =
+            focused()?.takeIf { id -> list.any { it.tabId == id && it.workspaceId == workspaceId && it.panelId == panelId } }
         override suspend fun refreshTabs() {}
         override fun selectTab(tabId: String, panelId: String) {}
         override fun getTabUrl(tabId: String): String? = list.firstOrNull { it.tabId == tabId }?.url

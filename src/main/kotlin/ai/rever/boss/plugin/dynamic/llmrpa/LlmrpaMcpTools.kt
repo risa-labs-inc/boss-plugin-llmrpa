@@ -34,7 +34,8 @@ internal class LlmrpaMcpToolProvider(
                     "real, logged-in browser session, as them, and can open any web address the instruction contains. " +
                     "A model (Jev by default, or any configured chat model) picks each step and RPA Engine performs it. " +
                     "Stops instead of guessing when the model is unsure or the next action looks irreversible, and returns " +
-                    "the steps taken. Put any text to type in quotes in the instruction. Each step is a paid model call.",
+                    "the steps taken. Put any text to type in quotes in the instruction. Each step is one to three paid model calls, " +
+                    "and a run stops after 10 minutes.",
             inputSchema = """{"type":"object","additionalProperties":false,"properties":{""" +
                 """"instruction":{"type":"string","description":"The task, e.g. Search for 'wireless keyboard' and open the first result"},""" +
                 """"tab_id":{"type":"string","description":"Browser tab to act on; defaults to the focused tab; required when no tab is focused (the error lists the open ones)"},""" +

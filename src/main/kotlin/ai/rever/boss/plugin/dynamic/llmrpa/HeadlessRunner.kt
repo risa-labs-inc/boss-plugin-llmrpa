@@ -6,6 +6,7 @@ import ai.rever.boss.plugin.api.LlmProvider
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -33,8 +34,10 @@ class HeadlessRunner(
     private val llmProvider: () -> LlmProvider?,
     private val tabs: () -> List<ActiveTabData>,
     /** The tab the user is looking at, or null when the host cannot say. */
-    private val activeTabId: () -> String? = { null },
-    private val locks: TabLocks = TabLocks(),
+    private val activeTabId: () -> String?,
+    // No default: a forgotten one would give headless runs their own locks, apart from the panel's.
+    private val locks: TabLocks,
+    private val timeLimitMs: Long = TIME_LIMIT_MS,
 ) {
     suspend fun execute(instruction: String, tabId: String?, maxSteps: Int, model: String?): Result<RunState> = try {
         executeUnguarded(instruction, tabId, maxSteps, model)
@@ -69,14 +72,15 @@ class HeadlessRunner(
         } ?: return Result.failure(
             IllegalArgumentException(
                 if (model == null) "No model is available. Install Jev, pick a model in Settings → AI Providers, or pass model."
-                else "Unknown model '$model'. Available: ${models.take(25).joinToString { it.modelId }}${if (models.size > 25) ", …" else ""}",
+                else "Unknown model '$model'. Available: ${models.take(25).joinToString { it.key }}${if (models.size > 25) ", …" else ""}",
             ),
         )
         val decider = if (option.kind == ModelOption.Kind.DECISION) JevDecider(tools, option) else ChatDecider(gateway, option)
         if (!locks.tryAcquire(tab.tabId)) return Result.failure(IllegalStateException(TabLocks.BUSY))
         return try {
             val runner = TaskRunner(tools, decider, tab.tabId, instruction, RunLimits(maxSteps = maxSteps)) { Answer.Stop }
-            Result.success(runner.run())
+            // Bounded, so a caller that times out does not leave a run going on the user's tab.
+            Result.success(withTimeoutOrNull(timeLimitMs) { runner.run() } ?: runner.also { it.timedOut(timeLimitMs) }.state.value)
         } finally {
             locks.release(tab.tabId)
         }
@@ -89,6 +93,8 @@ class HeadlessRunner(
     }
 
     companion object {
+        const val TIME_LIMIT_MS = 10 * 60_000L
+
         private fun describe(tabs: List<ActiveTabData>): String =
             tabs.take(20).joinToString { "${it.tabId} ('${it.title.take(40)}', ${host(it.url)})" } + if (tabs.size > 20) ", …" else ""
 

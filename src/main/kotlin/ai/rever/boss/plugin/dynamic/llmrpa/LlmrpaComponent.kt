@@ -56,8 +56,8 @@ class LlmrpaComponent(
     // No defaults, like aiGateway: a forgotten one would look exactly like "not installed".
     internal val tools: ToolInvoker,
     private val llmProvider: () -> LlmProvider?,
-    /** Shared with `llmrpa_execute`, so a panel run and a headless one never drive the same tab. */
-    private val tabLocks: TabLocks = TabLocks(),
+    /** Shared with `llmrpa_execute`, so a panel run and a headless one never drive the same tab. No default, for the same reason. */
+    private val tabLocks: TabLocks,
     /** Where catalog reads run; tests pass the test Main so the model list lands synchronously. */
     private val io: CoroutineDispatcher = Dispatchers.IO,
 ) : PanelComponentWithUI, ComponentContext by ctx {
@@ -117,6 +117,9 @@ class LlmrpaComponent(
     private val _selectedTab = MutableStateFlow<ActiveTabData?>(null)
     val selectedTab: StateFlow<ActiveTabData?> = _selectedTab
 
+    /** Until the person picks a tab, the pick follows the focused one: Run acts in their logged-in session. */
+    private var tabPickedByUser = false
+
     private val _errorMessage = MutableStateFlow<String?>(null)
     val errorMessage: StateFlow<String?> = _errorMessage
 
@@ -146,9 +149,11 @@ class LlmrpaComponent(
                     val currentSelected = _selectedTab.value
                     if (currentSelected != null && browserTabs.none { it.tabId == currentSelected.tabId }) {
                         _selectedTab.value = null
+                        tabPickedByUser = false
                     }
 
-                    // Auto-select first tab if no tab is selected and tabs are available
+                    followFocusedTab()
+                    // The first tab only when the host cannot say which one is focused.
                     if (_selectedTab.value == null && browserTabs.isNotEmpty()) {
                         _selectedTab.value = browserTabs.first()
                     }
@@ -179,6 +184,17 @@ class LlmrpaComponent(
      */
     fun selectTab(tab: ActiveTabData) {
         _selectedTab.value = tab
+        tabPickedByUser = true
+    }
+
+    /** Moves the pick to the focused browser tab, unless the person chose one or a run is going. */
+    private fun followFocusedTab() {
+        if (tabPickedByUser || runJob?.isActive == true) return
+        val provider = activeTabsProvider ?: return
+        val tabs = _availableTabs.value
+        val id = runCatching { HeadlessRunner.activeTab(tabs, provider.activePanelId) { ws, panel -> provider.selectedTabId(ws, panel) } }
+            .getOrNull() ?: return
+        if (id != _selectedTab.value?.tabId) tabs.firstOrNull { it.tabId == id }?.let { _selectedTab.value = it }
     }
 
     fun toggleSettings() {
@@ -413,14 +429,25 @@ class LlmrpaComponent(
     val readiness: StateFlow<Blocker?> = _readiness
 
     private var jevSeen = false
+    private var emptyReloads = 0
+    private var lastEmptyReloadAt = 0L
 
-    /** Recomputes readiness, reloading models when the list is empty or Jev appeared or left. */
+    /**
+     * Recomputes readiness, reloading models when Jev appeared or left, or when the list is empty.
+     * Empty reloads back off to 32 s: with nothing installed they would otherwise call into other
+     * plugins every 2 s for the panel's whole life.
+     */
     fun recheck() {
         val jevNow = tools.has(ToolNames.JEV_DECIDE)
-        if (_modelGroups.value.isEmpty() || jevNow != jevSeen) {
+        val now = System.currentTimeMillis()
+        val empty = _modelGroups.value.isEmpty()
+        val emptyDue = empty && now - lastEmptyReloadAt >= (READINESS_POLL_MS shl emptyReloads.coerceAtMost(4))
+        if (emptyDue || jevNow != jevSeen) {
+            if (empty) { lastEmptyReloadAt = now; emptyReloads++ } else emptyReloads = 0
             jevSeen = jevNow
             refreshModels()
         }
+        followFocusedTab()
         _readiness.value = blocker()
     }
 

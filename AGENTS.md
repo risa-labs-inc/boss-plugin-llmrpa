@@ -358,3 +358,11 @@ Found by running, not reviewing:
 - **Draft steps never falls back to the active model.** Jev or an unroutable chat model is refused
   with the reason, the same rule `routingProblem` applies to Run.
 - `LlmrpaComponent`'s `tools` and `llmProvider` have no defaults, for the reason `aiGateway` has none.
+- **The commit-word check only raises a chat model's risk.** The model grades its own pick from
+  page text, so a misleading page could talk it into `irreversible:false` on a Delete. A person's
+  pick with a harmless label is not confirmed a second time.
+- **The panel's tab follows the focused one** until the person picks a tab; `first()` is only the
+  fallback when the host cannot say. `llmrpa_execute` is bounded at 10 minutes.
+- RPA Engine (`>=1.3.0`) and Jev are declared optional dependencies, for the same unload guard as
+  the gateway. `TabLocks` has no default anywhere: a forgotten one splits the panel from headless.
+- With nothing installed, the empty model reload backs off to 32 s instead of every 2 s.
