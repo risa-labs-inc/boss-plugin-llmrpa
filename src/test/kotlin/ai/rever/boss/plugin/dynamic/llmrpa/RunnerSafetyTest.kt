@@ -287,10 +287,117 @@ class RunnerSafetyTest {
         listOf("Sign in", "Sender settings", "Orders history", "Search").forEach { assertFalse(Candidates.soundsCommitting(c(it)), it) }
     }
 
+    @Test
+    fun `a page with hundreds of links still offers Enter`() {
+        val page = SEARCH_PAGE.copy(elements = SEARCH_PAGE.elements + (1..200).map { element("l$it", "link", "Link $it") })
+        val c = Candidates.build(page, instruction)
+        assertTrue("Press Enter" in c.map { it.description })
+        assertEquals(Candidates.MAX + 2, c.size)
+        assertEquals(c.size, c.map { it.key }.toSet().size)
+    }
+
+    @Test
+    fun `a person who picks done is not overruled by the done check`() = runTest {
+        val tools = FakeTools(complete = listOf(0.1)) { _, _ -> Triple("Open 'Sign in' link", 0.3, null) }
+        val state = TaskRunner(tools, JevDecider(tools, JEV), "t1", instruction) { q ->
+            Answer.Pick(Candidates.build(SEARCH_PAGE, instruction).first { it.kind == Candidate.Kind.DONE })
+        }.run()
+        assertEquals(RunStatus.DONE, state.status)
+        assertTrue(state.summary!!.contains("You said"), state.summary)
+        assertEquals(0, tools.verifyCalls)
+        assertTrue(tools.steps.isEmpty())
+    }
+
+    @Test
+    fun `a done the runner could not check is not reported as done`() = runTest {
+        val tools = FakeTools { _, _ -> Triple("The task is complete", 0.97, null) }
+        val decider = object : StepDecider by JevDecider(tools, JEV) {
+            override suspend fun verifyDone(ctx: StepContext) = Result.failure<Pair<Double, Double>>(IllegalStateException("timed out"))
+        }
+        val state = TaskRunner(tools, decider, "t1", instruction) { Answer.Stop }.run()
+        assertEquals(RunStatus.STOPPED, state.status)
+        assertTrue(state.summary!!.contains("could not confirm") && state.summary.contains("timed out"), state.summary)
+    }
+
+    @Test
+    fun `a select whose label commits is risk checked`() {
+        val sort = element("e4", "combobox", "Sort by", tag = "select", options = listOf("Price"))
+        val pay = element("e5", "combobox", "Pay with", tag = "select", options = listOf("Card"))
+        val c = Candidates.build(SEARCH_PAGE.copy(elements = listOf(sort, pay)), instruction).filter { it.kind == Candidate.Kind.SELECT }
+        assertEquals(listOf(false, true), c.map { it.canCommit })
+    }
+
+    @Test
+    fun `draft steps refuses a model it cannot use rather than falling back`() = runTest {
+        val routed = mutableListOf<AiRequest>()
+        val api = object : AiGatewayAPI {
+            override suspend fun complete(request: AiRequest): Result<AiReply> { routed += request; return Result.success(AiReply("{}")) }
+            override fun stream(request: AiRequest): Flow<AiChunk> = emptyFlow()
+            override suspend fun runAgent(request: AiRequest, tools: List<AiToolSpec>, budget: AiBudget, invoke: suspend (AiToolCall) -> AiToolOutcome): Result<AiAgentResult> =
+                Result.failure(UnsupportedOperationException())
+            override fun capabilities(): Set<String> = emptySet()
+            override fun activeModel(): AiModelInfo? = AiModelInfo("ANTHROPIC", "Anthropic", "claude")
+        }
+        val client = LlmApiClient { api }
+        val req = LLMRpaRequest(actions = listOf(LLMAction(instruction)), sourceUrl = "https://shop.example/")
+        val jev = client.callLLMApi(req, JEV)
+        assertEquals("error", jev.status)
+        assertEquals(LlmApiClient.DRAFT_NEEDS_CHAT, jev.message)
+        val unroutable = client.callLLMApi(req, chat)
+        assertEquals("error", unroutable.status)
+        assertTrue(unroutable.message!!.contains("Update AI Gateway"), unroutable.message)
+        assertTrue(routed.isEmpty())
+    }
+
+    @Test
+    fun `the panel names why draft steps is unavailable for Jev`() = withMain {
+        val c = component(FakeTools { _, _ -> Triple("The task is complete", 0.9, null) })
+        assertEquals(ModelOption.Kind.DECISION, c.selectedModel.value?.kind)
+        assertEquals(LlmApiClient.DRAFT_NEEDS_CHAT, c.draftProblem())
+    }
+
+    @Test
+    fun `headless without Jev uses the model selected in settings, and an ambiguous id is refused`() = runTest {
+        val tools = FakeTools { _, _ -> error("jev is not used") }
+        tools.registered = setOf(ToolNames.OBSERVE, ToolNames.STEP)
+        val api = object : AiGatewayAPI {
+            override suspend fun complete(request: AiRequest): Result<AiReply> = Result.success(
+                AiReply(if (request.system.contains("check whether")) """{"complete":true,"confidence":0.9}"""
+                else """{"action":"done","confidence":0.9,"irreversible":false}"""),
+            )
+            override fun stream(request: AiRequest): Flow<AiChunk> = emptyFlow()
+            override suspend fun runAgent(request: AiRequest, tools: List<AiToolSpec>, budget: AiBudget, invoke: suspend (AiToolCall) -> AiToolOutcome): Result<AiAgentResult> =
+                Result.failure(UnsupportedOperationException())
+            override fun capabilities(): Set<String> = setOf(AiGatewayAPI.CAPABILITY_PROVIDER_OVERRIDE)
+            override fun activeModel(): AiModelInfo? = AiModelInfo("ANTHROPIC", "Anthropic", "claude-haiku")
+            override fun availableModels(): List<ai.rever.boss.plugin.api.AiProviderModels> = listOf(
+                ai.rever.boss.plugin.api.AiProviderModels("OPENROUTER", "OpenRouter", listOf(ai.rever.boss.plugin.api.AiAvailableModel("claude-haiku", "Haiku via OpenRouter"))),
+                ai.rever.boss.plugin.api.AiProviderModels("ANTHROPIC", "Anthropic", listOf(ai.rever.boss.plugin.api.AiAvailableModel("claude-haiku", "Haiku"))),
+            )
+        }
+        val runner = HeadlessRunner(tools, { api }, { null }, tabs = { listOf(tab("t1")) }, activeTabId = { "t1" })
+        val byDefault = runner.execute(instruction, null, 3, null).getOrThrow()
+        assertEquals("Haiku", byDefault.modelLabel)
+        assertEquals(RunStatus.DONE, byDefault.status)
+        val err = runner.execute(instruction, null, 3, "claude-haiku").exceptionOrNull()!!.message!!
+        assertTrue(err.contains("CHAT:OPENROUTER:claude-haiku") && err.contains("CHAT:ANTHROPIC:claude-haiku"), err)
+        assertEquals(RunStatus.DONE, runner.execute(instruction, null, 3, "CHAT:ANTHROPIC:claude-haiku").getOrThrow().status)
+    }
+
+    @Test
+    fun `the mcp transcript keeps the shape agents parse`() = runTest {
+        val tools = FakeTools { _, call -> if (call == 0) Triple("Open 'Sign in' link", 0.9, null) else Triple("The task is complete", 0.9, null) }
+        val t = LlmrpaMcpToolProvider.transcript(TaskRunner(tools, JevDecider(tools, JEV), "t1", instruction) { Answer.Stop }.run())
+        assertEquals(setOf("status", "summary", "model", "model_calls", "cost_usd", "steps"), t.keys)
+        val step = (t["steps"] as kotlinx.serialization.json.JsonArray).single() as kotlinx.serialization.json.JsonObject
+        assertEquals(setOf("step", "action", "confidence", "result"), step.keys)
+        assertEquals("ok", (step["result"] as JsonPrimitive).content)
+    }
+
     private fun tab(id: String, title: String = "Shop") = ActiveTabData(id, "fluck", title, "w", "Work", "p", "win", url = "https://shop.example/$id")
 
     private fun component(tools: ToolInvoker, locks: TabLocks = TabLocks()) =
-        LlmrpaComponent(DefaultComponentContext(LifecycleRegistry()), LlmrpaInfo, tabs(listOf(tab("t1"))), { null }, tools = tools, tabLocks = locks, io = Dispatchers.Main)
+        LlmrpaComponent(DefaultComponentContext(LifecycleRegistry()), LlmrpaInfo, tabs(listOf(tab("t1"))), { null }, tools = tools, llmProvider = { null }, tabLocks = locks, io = Dispatchers.Main)
 
     private fun withMain(block: () -> Unit) {
         Dispatchers.setMain(UnconfinedTestDispatcher())

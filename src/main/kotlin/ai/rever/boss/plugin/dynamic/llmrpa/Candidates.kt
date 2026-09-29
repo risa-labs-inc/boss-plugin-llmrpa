@@ -65,8 +65,11 @@ data class Candidate(
 
     val needsValue: Boolean get() = kind == Kind.TYPE
 
-    /** Whether this action could commit something on the page and so deserves a risk check. */
-    val canCommit: Boolean get() = kind == Kind.CLICK || kind == Kind.KEY
+    /**
+     * Whether this action could commit something on the page and so deserves a risk check. A select
+     * counts when its label says so: some sites submit on change.
+     */
+    val canCommit: Boolean get() = kind == Kind.CLICK || kind == Kind.KEY || (kind == Kind.SELECT && Candidates.soundsCommitting(this))
 }
 
 data class StepAction(val type: String, val selector: SelectorInfo? = null, val value: String? = null)
@@ -115,7 +118,7 @@ internal object Candidates {
             out += Candidate(next(), Candidate.Kind.NAVIGATE, "Go to $u", StepAction("navigate", value = u))
         }
         for (el in page.elements) {
-            if (out.size >= MAX) break
+            if (out.size >= MAX - 1) break
             val label = el.label ?: continue
             val quotedLabel = "'${label.take(60)}'"
             // An image (or a link wrapping one) can be saved; RPA Engine's download action fetches it.
@@ -144,8 +147,9 @@ internal object Candidates {
                 else -> out += Candidate(next(), Candidate.Kind.CLICK, "Click $quotedLabel ${roleNoun(el)}".trimEnd(), StepAction("click", el.selector), el)
             }
         }
-        out += Candidate(next(), Candidate.Kind.KEY, "Press Enter", StepAction("keypress", value = "Enter"))
-        return out.take(MAX) +
+        // After the cut, so a page with hundreds of links still offers Enter after typing a search.
+        return out.take(MAX - 1) +
+            Candidate(next(), Candidate.Kind.KEY, "Press Enter", StepAction("keypress", value = "Enter")) +
             Candidate(DONE, Candidate.Kind.DONE, "The task is complete") +
             Candidate(STUCK, Candidate.Kind.STUCK, "None of these moves the task forward")
     }

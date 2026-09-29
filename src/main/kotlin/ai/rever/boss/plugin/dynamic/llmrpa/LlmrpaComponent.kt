@@ -53,8 +53,9 @@ class LlmrpaComponent(
     private val settingsProvider: SettingsProvider? = null,
     private val windowId: String? = null,
     /** Other plugins' MCP tools: RPA Engine acts and Jev decides. */
-    internal val tools: ToolInvoker = RegistryToolInvoker { null },
-    private val llmProvider: () -> LlmProvider? = { null },
+    // No defaults, like aiGateway: a forgotten one would look exactly like "not installed".
+    internal val tools: ToolInvoker,
+    private val llmProvider: () -> LlmProvider?,
     /** Shared with `llmrpa_execute`, so a panel run and a headless one never drive the same tab. */
     private val tabLocks: TabLocks = TabLocks(),
     /** Where catalog reads run; tests pass the test Main so the model list lands synchronously. */
@@ -213,6 +214,8 @@ class LlmrpaComponent(
             return "No AI provider is configured"
         }
 
+        draftProblem()?.let { _errorMessage.value = it; return it }
+
         // Last, and with compareAndSet rather than a check then a set: llmrpa_run also calls this
         // and the MCP handler thread is not guaranteed to be the UI thread, so two calls could both
         // pass a plain check, lose one history append, resolve the same index and race on
@@ -312,6 +315,14 @@ class LlmrpaComponent(
         }
         // Started: nothing to report.
         return null
+    }
+
+    /** Why Draft steps cannot use the selected model, or null. It never falls back to another one. */
+    fun draftProblem(): String? {
+        val m = _selectedModel.value ?: return null
+        if (m.kind != ModelOption.Kind.CHAT) return LlmApiClient.DRAFT_NEEDS_CHAT
+        val api = runCatching { aiGateway() }.getOrNull() ?: return null
+        return ChatDecider.routingProblem(api, m)
     }
 
     private fun updateExecutionStatus(

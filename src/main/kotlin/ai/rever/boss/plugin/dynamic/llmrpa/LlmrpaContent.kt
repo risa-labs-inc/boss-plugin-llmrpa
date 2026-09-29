@@ -278,6 +278,7 @@ private fun Compose(
 ) {
     val values = remember(instruction) { Candidates.values(instruction) }
     val decision = model?.kind == ModelOption.Kind.DECISION
+    val hasTab = component.selectedTab.collectAsState().value != null
     Column(
         Modifier.fillMaxWidth().widthIn(max = PaneMaxWidth).padding(12.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
@@ -308,13 +309,13 @@ private fun Compose(
                 BossPrimaryButton("Run", onClick = { component.startRun() }, modifier = center.height(34.dp),
                     enabled = instruction.isNotBlank() && blocker == null, icon = Icons.Outlined.PlayArrow)
                 OutlineButton(if (drafting) "Drafting…" else "Draft steps", { component.generateActions() }, center,
-                    enabled = instruction.isNotBlank() && !drafting && component.aiAvailable() && blocker != LlmrpaComponent.Blocker.TAB)
+                    enabled = instruction.isNotBlank() && !drafting && component.aiAvailable() && hasTab && model?.kind != ModelOption.Kind.DECISION)
                 Box(center) { StepLimit(component, maxSteps, enabled = true) }
             }
         }
         if (!active && blocker != null && instruction.isNotBlank()) Notice(blocker.detail, Tone.WARNING)
         errorMessage?.let { Notice(it, Tone.ERROR, onDismiss = component::clearError) }
-        draftPath?.let { Notice("Draft saved for RPA Engine as ${it.substringAfterLast('/')}. Load it there to run the whole plan.", Tone.SUCCESS) }
+        draftPath?.let { Notice("Draft saved for RPA Engine as ${java.io.File(it).name}. Load it there to run the whole plan.", Tone.SUCCESS) }
         if (!collapsed && model != null) {
             val where = if (decision) "OpenRouter" else model.providerName
             Text("Each step sends element labels, the page address and your instruction to $where. Never field values or passwords.",

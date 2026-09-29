@@ -31,7 +31,7 @@ internal class LlmrpaMcpToolProvider(
             name = "llmrpa_execute",
             description =
                 "Do a browser task from a plain-language instruction, one step at a time, on an open tab. It acts in the user's " +
-                    "real, logged-in browser session, as them. " +
+                    "real, logged-in browser session, as them, and can open any web address the instruction contains. " +
                     "A model (Jev by default, or any configured chat model) picks each step and RPA Engine performs it. " +
                     "Stops instead of guessing when the model is unsure or the next action looks irreversible, and returns " +
                     "the steps taken. Put any text to type in quotes in the instruction. Each step is a paid model call.",

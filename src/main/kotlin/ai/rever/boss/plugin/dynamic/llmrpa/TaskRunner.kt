@@ -67,6 +67,8 @@ data class RunLimits(
     val askBelow: Double = 0.6,
     /** At or above this risk the runner asks for confirmation. */
     val confirmAbove: Double = 0.5,
+    /** Below this, the done check says the page does not show the task complete. */
+    val doneAbove: Double = 0.5,
     val maxConsecutiveFailures: Int = 2,
 )
 
@@ -148,18 +150,20 @@ class TaskRunner(
             }
 
             if (chosen.kind == Candidate.Kind.DONE) {
+                val n = _state.value.steps.size
+                val steps = "$n ${if (n == 1) "step" else "steps"}"
+                // The person said so; the model does not get to overrule them.
+                if (chosenBy == StepRecord.ChosenBy.USER) return finish(RunStatus.DONE, "Done in $steps. You said the task is complete.")
                 // A model can claim success on the wrong page. Check once, with the page named.
-                val verified = decider.verifyDone(ctx).getOrNull()?.also { (_, cost) ->
+                val check = decider.verifyDone(ctx)
+                val verified = check.getOrNull()?.also { (_, cost) ->
                     _state.update { it.copy(calls = it.calls + 1, costUsd = it.costUsd + cost) }
                 }?.first
-                if (verified == null || verified >= limits.confirmAbove || doneRejected) {
-                    val sure = verified ?: decision.confidence
-                    val n = _state.value.steps.size
-                    return finish(
-                        if (verified != null && verified < limits.confirmAbove) RunStatus.STOPPED else RunStatus.DONE,
-                        if (verified != null && verified < limits.confirmAbove) "Stopped: the model says the task is done, but the page ('${page.title}') does not look like it."
-                        else "Done in $n ${if (n == 1) "step" else "steps"}. ${pct(sure)} sure the task is complete.",
-                    )
+                    // Fails closed like the risk check: an unchecked done is not reported as done.
+                    ?: return finish(RunStatus.STOPPED, "Stopped: could not confirm the task is complete (${check.exceptionOrNull()?.message}). Check the page.")
+                if (verified >= limits.doneAbove) return finish(RunStatus.DONE, "Done in $steps. ${pct(verified)} sure the task is complete.")
+                if (doneRejected) {
+                    return finish(RunStatus.STOPPED, "Stopped: the model says the task is done, but the page ('${page.title}') does not look like it.")
                 }
                 doneRejected = true
                 history += "Checked whether the task is complete: not yet (the page is '${page.title.take(80)}')"
@@ -227,7 +231,10 @@ class TaskRunner(
         return PageSnapshot.parse(reply.json!!)
     }
 
-    private suspend fun act(action: StepAction, allowSensitive: Boolean): Triple<Boolean, String?, Boolean> {
+    /** What one `rpa_step` did. [detail] is the error on failure, or a note such as the saved file. */
+    private data class StepResult(val ok: Boolean, val detail: String?, val navigated: Boolean)
+
+    private suspend fun act(action: StepAction, allowSensitive: Boolean): StepResult {
         val reply = tools.invoke(ToolNames.STEP, buildJsonObject {
             put("tab_id", tabId)
             // RPA Engine refuses typing into a sensitive field without this; older engines ignore it.
@@ -238,13 +245,13 @@ class TaskRunner(
                 action.value?.let { put("value", it) }
             }
         })
-        if (reply.isError) return Triple(false, reply.errorMessage, false)
+        if (reply.isError) return StepResult(false, reply.errorMessage, false)
         val ok = (reply.json?.get("ok") as? JsonPrimitive)?.booleanOrNull ?: false
         val navigated = (reply.json?.get("navigated") as? JsonPrimitive)?.booleanOrNull ?: false
         val error = (reply.json?.get("error") as? JsonPrimitive)?.takeIf { it.isString }?.content
         // A download names the file it saved; the timeline shows it as the step's detail.
         val saved = ((reply.json?.get("download") as? JsonObject)?.get("file") as? JsonPrimitive)?.content
-        return Triple(ok, if (ok) saved?.let { "Saved $it" } else error, navigated)
+        return StepResult(ok, if (ok) saved?.let { "Saved $it" } else error, navigated)
     }
 
     private suspend fun waitFor(q: PendingQuestion): Answer {
@@ -277,7 +284,8 @@ class TaskRunner(
         class Asker {
             // Atomic: ask and answer run on Main today, but answer is public and Stop may come from elsewhere.
             private val pending = AtomicReference<CompletableDeferred<Answer>?>(null)
-            suspend fun ask(q: PendingQuestion): Answer = CompletableDeferred<Answer>().also { pending.set(it) }.await()
+            suspend fun ask(q: PendingQuestion): Answer =
+                CompletableDeferred<Answer>().also { pending.getAndSet(it)?.complete(Answer.Stop) }.await()
             fun answer(a: Answer) { pending.getAndSet(null)?.complete(a) }
         }
     }

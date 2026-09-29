@@ -57,12 +57,18 @@ class HeadlessRunner(
             ?: return Result.failure(IllegalArgumentException("No browser tab with id $wanted. Open browser tabs: ${describe(browserTabs)}"))
         // On IO: catalog calls into other plugins can read settings or secrets.
         val models = withContext(Dispatchers.IO) { ModelDirectory(tools, llmProvider, gateway).load() }.flatMap { it.models }
-        val option = when {
-            model == null -> models.firstOrNull { it.kind == ModelOption.Kind.DECISION } ?: models.firstOrNull()
-            else -> models.firstOrNull { it.modelId == model || it.key == model }
+        val option = when (model) {
+            // Jev, else the model selected in Settings: never just whichever provider the catalog lists first.
+            null -> models.firstOrNull { it.kind == ModelOption.Kind.DECISION } ?: activeChat(models)
+            else -> models.firstOrNull { it.key == model } ?: models.filter { it.modelId == model }.let { same ->
+                if (same.size > 1) {
+                    return Result.failure(IllegalArgumentException("'$model' is offered by more than one provider. Pass one of: ${same.joinToString { it.key }}"))
+                }
+                same.singleOrNull()
+            }
         } ?: return Result.failure(
             IllegalArgumentException(
-                if (model == null) "No model is available. Install Jev or add a provider in Settings → AI Providers."
+                if (model == null) "No model is available. Install Jev, pick a model in Settings → AI Providers, or pass model."
                 else "Unknown model '$model'. Available: ${models.take(25).joinToString { it.modelId }}${if (models.size > 25) ", …" else ""}",
             ),
         )
@@ -74,6 +80,12 @@ class HeadlessRunner(
         } finally {
             locks.release(tab.tabId)
         }
+    }
+
+    private fun activeChat(models: List<ModelOption>): ModelOption? {
+        val active = runCatching { gateway()?.activeModel() }.getOrNull() ?: return null
+        return models.firstOrNull { it.kind == ModelOption.Kind.CHAT && it.providerId == active.providerId && it.modelId == active.modelId }
+            ?: ModelOption(ModelOption.Kind.CHAT, active.providerId, active.providerName, active.modelId)
     }
 
     companion object {

@@ -38,16 +38,19 @@ class LlmApiClient(
         val api = gateway() ?: return createUnconfiguredResponse(request)
         if (api.activeModel() == null) return createUnconfiguredResponse(request)
 
+        // The model picked in the panel, or none. Never a silent fallback to the active model:
+        // the draft would then come from a model the user did not choose.
+        val extras = when {
+            model == null -> emptyMap()
+            model.kind != ModelOption.Kind.CHAT -> return errorResponse(DRAFT_NEEDS_CHAT)
+            else -> ChatDecider.routingProblem(api, model)?.let { return errorResponse(it) } ?: ChatDecider.routingExtras(model)
+        }
         return api
             .complete(
                 AiRequest(
                     system = SYSTEM_PROMPT,
                     messages = listOf(AiMessage.user(buildPrompt(request))),
-                    // A chat model picked in the panel; a gateway without per-request selection
-                    // ignores these and uses the active provider.
-                    extras = model?.takeIf { it.kind == ModelOption.Kind.CHAT && ChatDecider.routingProblem(api, it) == null }
-                        ?.let(ChatDecider::routingExtras)
-                        .orEmpty(),
+                    extras = extras,
                 ),
             ).fold(
                 onSuccess = { reply -> parseReply(reply.text) },
@@ -62,6 +65,8 @@ class LlmApiClient(
                 },
             )
     }
+
+    private fun errorResponse(message: String) = LLMRpaResponse(configuration = emptyList(), status = "error", message = message)
 
     /**
      * Build the generation prompt.
@@ -159,6 +164,8 @@ Provide only the JSON response without additional text.
     companion object {
         /** Status of the placeholder response served when no provider is configured. */
         internal const val STATUS_EXAMPLE = "example"
+
+        const val DRAFT_NEEDS_CHAT = "Draft steps needs a chat model: Jev only picks among the actions on a page. Pick a chat model to draft."
 
         private val json =
             Json {

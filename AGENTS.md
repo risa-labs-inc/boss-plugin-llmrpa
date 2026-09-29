@@ -351,3 +351,10 @@ Found by running, not reviewing:
   sensitive fields (older engines ignore unknown arguments).
 - The floor is **1.0.91**: `CAPABILITY_PROVIDER_OVERRIDE` / `EXTRAS_KEY_PROVIDER_ID` routing
   arrived there, `availableModels()` in 1.0.89. Nothing from 1.0.92–1.0.93 is used.
+- **A done check that cannot run stops the run** rather than reporting DONE, and a person who
+  picks "The task is complete" is not overruled by it. Its threshold is `doneAbove`, not the risk one.
+- **"Press Enter" survives the 150-candidate cap.** It was appended before the cut, so any page
+  with ~150 links lost it and "type a search, press Enter" could not be expressed.
+- **Draft steps never falls back to the active model.** Jev or an unroutable chat model is refused
+  with the reason, the same rule `routingProblem` applies to Run.
+- `LlmrpaComponent`'s `tools` and `llmProvider` have no defaults, for the reason `aiGateway` has none.
