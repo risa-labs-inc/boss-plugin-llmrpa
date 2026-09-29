@@ -8,7 +8,7 @@ AI-powered robotic process automation with LLM integration
 
 - **Plugin ID**: `ai.rever.boss.plugin.dynamic.llmrpa`
 - **Main Class**: `ai.rever.boss.plugin.dynamic.llmrpa.LlmrpaDynamicPlugin`
-- **API Version**: 1.0.20 · **minApiVersion**: 1.0.75 · **minBossVersion**: 9.2.63
+- **apiVersion**: 1.0.93 · **minApiVersion**: 1.0.91 · **minBossVersion**: 9.2.63
 
 ## AI: this plugin owns no credentials and no wire formats
 
@@ -44,7 +44,7 @@ Three things to keep right:
   provider the user has since changed or removed.
 
 There are no wire formats here any more, so the `else`-branch rule that used to matter is the
-gateway's problem. The api floor is **1.0.75** (the manifest is the source of truth).
+gateway's problem. The api floor is **1.0.91** (the manifest is the source of truth).
 
 ### The gateway is an *optional* declared dependency
 
@@ -309,3 +309,79 @@ host's install-time dependency check reads. Anchored on the top-level two-space 
 - `EngineAction.meta` is never omitted, so a stricter reader on the other side cannot break on a
   missing key. The durable half of that is in rpaengine, which now defaults `selector` and has a test
   decoding the shapes this writer produces.
+
+## Live runs (1.3)
+
+`TaskRunner` is the observe → decide → act loop. It never touches the browser: RPA Engine's
+`rpa_observe` / `rpa_step` do, reached through `PluginContext.mcpToolRegistry` (`RegistryToolInvoker`,
+guarded, because the registry is absent on older hosts and throws across the boundary). Jev is
+reached the same way (`jev_decide`); chat models through the gateway with
+`AiRequest.EXTRAS_KEY_PROVIDER_ID` / `EXTRAS_KEY_MODEL_OVERRIDE`, only when the gateway advertises
+`CAPABILITY_PROVIDER_OVERRIDE` - otherwise it would silently answer with the active model and the
+timeline would name the wrong one.
+
+Found by running, not reviewing:
+- **An autocomplete box reports role `combobox`.** Wikipedia's search upgrades itself a moment after
+  load; keying "Type into" on textbox/searchbox only offered it when the page was observed early.
+  `Candidates.isTextField` covers a text `input` with role combobox and no options.
+- **A model will claim success on the wrong page.** Haiku said "done, 95%" on an empty search
+  results page. A pick of done is verified once against the page title and address
+  (`verifyDone`); a rejected done continues, a second contradicted one stops the run.
+- **Pages rebuild widgets on load.** The runner waits after a step (longer after navigation) before
+  the next observation; tests zero `NAV_SETTLE_MS` / `STEP_SETTLE_MS`.
+- The history each decision sees ends every step with the page it led to ("→ now on '…'").
+
+`PanelRenderTest` renders the real panel through the fakes at 280/360/520 and two-pane widths into
+`build/reports/visual/`; look at them after UI changes.
+
+### Review round (1.3)
+
+- **The irreversible check fails closed.** A chat model that leaves out `"irreversible"`, or a
+  `jev_decide` risk call that fails, used to let a Submit through unasked. An unknown risk now asks
+  (and stops a headless run); `Candidates.soundsCommitting` only labels it. `decision.risk` and
+  `decision.value` describe the model's pick, so a person-picked alternative is re-assessed.
+- **`TaskRunner.run()` never throws except on cancellation.** A `NoSuchMethodError` from the
+  gateway used to reach `finally`, which wrote "Stopped by you". Deciders wrap their bodies in
+  `guarded`; `JevDecider` names the missing reply path instead of a bare `!!` NPE.
+- **One run per tab, plugin-wide** (`TabLocks`), across the panel and `llmrpa_execute`.
+- **`llmrpa_execute` never picks an arbitrary tab.** It uses the focused tab (`activePanelId` +
+  `selectedTabId`) or requires `tab_id` and lists the open ones.
+- **A sensitive field only takes text from the instruction.** A chat-written value is refused;
+  a value from the instruction is sent with `allow_sensitive: true`, which RPA Engine requires for
+  sensitive fields (older engines ignore unknown arguments).
+- The floor is **1.0.91**: `CAPABILITY_PROVIDER_OVERRIDE` / `EXTRAS_KEY_PROVIDER_ID` routing
+  arrived there, `availableModels()` in 1.0.89. Nothing from 1.0.92–1.0.93 is used.
+- **A done check that cannot run stops the run** rather than reporting DONE, and a person who
+  picks "The task is complete" is not overruled by it. Its threshold is `doneAbove`, not the risk one.
+- **"Press Enter" survives the 150-candidate cap.** It was appended before the cut, so any page
+  with ~150 links lost it and "type a search, press Enter" could not be expressed.
+- **Draft steps never falls back to the active model.** Jev or an unroutable chat model is refused
+  with the reason, the same rule `routingProblem` applies to Run.
+- `LlmrpaComponent`'s `tools` and `llmProvider` have no defaults, for the reason `aiGateway` has none.
+- **The commit-word check only raises a chat model's risk.** The model grades its own pick from
+  page text, so a misleading page could talk it into `irreversible:false` on a Delete. A person's
+  pick with a harmless label is not confirmed a second time.
+- **The panel's tab follows the focused one** until the person picks a tab; `first()` is only the
+  fallback when the host cannot say. `llmrpa_execute` is bounded at 10 minutes.
+- RPA Engine (`>=1.3.0`) and Jev are declared optional dependencies, for the same unload guard as
+  the gateway. `TabLocks` has no default anywhere: a forgotten one splits the panel from headless.
+- With nothing installed, the empty model reload backs off to 32 s instead of every 2 s.
+- **A private field's text is masked** (`Type •••••• into 'Password'`) in the timeline, the
+  history sent to the model, and the transcript. Only `rpa_step` gets the real value.
+- **Downloads are not risk-checked, deliberately.** RPA Engine's `download` saves an image into
+  Downloads and commits nothing on the site; the other commit rules stay on CLICK, KEY and
+  committing SELECTs.
+- The run loop runs on `Dispatchers.Default` (each step parses the page and builds candidates);
+  settle times live in `RunLimits`, not in mutable statics.
+- **Enter is judged by the field it lands in.** "Press Enter" alone names nothing, so the risk check
+  sees "Press Enter in '<last typed field>'", and Enter after text the model wrote always asks. The
+  field is kept until the page navigates: focus stays in it across a harmless click.
+- **A "Go to" address that sounds committing is risk-checked** (unsubscribe, confirm, approve links
+  act on a GET). A chat done check that says complete without a confidence cannot confirm the task.
+- A step cut off by Stop or the time limit is marked failed ("may or may not have happened"),
+  never left reading as running in the timeline or transcript.
+- **Chat models are asked for runners-up** (`alternatives`), so an unsure or stuck chat pick offers
+  choices. A missing `confidence` reads as 0.5, below `askBelow`: that asks, deliberately.
+- **`waitFor` starts `ask` before publishing the question** (`async(UNDISPATCHED)`), so an answer
+  the instant the buttons appear is not dropped. The test answers from an Unconfined watcher.
+- `TabLocks` records who holds a tab, so a refusal can say the panel may be waiting for an answer.

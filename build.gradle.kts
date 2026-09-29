@@ -8,7 +8,7 @@ plugins {
 }
 
 group = "ai.rever.boss.plugin.dynamic"
-version = "1.2.1"
+version = "1.3.0"
 
 java {
     toolchain {
@@ -106,7 +106,11 @@ dependencies {
         }
     )
     testRuntimeOnly("org.slf4j:slf4j-simple:2.0.17")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
 }
+
+// The render test draws with Skia offscreen; no display needed.
+tasks.withType<Test>().configureEach { systemProperty("java.awt.headless", "true") }
 
 // Task to build plugin JAR with compiled classes only
 tasks.register<Jar>("buildPluginJar") {
@@ -130,6 +134,9 @@ tasks.register<Jar>("buildPluginJar") {
 
 // Sync version from build.gradle.kts into plugin.json (single source of truth)
 tasks.processResources {
+    // Without this the task stays UP-TO-DATE across a version bump, so a local build ships the
+    // previous version in its manifest.
+    inputs.property("pluginVersion", version)
     filesMatching("**/plugin.json") {
         // Anchored to the top-level key's two-space indent. The filter is per-line and used to be
         // unanchored, so it also rewrote the *dependency's* constraint: the shipped manifest
