@@ -93,6 +93,8 @@ internal object Candidates {
     private val quoted = listOf(
         Regex("\"([^\"]{1,200})\""),
         Regex("“([^”]{1,200})”"),
+        // macOS smart quotes turn 'x' into ‘x’.
+        Regex("‘([^’]{1,200})’"),
         Regex("""(?<!\w)'([^']{1,200})'(?!\w)"""),
     )
     private val email = Regex("""[\w.+-]+@[\w-]+(\.[\w-]+)+""")
@@ -111,9 +113,146 @@ internal object Candidates {
         return found.toList().take(20)
     }
 
+    private val quotedAll = listOf(Regex("\"([^\"]+)\""), Regex("“([^”]+)”"), Regex("‘([^’]+)’"), Regex("""(?<!\w)'([^']+)'(?!\w)"""))
+
+    /**
+     * Every quoted phrase, email and address in the instruction, uncapped: what must not leave in a
+     * search or a model-chosen address. [values] is capped for the list a model types from.
+     */
+    fun scrubbable(instruction: String): List<String> {
+        val found = LinkedHashSet<String>()
+        quotedAll.forEach { re -> re.findAll(instruction).forEach { m -> m.groupValues[1].trim().takeIf { it.isNotEmpty() }?.let(found::add) } }
+        email.findAll(instruction).forEach { found += it.value }
+        url.findAll(instruction).forEach { found += it.value.trimEnd('.', ',', ')') }
+        return found.toList()
+    }
+
+    private val SECRET_AFTER = Regex(
+        """\b(?:passwords?|passcode|passwd|pwd|pin|otp|token|secret|ssn|cvv|cvc|card(?: number)?|account(?: number)?|api key|user ?name)\b(?:\s*(?:is\b|=|:))?\s*("[^"]*"|“[^”]*”|‘[^’]*’|'[^']*'|[^\s,;]+)(?:(?:\s+[^\s,;:=]+){0,3}?\s*(?:\bis\b|=|:)\s*("[^"]*"|“[^”]*”|‘[^’]*’|'[^']*'|[^\s,;]+))?""",
+        RegexOption.IGNORE_CASE,
+    )
+
+    /**
+     * The unquoted word after a secret-sounding keyword ("password hunter2", "pin: 1234"), and the
+     * one after an "is", "=" or ":" a few words on ("password for github is hunter2"), with the match. Crude, and it over-cuts ("pin the tab"), which only costs a search some words.
+     */
+    fun keywordSecrets(instruction: String): List<String> =
+        SECRET_AFTER.findAll(instruction).flatMap { listOf(it.value, it.groupValues[1], it.groupValues[2]) }.filter { it.isNotEmpty() }.distinct().toList()
+
+    // Narrower than SECRET_AFTER: a username is fine in a username box, a password is not.
+    private val PRIVATE_AFTER = Regex(
+        """\b(?:passwords?|passcode|passwd|pwd|pin|otp|token|secret|ssn|cvv|cvc|card number|account number|api key)\b(?:\s*(?:is\b|=|:))?\s*("[^"]*"|“[^”]*”|‘[^’]*’|'[^']*'|[^\s,;]+)(?:(?:\s+[^\s,;:=]+){0,3}?\s*(?:\bis\b|=|:)\s*("[^"]*"|“[^”]*”|‘[^’]*’|'[^']*'|[^\s,;]+))?""",
+        RegexOption.IGNORE_CASE,
+    )
+
+    /**
+     * Whether [value] is the word after a password-like keyword, quoted or bare: text only a private
+     * field or the person may place, and masked wherever it is shown.
+     */
+    fun isKeywordSecret(instruction: String, value: String): Boolean =
+        PRIVATE_AFTER.findAll(instruction).any { m -> m.groupValues.drop(1).any { it.isNotEmpty() && it.trim('"', '\'', '“', '”', '‘', '’') == value } }
+
+    /**
+     * [instruction] with each secret keyword and its word, then its values ([scrubbable]), replaced
+     * by [with]. Keywords go in one regex pass, so a username that prefixes the password cannot
+     * shield it; values go longest first and only as whole words, so "cat" leaves "category" alone.
+     */
+    fun scrub(instruction: String, with: String): String {
+        // Keywords first, on the untouched text, so a quoted secret goes with its quotes.
+        var text = SECRET_AFTER.replace(instruction, Regex.escapeReplacement(with))
+        scrubbable(instruction).sortedByDescending { it.length }.forEach { v ->
+            text = text.replace(Regex("(?<![\\p{L}\\p{N}])${Regex.escape(v)}(?![\\p{L}\\p{N}])"), Regex.escapeReplacement(with))
+        }
+        return text
+    }
+
+    /** Quoted phrases alone: text meant to be typed, not a place to go. */
+    fun quotedPhrases(instruction: String): List<String> =
+        quotedAll.flatMap { re -> re.findAll(instruction).map { it.groupValues[1] }.toList() }
+
     fun urls(instruction: String): List<String> = url.findAll(instruction).map { it.value.trimEnd('.', ',', ')') }.distinct().toList()
 
-    fun build(page: PageSnapshot, instruction: String): List<Candidate> {
+    private const val MAX_PHRASES = 8
+    private const val MAX_PHRASE_WORDS = 4
+
+    // A span may not start or end on one of these: they say what to do, not what to type.
+    private val STOP_WORDS = setOf(
+        "a", "an", "the", "and", "or", "but", "of", "on", "in", "at", "to", "into", "onto", "for", "from", "by", "with",
+        "about", "as", "is", "are", "be", "it", "its", "this", "that", "these", "those", "there", "here", "then", "than",
+        "so", "if", "when", "where", "what", "which", "who", "how", "i", "me", "my", "we", "us", "our", "you", "your",
+        "please", "can", "could", "would", "should", "will", "must", "want", "need", "let", "just", "now", "up", "down",
+        "log", "login", "logout", "sign", "signin", "open", "go", "goto", "visit", "navigate", "follow", "link", "links", "click", "press", "tap", "type", "enter",
+        "search", "find", "look", "show", "get", "till", "until", "reach", "arrive", "keep", "start", "stop", "use",
+        "page", "pages", "home", "homepage", "site", "website", "tab", "result", "results", "first", "next", "select",
+        "choose", "pick", "download", "save", "image", "picture", "article",
+        "let's", "don't", "doesn't", "didn't", "can't", "won't", "isn't", "it's", "that's", "i'm", "i'd", "i'll", "you're",
+    )
+    private val SITE_SUFFIX = Regex("""^(home ?page|homepage|website|site|main page)\b""", RegexOption.IGNORE_CASE)
+    private val word = Regex("""[\p{L}\p{N}][\p{L}\p{N}'’-]*""")
+
+    /**
+     * Words from the instruction that could be typed when nothing is quoted: contiguous spans of up
+     * to four words, never starting or ending on a stop or task word or on the site's name (a word
+     * before "home page", X in "search X for", or a label of [addresses]' hosts or the instruction's own). Quoted
+     * text, emails and addresses are left out (they are [values] already), and so is [keywordSecrets].
+     * Spans with no inner stop word first, then longest; capped.
+     */
+    fun phrases(instruction: String, addresses: List<String> = emptyList()): List<String> {
+        // The word after "password" and the like goes too: before 1.4 unquoted text was never typed.
+        val text = scrub(instruction, " , ")
+        val sites = (addresses + urls(instruction)).flatMap { hostLabels(it) }.toMutableSet()
+        // Clauses break on punctuation, so a span never runs across "page, then".
+        // ’ between letters is an apostrophe (macOS "Let’s"), not a quote.
+        val clauses = text.split(Regex("""[.,;:!?()\[\]{}"“”‘]|(?<!\p{L})’|’(?!\p{L})|\s'|'\s""")).map { c -> word.findAll(c).map { it.value }.toList() }
+        clauses.forEach { words ->
+            words.forEachIndexed { i, w ->
+                if (i + 1 < words.size && SITE_SUFFIX.containsMatchIn(words.drop(i + 1).joinToString(" "))) sites += w.lowercase()
+                // "search google for cats": the word between is where, not what.
+                if (i in 1 until words.lastIndex && words[i - 1].equals("search", true) && words[i + 1].equals("for", true)) sites += w.lowercase()
+            }
+        }
+        val found = mutableListOf<Pair<String, Int>>()
+        clauses.forEach { words ->
+            for (start in words.indices) for (len in 1..MAX_PHRASE_WORDS) {
+                val span = words.subList(start, (start + len).coerceAtMost(words.size)).takeIf { it.size == len } ?: break
+                val edge = listOf(span.first(), span.last()).map { it.lowercase().replace('’', '\'') }
+                if (edge.any { it in STOP_WORDS || it in sites }) continue
+                if (len == 1 && span[0].length < 2) continue
+                found += span.joinToString(" ") to len
+            }
+        }
+        // Spans with no inner stop word first ("cats" over "google for cats"), then longest. The sort
+        // is stable, so ties keep the instruction's order.
+        fun clean(p: String) = p.split(' ').none { it.lowercase().replace('’', '\'') in STOP_WORDS }
+        return found.sortedWith(compareByDescending<Pair<String, Int>> { clean(it.first) }.thenByDescending { it.second })
+            .map { it.first }.distinctBy { it.lowercase() }.take(MAX_PHRASES)
+    }
+
+    /** The name-like labels of [address]'s host: `en.wikipedia.org` gives `wikipedia` (and `en`). */
+    private fun hostLabels(address: String): List<String> {
+        val host = runCatching { java.net.URI(address.trim()).host }.getOrNull()?.lowercase() ?: return emptyList()
+        return host.split('.').dropLast(1).filter { it != "www" }
+    }
+
+    private val SEARCH_WORD = Regex("""\bsearch\b""", RegexOption.IGNORE_CASE)
+
+    /**
+     * A field whose Enter runs a search rather than posting what was typed. By label only for a
+     * plain text field, and as a whole word: "Research notes" is a form field.
+     */
+    fun isSearchField(el: PageElement): Boolean =
+        el.role == "searchbox" || el.type == "search" ||
+            (el.tag != "textarea" && isTextField(el) && el.label?.let { SEARCH_WORD.containsMatchIn(it) } == true)
+
+    /**
+     * [writes] is whether the decider can write text itself (a chat model). A field is offered only
+     * when something can go in it: a private field takes quoted values alone, any other field also
+     * words from the instruction ([phrases]).
+     */
+    fun build(page: PageSnapshot, instruction: String, writes: Boolean, phrases: List<String> = phrases(instruction, listOf(page.url))): List<Candidate> {
+        val quotedValues = values(instruction).isNotEmpty()
+        val canType = writes || quotedValues || phrases.isNotEmpty()
+        val canTypePrivate = writes || quotedValues
         val out = mutableListOf<Candidate>()
         var n = 0
         var firstImage = true
@@ -135,7 +274,7 @@ internal object Candidates {
                 if (el.role == "img") continue
             }
             when {
-                isTextField(el) -> out += Candidate(
+                isTextField(el) -> if (if (el.sensitive) canTypePrivate else canType) out += Candidate(
                     next(), Candidate.Kind.TYPE, "Type into $quotedLabel${if (el.sensitive) " (private field)" else ""}",
                     StepAction("input", el.selector), el,
                 )

@@ -7,6 +7,7 @@ import ai.rever.boss.plugin.api.McpToolResult
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
@@ -30,15 +31,23 @@ internal class LlmrpaMcpToolProvider(
         McpToolDefinition(
             name = "llmrpa_execute",
             description =
-                "Do a browser task from a plain-language instruction, one step at a time, on an open tab. It acts in the user's " +
+                "Do a browser task from a plain-language instruction, one step at a time, on an open tab or a new one. It acts in the user's " +
                     "real, logged-in browser session, as them, and can open any web address the instruction contains. " +
+                    "By default it uses the focused tab. With new_tab: true it opens a new tab in the space on screen at the first " +
+                    "address in the instruction, else one the model picks (https only), else a DuckDuckGo search for the instruction text " +
+                    "with its quoted values, emails and addresses removed; " +
+                    "start_url names that address instead and is opened as given, with no host filtering (as an address in the instruction is). " +
+                    "Only tabs in the space on screen can be driven. " +
                     "A model (Jev by default, or any configured chat model) picks each step and RPA Engine performs it. " +
                     "Stops instead of guessing when the model is unsure or the next action looks irreversible, and returns " +
-                    "the steps taken. Put any text to type in quotes in the instruction. Each step is one to three paid model calls, " +
+                    "the steps taken. Put any text to type in quotes in the instruction; with none quoted, words from the instruction " +
+                    "(e.g. a search term) may be typed into a field that is not private. Each step is one to three paid model calls, " +
                     "and a run stops after 10 minutes.",
             inputSchema = """{"type":"object","additionalProperties":false,"properties":{""" +
                 """"instruction":{"type":"string","description":"The task, e.g. Search for 'wireless keyboard' and open the first result"},""" +
-                """"tab_id":{"type":"string","description":"Browser tab to act on; defaults to the focused tab; required when no tab is focused (the error lists the open ones)"},""" +
+                """"tab_id":{"type":"string","description":"Browser tab to act on; defaults to the focused tab; required when no tab is focused (the error lists the open ones and which can be driven)"},""" +
+                """"new_tab":{"type":"boolean","default":false,"description":"Open the right page in a new tab first instead of using an open tab"},""" +
+                """"start_url":{"type":"string","description":"http(s) address to open in a new tab first; implies new_tab"},""" +
                 """"max_steps":{"type":"integer","minimum":1,"maximum":50,"default":12},""" +
                 """"model":{"type":"string","description":"Model id, e.g. typesafe/jev-1.13 or a chat model id; defaults to Jev"}""" +
                 """},"required":["instruction"]}""",
@@ -51,9 +60,11 @@ internal class LlmrpaMcpToolProvider(
                 val maxSteps = ((root["max_steps"] as? JsonPrimitive)?.intOrNull ?: RunLimits().maxSteps).coerceIn(1, 50)
                 headless.execute(
                     instruction,
-                    (root["tab_id"] as? JsonPrimitive)?.contentOrNull,
+                    (root["tab_id"] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() },
                     maxSteps,
                     (root["model"] as? JsonPrimitive)?.contentOrNull,
+                    newTab = (root["new_tab"] as? JsonPrimitive)?.booleanOrNull ?: false,
+                    startUrl = (root["start_url"] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() },
                 ).fold(
                     onSuccess = { McpToolResult(transcript(it).toString(), isError = it.status == RunStatus.FAILED) },
                     onFailure = { McpToolResult(it.message ?: "Could not run the task", isError = true) },
@@ -122,6 +133,14 @@ internal class LlmrpaMcpToolProvider(
             put("model_calls", state.calls)
             // Chat models report tokens, not money, through the gateway; leave cost out rather than say $0.
             if (state.costUsd > 0) put("cost_usd", state.costUsd)
+            state.opened?.let { o ->
+                put("opened", buildJsonObject {
+                    state.tabId?.let { put("tab_id", it) }
+                    put("url", o.url)
+                    put("chosen_by", o.source.label)
+                    o.note?.let { put("note", it) }
+                })
+            }
             when (val q = state.lastQuestion.takeIf { state.status == RunStatus.STOPPED }) {
                 is PendingQuestion.Choose -> put("stopped_at_question", buildJsonObject {
                     put("reason", q.reason)
@@ -135,6 +154,12 @@ internal class LlmrpaMcpToolProvider(
                     put("action", q.action.description)
                     q.risk?.let { put("risk", it) }
                 })
+                is PendingQuestion.ChooseText -> put("stopped_at_question", buildJsonObject {
+                    put("reason", q.reason)
+                    put("field", q.field)
+                    put("text_options", buildJsonArray { q.options.forEach { add(JsonPrimitive(if (Candidates.isKeywordSecret(state.instruction, it)) "••••••" else it)) } })
+                    put("hint", "Put the text to type in quotes in the instruction, or run it in the LLM RPA panel to choose.")
+                })
                 null -> Unit
             }
             put("steps", buildJsonArray {
@@ -144,6 +169,7 @@ internal class LlmrpaMcpToolProvider(
                         put("action", s.description)
                         put("confidence", s.confidence)
                         put("result", s.outcome.name.lowercase())
+                        s.valueSource?.let { put("text_source", it.name.lowercase()) }
                         s.detail?.let { put(if (s.outcome == StepRecord.Outcome.FAILED) "error" else "detail", it) }
                     })
                 }

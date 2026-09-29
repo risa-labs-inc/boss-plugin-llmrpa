@@ -36,7 +36,7 @@ class TaskRunnerTest {
     @Test
     fun `candidates read as plain sentences and end with done and stuck`() {
         val page = SEARCH_PAGE.copy(elements = SEARCH_PAGE.elements + element("e4", "combobox", "Sort by", tag = "select", options = listOf("Featured", "Price: Low to High")) + element("e5", "button", null))
-        val c = Candidates.build(page, instruction)
+        val c = Candidates.build(page, instruction, writes = false)
         val descriptions = c.map { it.description }
         assertTrue("Type into 'Search shop'" in descriptions)
         assertTrue("Open 'Sign in' link" in descriptions)
@@ -51,7 +51,7 @@ class TaskRunnerTest {
 
     @Test
     fun `jev asks for a value only when something can be typed`() {
-        val ctx = StepContext(instruction, SEARCH_PAGE, Candidates.build(SEARCH_PAGE, instruction), Candidates.values(instruction), emptyList())
+        val ctx = StepContext(instruction, SEARCH_PAGE, Candidates.build(SEARCH_PAGE, instruction, writes = false), Candidates.values(instruction), emptyList())
         val args = JevDecider.decideArgs(ctx, "typesafe/jev-1.13")
         val q = args["questions"]!! as kotlinx.serialization.json.JsonObject
         assertEquals(ctx.candidates.size, (q["next"] as kotlinx.serialization.json.JsonObject)["criteria"].let { (it as kotlinx.serialization.json.JsonObject).size })
@@ -160,7 +160,7 @@ class TaskRunnerTest {
         val box = PageElement("e8", "combobox", "input", "Search Wikipedia", type = "search", selector = SelectorInfo("id", "ooui-php-1"))
         assertTrue(Candidates.isTextField(box))
         val page = SEARCH_PAGE.copy(elements = listOf(box))
-        assertTrue("Type into 'Search Wikipedia'" in Candidates.build(page, instruction).map { it.description })
+        assertTrue("Type into 'Search Wikipedia'" in Candidates.build(page, instruction, writes = false).map { it.description })
         // A real select-like combobox with options is offered as choices instead.
         assertTrue(!Candidates.isTextField(box.copy(options = listOf("a", "b"))))
     }
@@ -185,7 +185,7 @@ class TaskRunnerTest {
     fun `an image can be downloaded and the saved file reaches the timeline and history`() = runTest {
         val cat = element("e9", "link", "Persialainen.jpg").copy(imageSrc = "https://upload.example/cat.jpg")
         val page = SEARCH_PAGE.copy(elements = SEARCH_PAGE.elements + cat)
-        val descriptions = Candidates.build(page, instruction).map { it.description }
+        val descriptions = Candidates.build(page, instruction, writes = false).map { it.description }
         assertTrue("Download image 'Persialainen.jpg' (first image on the page)" in descriptions)
         assertTrue("Open 'Persialainen.jpg' link" in descriptions)
 
@@ -208,13 +208,13 @@ class TaskRunnerTest {
     @Test
     fun `a standalone picture is offered only as a download`() {
         val img = element("e1", "img", "Persian cat in flowers", tag = "img").copy(imageSrc = "https://upload.example/p.jpg")
-        val c = Candidates.build(SEARCH_PAGE.copy(elements = listOf(img)), instruction).filter { it.element?.id == "e1" }
+        val c = Candidates.build(SEARCH_PAGE.copy(elements = listOf(img)), instruction, writes = false).filter { it.element?.id == "e1" }
         assertEquals(listOf("Download image 'Persian cat in flowers' (first image on the page)"), c.map { it.description })
     }
 
     @Test
     fun `a chat model that answers in prose is asked once more`() = runTest {
-        val ctx = StepContext(instruction, SEARCH_PAGE, Candidates.build(SEARCH_PAGE, instruction), Candidates.values(instruction), emptyList())
+        val ctx = StepContext(instruction, SEARCH_PAGE, Candidates.build(SEARCH_PAGE, instruction, writes = false), Candidates.values(instruction), emptyList())
         val key = ctx.candidates.first().key
         val replies = ArrayDeque(listOf("I would click the search box first.", """{"action":"$key","confidence":0.7,"irreversible":false}"""))
         val requests = mutableListOf<AiRequest>()
@@ -235,7 +235,7 @@ class TaskRunnerTest {
 
     @Test
     fun `a chat reply must name a listed action and marks text it wrote itself`() {
-        val ctx = StepContext(instruction, SEARCH_PAGE, Candidates.build(SEARCH_PAGE, instruction), Candidates.values(instruction), emptyList())
+        val ctx = StepContext(instruction, SEARCH_PAGE, Candidates.build(SEARCH_PAGE, instruction, writes = false), Candidates.values(instruction), emptyList())
         val key = ctx.candidates.first { it.needsValue }.key
         val d = ChatDecider.parseReply("""Sure. {"action":"$key","value":"cordless keyboard","confidence":0.8,"irreversible":false,"reason":"search"}""", ctx)
         assertEquals(key, d.key)

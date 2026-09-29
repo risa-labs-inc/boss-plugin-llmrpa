@@ -90,6 +90,8 @@ fun LlmrpaContent(component: LlmrpaComponent) {
     val instruction by component.currentInstruction.collectAsState()
     val tabs by component.availableTabs.collectAsState()
     val selectedTab by component.selectedTab.collectAsState()
+    val newTab by component.newTab.collectAsState()
+    val drivable by component.drivable.collectAsState()
     val groups by component.modelGroups.collectAsState()
     val model by component.selectedModel.collectAsState()
     val run by component.run.collectAsState()
@@ -117,7 +119,7 @@ fun LlmrpaContent(component: LlmrpaComponent) {
             val compact = maxWidth < CompactWidth
             val showHost = maxWidth >= HostVisibleWidth
             Column(Modifier.fillMaxSize()) {
-                Header(component, tabs, selectedTab, groups, model, blocker, compact, showHost, active)
+                Header(component, TabTarget(tabs, selectedTab, newTab, drivable), groups, model, blocker, compact, showHost, active)
                 Box(Modifier.fillMaxWidth().height(1.dp).background(RpaTokens.Border))
                 if (twoPane) {
                     Row(Modifier.fillMaxSize()) {
@@ -144,8 +146,7 @@ private val NUMBER_KEYS = listOf(Key.One, Key.Two, Key.Three)
 @Composable
 private fun Header(
     component: LlmrpaComponent,
-    tabs: List<ActiveTabData>,
-    selected: ActiveTabData?,
+    target: TabTarget,
     groups: List<ModelGroup>,
     model: ModelOption?,
     blocker: LlmrpaComponent.Blocker?,
@@ -158,27 +159,42 @@ private fun Header(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        Box(Modifier.weight(1f)) { TabPicker(component, tabs, selected, showHost, enabled = !active) }
+        Box(Modifier.weight(1f)) { TabPicker(component, target, showHost, enabled = !active) }
         ModelPicker(component, groups, model, blocker, compact, enabled = !active)
     }
 }
 
+/** What Run acts on: an open tab, or a new one it opens itself. */
+private data class TabTarget(val tabs: List<ActiveTabData>, val selected: ActiveTabData?, val newTab: Boolean, val drivable: Map<String, Boolean>?) {
+    fun canDrive(tabId: String) = StartPages.drivableIn(drivable, tabId)
+}
+
+private const val NEW_TAB_LABEL = "New tab (pick the page for me)"
+
 /** The tab every action lands on. Always visible, because it is where clicks will happen. */
 @Composable
-private fun TabPicker(component: LlmrpaComponent, tabs: List<ActiveTabData>, selected: ActiveTabData?, showHost: Boolean, enabled: Boolean) {
+private fun TabPicker(component: LlmrpaComponent, target: TabTarget, showHost: Boolean, enabled: Boolean) {
+    val (tabs, _, newTab, _) = target
+    val selected = target.selected.takeIf { !newTab }
+    val away = selected != null && !target.canDrive(selected.tabId)
     var open by remember { mutableStateOf(false) }
     Box {
         Row(
-            Modifier.clip(RpaTokens.Shape).clickable(enabled = enabled, role = Role.Button) { open = true }
+            Modifier.clip(RpaTokens.Shape).clickable(enabled = enabled, role = Role.Button) { component.refreshDrivable(); open = true }
                 .pointerHoverIcon(PointerIcon.Hand).padding(horizontal = 6.dp, vertical = 4.dp)
-                .semantics { contentDescription = "Target tab: ${selected?.title ?: "none"}. Change" },
+                .semantics { contentDescription = "Target tab: ${if (newTab) NEW_TAB_LABEL else selected?.title ?: "none"}. Change" },
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            SmallIcon(Icons.Outlined.Public, null, if (selected == null) RpaTokens.Warning else RpaTokens.TextSecondary)
-            Text(selected?.title?.ifBlank { null } ?: if (tabs.isEmpty()) "No web page open" else "Pick a tab",
-                color = if (selected == null) RpaTokens.Warning else RpaTokens.Text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
+            val warn = (selected == null && !newTab) || away
+            SmallIcon(Icons.Outlined.Public, null, if (warn) RpaTokens.Warning else RpaTokens.TextSecondary)
+            Text(if (newTab) "New tab" else selected?.title?.ifBlank { null } ?: if (tabs.isEmpty()) "No web page open" else "Pick a tab",
+                color = if (warn) RpaTokens.Warning else RpaTokens.Text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
                 maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
+            if (showHost && newTab) {
+                Text("page picked for you", color = RpaTokens.TextMuted, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false))
+            }
             if (showHost && selected != null) {
                 Text(host(selected.url), color = RpaTokens.TextMuted, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f, fill = false))
@@ -188,13 +204,14 @@ private fun TabPicker(component: LlmrpaComponent, tabs: List<ActiveTabData>, sel
         if (open) {
             RpaMenu(onDismiss = { open = false }, width = 300) {
                 MenuHeading("Run on")
-                if (tabs.isEmpty()) {
-                    Text("Open a web page in a browser tab, then pick it here.", color = RpaTokens.TextSecondary, fontSize = 12.sp,
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp))
-                }
-                tabs.forEach { t ->
-                    MenuRow(t.title.ifBlank { host(t.url) }, onClick = { open = false; component.selectTab(t) }, detail = host(t.url),
-                        selected = t.tabId == selected?.tabId)
+                MenuRow(NEW_TAB_LABEL, onClick = { open = false; component.selectNewTab() },
+                    detail = "The address in your task, else the model's pick, else a DuckDuckGo search", selected = newTab)
+                if (tabs.isNotEmpty()) MenuDivider()
+                // Drivable first; a tab in another space is listed but cannot be picked, since the host cannot reach its browser.
+                tabs.sortedByDescending { target.canDrive(it.tabId) }.forEach { t ->
+                    val canDrive = target.canDrive(t.tabId)
+                    MenuRow(t.title.ifBlank { host(t.url) }, onClick = { open = false; component.selectTab(t) },
+                        detail = if (canDrive) host(t.url) else StartPages.awayReason(t, tabs, target.drivable), selected = t.tabId == selected?.tabId, enabled = canDrive)
                 }
             }
         }
@@ -213,7 +230,7 @@ private fun ModelPicker(
 ) {
     var open by remember { mutableStateOf(false) }
     var query by remember { mutableStateOf("") }
-    val ready = blocker == null || blocker == LlmrpaComponent.Blocker.TAB
+    val ready = blocker == null || blocker == LlmrpaComponent.Blocker.TAB || blocker == LlmrpaComponent.Blocker.AWAY
     val label = model?.label ?: "Pick a model"
     Box {
         Row(
@@ -249,7 +266,7 @@ private fun ModelPicker(
                         }
                     }
                 }
-                if (blocker != null && blocker != LlmrpaComponent.Blocker.TAB) {
+                if (blocker != null && blocker != LlmrpaComponent.Blocker.TAB && blocker != LlmrpaComponent.Blocker.AWAY) {
                     MenuDivider()
                     Text(blocker.detail, color = RpaTokens.Warning, fontSize = 12.sp, modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp))
                 }
@@ -278,7 +295,12 @@ private fun Compose(
 ) {
     val values = remember(instruction) { Candidates.values(instruction) }
     val decision = model?.kind == ModelOption.Kind.DECISION
-    val hasTab = component.selectedTab.collectAsState().value != null
+    val tab = component.selectedTab.collectAsState().value
+    val hasTab = tab != null
+    // The page's host as the runner sees it, so the hint leaves out the site's name too.
+    val newTab = component.newTab.collectAsState().value
+    val site = tab?.url?.takeIf { !newTab }
+    val phrases = remember(instruction, site) { Candidates.phrases(instruction, listOfNotNull(site)) }
     Column(
         Modifier.fillMaxWidth().widthIn(max = PaneMaxWidth).padding(12.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
@@ -292,10 +314,13 @@ private fun Compose(
         if (!collapsed && instruction.isNotBlank()) {
             // What can be typed, shown before the run: a decision model types only these.
             FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text(if (decision) "Jev can type:" else "From your instruction:", color = RpaTokens.TextSecondary, fontSize = 12.sp,
-                    modifier = Modifier.align(Alignment.CenterVertically))
+                val words = decision && values.isEmpty() && phrases.isNotEmpty()
+                Text(
+                    if (words) "Jev can type words from your instruction, e.g. '${phrases.first()}'" else if (decision) "Jev can type:" else "From your instruction:",
+                    color = RpaTokens.TextSecondary, fontSize = 12.sp, modifier = Modifier.align(Alignment.CenterVertically),
+                )
                 values.forEach { Pill(it, Tone.ACCENT, mono = true) }
-                if (values.isEmpty()) {
+                if (values.isEmpty() && !words) {
                     Text(if (decision) "nothing yet. Put text to type in quotes." else "no quoted values; the model may write its own.",
                         color = if (decision) RpaTokens.Warning else RpaTokens.TextMuted, fontSize = 12.sp,
                         modifier = Modifier.align(Alignment.CenterVertically))
@@ -312,13 +337,17 @@ private fun Compose(
                     enabled = instruction.isNotBlank() && !drafting && component.aiAvailable() && hasTab && model?.kind != ModelOption.Kind.DECISION)
                 Box(center) { StepLimit(component, maxSteps, enabled = true) }
             }
+            if (newTab && !decision && instruction.isNotBlank()) {
+                Text(LlmrpaComponent.DRAFT_NEEDS_TAB, color = RpaTokens.TextMuted, fontSize = 11.sp)
+            }
         }
         if (!active && blocker != null && instruction.isNotBlank()) Notice(blocker.detail, Tone.WARNING)
         errorMessage?.let { Notice(it, Tone.ERROR, onDismiss = component::clearError) }
         draftPath?.let { Notice("Draft saved for RPA Engine as ${java.io.File(it).name}. Load it there to run the whole plan.", Tone.SUCCESS) }
         if (!collapsed && model != null) {
             val where = if (decision) "OpenRouter" else model.providerName
-            Text("Every step sends your instruction, with all quoted text (even text meant for a password field), element labels and the page address to $where. Text already in fields is never read.",
+            val search = if (newTab) " With New tab and no address in the task, the task minus its quoted text, emails and addresses may be searched on DuckDuckGo." else ""
+            Text("Every step sends your instruction, with all quoted text (even text meant for a password field), element labels and the page address to $where. Text already in fields is never read.$search",
                 color = RpaTokens.TextMuted, fontSize = 11.sp)
         }
     }
@@ -365,11 +394,13 @@ private fun RunPane(component: LlmrpaComponent, run: RunState?, pastRuns: List<R
                 if (run == null) {
                     Empty(component)
                 } else {
+                    run.opened?.let { OpenedRow(it) }
+                    if (active && run.tabId == null) Text("Finding the page to start on…", color = RpaTokens.TextSecondary, fontSize = 12.sp)
                     run.steps.forEach { StepRow(it, current = active && it == run.steps.last() && it.outcome == StepRecord.Outcome.RUNNING) }
-                    if (active && run.question == null && run.steps.lastOrNull()?.outcome != StepRecord.Outcome.RUNNING) {
+                    if (active && run.tabId != null && run.question == null && run.steps.lastOrNull()?.outcome != StepRecord.Outcome.RUNNING) {
                         Text("Reading the page…", color = RpaTokens.TextSecondary, fontSize = 12.sp)
                     }
-                    run.question?.let { QuestionCard(component, it) }
+                    run.question?.let { QuestionCard(component, it, run.instruction) }
                     if (!active) ResultCard(component, run)
                 }
             }
@@ -402,6 +433,20 @@ private fun RunHeader(component: LlmrpaComponent, run: RunState, active: Boolean
     Box(Modifier.fillMaxWidth().height(1.dp).background(RpaTokens.Border))
 }
 
+/** The page a run opened in a tab of its own, before its first step. */
+@Composable
+private fun OpenedRow(opened: OpenedPage) {
+    Column(
+        Modifier.fillMaxWidth().clip(RpaTokens.Shape).background(RpaTokens.Panel).border(1.dp, RpaTokens.Border, RpaTokens.Shape).padding(10.dp)
+            .semantics(mergeDescendants = true) { contentDescription = opened.description },
+        verticalArrangement = Arrangement.spacedBy(3.dp),
+    ) {
+        Text("Opened ${opened.url}", color = RpaTokens.Text, fontSize = 13.sp, fontWeight = FontWeight.Medium, maxLines = 2, overflow = TextOverflow.Ellipsis)
+        val why = opened.note?.let { if (opened.source == StartSource.SEARCH) " · searched because $it" else " · $it" }.orEmpty()
+        Text("Chosen by ${opened.source.label}$why", color = RpaTokens.TextSecondary, fontSize = 12.sp)
+    }
+}
+
 @Composable
 private fun StepRow(step: StepRecord, current: Boolean) {
     var expanded by remember { mutableStateOf(false) }
@@ -429,7 +474,7 @@ private fun StepRow(step: StepRecord, current: Boolean) {
             Text(step.description, color = RpaTokens.Text, fontSize = 13.sp, fontWeight = FontWeight.Medium)
             val notes = buildList {
                 if (step.chosenBy == StepRecord.ChosenBy.USER) add("you picked this")
-                if (step.valueWritten) add("text written by the model")
+                step.valueSource?.let { add(it.label) }
                 step.detail?.let { add(it) }
             }
             if (notes.isNotEmpty()) Text(notes.joinToString(" · "), color = if (step.outcome == StepRecord.Outcome.FAILED) RpaTokens.Error else RpaTokens.TextSecondary, fontSize = 12.sp)
@@ -453,7 +498,7 @@ private fun StepRow(step: StepRecord, current: Boolean) {
 
 /** A question takes focus and is announced, so it is never missed. Keys 1–3 answer a choice. */
 @Composable
-private fun QuestionCard(component: LlmrpaComponent, q: PendingQuestion) {
+private fun QuestionCard(component: LlmrpaComponent, q: PendingQuestion, instruction: String) {
     val focus = remember { FocusRequester() }
     LaunchedEffect(q) { runCatching { focus.requestFocus() } }
     val risk = q is PendingQuestion.Confirm
@@ -462,8 +507,13 @@ private fun QuestionCard(component: LlmrpaComponent, q: PendingQuestion) {
             .border(1.dp, (if (risk) RpaTokens.Error else RpaTokens.Warning).copy(alpha = 0.6f), RoundedCornerShape(8.dp))
             // On the card, not the panel root: digits typed into a text field must stay text.
             .onKeyEvent { e ->
-                if (q !is PendingQuestion.Choose || e.type != KeyEventType.KeyDown || e.key !in NUMBER_KEYS) return@onKeyEvent false
-                q.options.getOrNull(NUMBER_KEYS.indexOf(e.key))?.let { component.answer(Answer.Pick(it.first)) }
+                if (e.type != KeyEventType.KeyDown || e.key !in NUMBER_KEYS) return@onKeyEvent false
+                val i = NUMBER_KEYS.indexOf(e.key)
+                when (q) {
+                    is PendingQuestion.Choose -> q.options.getOrNull(i)?.let { component.answer(Answer.Pick(it.first)) }
+                    is PendingQuestion.ChooseText -> q.options.getOrNull(i)?.let { component.answer(Answer.Text(it)) }
+                    is PendingQuestion.Confirm -> return@onKeyEvent false
+                }
                 true
             }
             .focusRequester(focus).focusable().padding(12.dp)
@@ -475,19 +525,18 @@ private fun QuestionCard(component: LlmrpaComponent, q: PendingQuestion) {
                 Text("Which should I do?", color = RpaTokens.Text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.semantics { heading() })
                 Text("${q.reason}. Pick one, or stop here.", color = RpaTokens.TextSecondary, fontSize = 12.sp)
                 q.options.forEachIndexed { i, (c, p) ->
-                    Row(
-                        Modifier.fillMaxWidth().heightIn(min = 40.dp).clip(RpaTokens.Shape).background(RpaTokens.Content)
-                            .border(1.dp, RpaTokens.Border, RpaTokens.Shape)
-                            .clickable(role = Role.Button) { component.answer(Answer.Pick(c)) }.pointerHoverIcon(PointerIcon.Hand)
-                            .padding(horizontal = 10.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        Text("${i + 1}", color = RpaTokens.TextMuted, fontSize = 11.sp, fontFamily = RpaTokens.Mono)
-                        Text(c.description, color = RpaTokens.Text, fontSize = 13.sp, modifier = Modifier.weight(1f))
-                        // A chat model may name a runner-up without saying how sure it is.
-                        if (p > 0) Text(TaskRunner.pct(p), color = RpaTokens.TextSecondary, fontSize = 12.sp)
-                    }
+                    // A chat model may name a runner-up without saying how sure it is.
+                    OptionRow(i, c.description, p.takeIf { it > 0 }) { component.answer(Answer.Pick(c)) }
+                }
+                OutlineButton("Stop here", { component.answer(Answer.Stop) }, tone = Tone.ERROR)
+            }
+            is PendingQuestion.ChooseText -> {
+                Text("What should I type?", color = RpaTokens.Text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.semantics { heading() })
+                Text("${q.reason}. Pick the text to type into '${q.field}', or stop here.", color = RpaTokens.TextSecondary, fontSize = 12.sp)
+                q.options.forEachIndexed { i, v ->
+                    // Masked like a private field's text; screenshots of this card get shared.
+                    val label = if (Candidates.isKeywordSecret(instruction, v)) "•••••• (the text after 'password' or similar)" else v
+                    OptionRow(i, label, null, mono = true) { component.answer(Answer.Text(v)) }
                 }
                 OutlineButton("Stop here", { component.answer(Answer.Stop) }, tone = Tone.ERROR)
             }
@@ -503,6 +552,23 @@ private fun QuestionCard(component: LlmrpaComponent, q: PendingQuestion) {
                 }
             }
         }
+    }
+}
+
+/** One answer in a question card; the first three take the number keys. */
+@Composable
+private fun OptionRow(index: Int, text: String, confidence: Double?, mono: Boolean = false, onClick: () -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().heightIn(min = 40.dp).clip(RpaTokens.Shape).background(RpaTokens.Content)
+            .border(1.dp, RpaTokens.Border, RpaTokens.Shape)
+            .clickable(role = Role.Button, onClick = onClick).pointerHoverIcon(PointerIcon.Hand)
+            .padding(horizontal = 10.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(if (index < NUMBER_KEYS.size) "${index + 1}" else "·", color = RpaTokens.TextMuted, fontSize = 11.sp, fontFamily = RpaTokens.Mono)
+        Text(text, color = RpaTokens.Text, fontSize = 13.sp, modifier = Modifier.weight(1f), fontFamily = if (mono) RpaTokens.Mono else null)
+        confidence?.let { Text(TaskRunner.pct(it), color = RpaTokens.TextSecondary, fontSize = 12.sp) }
     }
 }
 

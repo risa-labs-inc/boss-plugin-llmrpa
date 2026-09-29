@@ -24,6 +24,9 @@ class TabLocks {
     /** Takes [tabId] for [owner]; null when taken, else why not. */
     fun tryAcquire(tabId: String, owner: Owner): String? = busy.putIfAbsent(tabId, owner)?.busy
     fun release(tabId: String) { busy.remove(tabId) }
+
+    /** Whether any run holds a tab. */
+    fun anyBusy(): Boolean = busy.isNotEmpty()
 }
 
 /**
@@ -36,31 +39,77 @@ class HeadlessRunner(
     private val gateway: () -> AiGatewayAPI?,
     private val llmProvider: () -> LlmProvider?,
     private val tabs: () -> List<ActiveTabData>,
-    /** The tab the user is looking at, or null when the host cannot say. */
-    private val activeTabId: () -> String?,
+    /** The tab the user is looking at among these (drivable) tabs, or null when the host cannot say. */
+    private val activeTabId: (List<ActiveTabData>) -> String?,
+    // No defaults: a forgotten one would look like every tab being drivable, or none being openable.
+    /** Whether the host can drive a tab now (only the space on screen resolves). */
+    private val drivable: (tabId: String) -> Boolean,
+    /** The host's createBrowserTab, in the active space; null when it made no tab. */
+    private val openTab: suspend (url: String, title: String) -> String?,
     // No default: a forgotten one would give headless runs their own locks, apart from the panel's.
     private val locks: TabLocks,
     private val timeLimitMs: Long = TIME_LIMIT_MS,
+    private val limits: RunLimits = RunLimits(),
 ) {
-    suspend fun execute(instruction: String, tabId: String?, maxSteps: Int, model: String?): Result<RunState> = try {
-        executeUnguarded(instruction, tabId, maxSteps, model)
+    /** [newTab] or a [startUrl] opens a page in a new tab first; otherwise the focused or named tab. */
+    suspend fun execute(
+        instruction: String,
+        tabId: String?,
+        maxSteps: Int,
+        model: String?,
+        newTab: Boolean = false,
+        startUrl: String? = null,
+    ): Result<RunState> = try {
+        executeUnguarded(instruction, tabId, maxSteps, model, newTab || startUrl != null, startUrl)
     } catch (e: CancellationException) {
         throw e
     } catch (e: Throwable) {
         Result.failure(IllegalStateException("The run failed: ${e.message ?: e::class.simpleName}", e))
     }
 
-    private suspend fun executeUnguarded(instruction: String, tabId: String?, maxSteps: Int, model: String?): Result<RunState> {
+    private suspend fun executeUnguarded(
+        instruction: String,
+        tabId: String?,
+        maxSteps: Int,
+        model: String?,
+        newTab: Boolean,
+        startUrl: String?,
+    ): Result<RunState> {
         if (!tools.has(ToolNames.OBSERVE) || !tools.has(ToolNames.STEP)) {
             return Result.failure(IllegalStateException("RPA Engine with rpa_observe and rpa_step is not installed"))
         }
-        val browserTabs = tabs().filter { it.url != null }
-        if (browserTabs.isEmpty()) return Result.failure(IllegalStateException("No browser tab is open"))
-        // Never an arbitrary tab: it acts in the user's logged-in session, so the focused one or a named one.
-        val wanted = tabId ?: runCatching { activeTabId() }.getOrNull()
-            ?: return Result.failure(IllegalArgumentException("No tab is focused. Pass tab_id, one of: ${describe(browserTabs)}"))
-        val tab = browserTabs.firstOrNull { it.tabId == wanted }
-            ?: return Result.failure(IllegalArgumentException("No browser tab with id $wanted. Open browser tabs: ${describe(browserTabs)}"))
+        if (newTab && tabId != null) return Result.failure(IllegalArgumentException("Pass tab_id or new_tab/start_url, not both"))
+        val start = startUrl?.let {
+            StartPages.usable(it, httpsOnly = false)
+                ?: return Result.failure(IllegalArgumentException("start_url must be an http(s) address with a host and no credentials"))
+        }
+        val tab = if (newTab) null else {
+            val browserTabs = tabs().filter { it.url != null }
+            if (browserTabs.isEmpty()) return Result.failure(IllegalStateException("No browser tab is open. Pass new_tab: true to open one."))
+            // Not while a run holds a tab: the host resolves browsers through one static "selected tab",
+            // so a probe racing a run's rpa_observe could hand that run the wrong tab. Unknown then
+            // reads as drivable, and a NO_BROWSER at the first look still says why. Re-checked
+            // before each tab, since a run can start mid-probe; on IO, one host call per tab.
+            suspend fun probe(list: List<ActiveTabData>) = withContext(Dispatchers.IO) {
+                list.associate { it.tabId to (locks.anyBusy() || runCatching { drivable(it.tabId) }.getOrDefault(true)) }
+            }
+            // A named tab probes only itself; the listing in an error probes the rest.
+            var canDrive = if (tabId != null) probe(browserTabs.filter { it.tabId == tabId }) else probe(browserTabs)
+            suspend fun listing(): String {
+                if (canDrive.size < browserTabs.size) canDrive = canDrive + probe(browserTabs.filter { it.tabId !in canDrive })
+                return describe(browserTabs, canDrive)
+            }
+            // Never an arbitrary tab: it acts in the user's logged-in session, so the focused one or a named one.
+            // Drivable tabs are the space on screen, which also makes a panel id unambiguous.
+            val wanted = tabId ?: runCatching { activeTabId(browserTabs.filter { canDrive[it.tabId] == true }) }.getOrNull()
+                ?: return Result.failure(IllegalArgumentException("No drivable tab is focused. Pass tab_id, one of: ${listing()}; or new_tab: true"))
+            val found = browserTabs.firstOrNull { it.tabId == wanted }
+                ?: return Result.failure(IllegalArgumentException("No browser tab with id $wanted. Open browser tabs: ${listing()}"))
+            if (canDrive[found.tabId] != true) {
+                return Result.failure(IllegalStateException("Tab $wanted: $NO_BROWSER_HINT Pass new_tab: true, or one of: ${listing()}"))
+            }
+            found
+        }
         // On IO: catalog calls into other plugins can read settings or secrets.
         val models = withContext(Dispatchers.IO) { ModelDirectory(tools, llmProvider, gateway).load() }.flatMap { it.models }
         val option = when (model) {
@@ -82,13 +131,15 @@ class HeadlessRunner(
             return Result.failure(IllegalStateException("Jev is not installed or not loaded (no jev_decide tool). Install it from Toolbox, or pass a chat model."))
         }
         val decider = if (option.kind == ModelOption.Kind.DECISION) JevDecider(tools, option) else ChatDecider(gateway, option)
-        locks.tryAcquire(tab.tabId, TabLocks.Owner.HEADLESS)?.let { return Result.failure(IllegalStateException(it)) }
+        val opener = if (tab == null) NewTab(openTab, claim = { locks.tryAcquire(it, TabLocks.Owner.HEADLESS) }, startUrl = start) else null
+        // Built before the lock, so a constructor that throws cannot leave the tab held.
+        val runner = TaskRunner(tools, decider, tab?.tabId, instruction, limits.copy(maxSteps = maxSteps), newTab = opener) { Answer.Stop }
+        tab?.let { t -> locks.tryAcquire(t.tabId, TabLocks.Owner.HEADLESS)?.let { return Result.failure(IllegalStateException(it)) } }
         return try {
-            val runner = TaskRunner(tools, decider, tab.tabId, instruction, RunLimits(maxSteps = maxSteps)) { Answer.Stop }
             // Bounded, so a caller that times out does not leave a run going on the user's tab.
             Result.success(withTimeoutOrNull(timeLimitMs) { runner.run() } ?: runner.also { it.timedOut(timeLimitMs) }.state.value)
         } finally {
-            locks.release(tab.tabId)
+            runner.state.value.tabId?.let(locks::release)
         }
     }
 
@@ -101,8 +152,14 @@ class HeadlessRunner(
     companion object {
         const val TIME_LIMIT_MS = 10 * 60_000L
 
-        private fun describe(tabs: List<ActiveTabData>): String =
-            tabs.take(20).joinToString { "${it.tabId} ('${it.title.take(40)}', ${host(it.url)})" } + if (tabs.size > 20) ", …" else ""
+        /** Drivable tabs first; the rest are marked, since the host cannot drive them from here. */
+        private fun describe(tabs: List<ActiveTabData>, drivable: Map<String, Boolean>): String {
+            val sorted = tabs.sortedByDescending { drivable[it.tabId] == true }
+            return sorted.take(20).joinToString { t ->
+                "${t.tabId} ('${t.title.take(40)}', ${host(t.url)}" +
+                    (if (drivable[t.tabId] == true) "" else ", not drivable: ${StartPages.awayReason(t, tabs, drivable)}") + ")"
+            } + if (tabs.size > 20) ", …" else ""
+        }
 
         /**
          * The browser tab selected in the focused pane, or null. A panel id is unique only within a

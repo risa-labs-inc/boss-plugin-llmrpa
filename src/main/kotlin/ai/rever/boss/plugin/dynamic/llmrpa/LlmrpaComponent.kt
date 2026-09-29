@@ -9,21 +9,24 @@ import ai.rever.boss.plugin.api.PanelComponentWithUI
 import ai.rever.boss.plugin.api.PanelInfo
 import ai.rever.boss.plugin.api.SettingsProvider
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import com.arkivanov.decompose.ComponentContext
 import com.arkivanov.essenty.lifecycle.doOnDestroy
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.flow.updateAndGet
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collectLatest
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.flow.updateAndGet
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -124,6 +127,25 @@ class LlmrpaComponent(
     /** Until the person picks a tab, the pick follows the focused one: Run acts in their logged-in session. */
     private var tabPickedByUser = false
 
+    private val _newTab = MutableStateFlow(false)
+    /** Run opens the right page in a new tab instead of using [selectedTab]. The default when no drivable tab is focused. */
+    val newTab: StateFlow<Boolean> = _newTab
+
+    private val _drivable = MutableStateFlow<Map<String, Boolean>?>(null)
+    /**
+     * Probe results by tab: whether the host can drive it now (only the space on screen resolves a
+     * browser). A tab not probed yet, e.g. opened while a run held the probe off, reads as drivable.
+     */
+    val drivable: StateFlow<Map<String, Boolean>?> = _drivable
+
+    private fun canDrive(tabId: String): Boolean = StartPages.drivableIn(_drivable.value, tabId)
+    private val probing = AtomicBoolean(false)
+    /** A probe was asked for while one ran; it runs again when that one ends. */
+    private val probeAgain = AtomicBoolean(false)
+    @Volatile private var lastProbeAt = 0L
+    /** Compositions showing the panel; the periodic probe runs only while there is one. */
+    private val shown = AtomicInteger(0)
+
     private val _errorMessage = MutableStateFlow<String?>(null)
     val errorMessage: StateFlow<String?> = _errorMessage
 
@@ -155,12 +177,7 @@ class LlmrpaComponent(
                         _selectedTab.value = null
                         tabPickedByUser = false
                     }
-
-                    followFocusedTab()
-                    // The first tab only when the host cannot say which one is focused.
-                    if (_selectedTab.value == null && browserTabs.isNotEmpty()) {
-                        _selectedTab.value = browserTabs.first()
-                    }
+                    probeDrivable()
                 }
             }
         }
@@ -176,6 +193,11 @@ class LlmrpaComponent(
 
     @Composable
     override fun Content() {
+        // The periodic probe runs only while the panel is on screen.
+        DisposableEffect(Unit) {
+            shown.incrementAndGet()
+            onDispose { shown.decrementAndGet() }
+        }
         LlmrpaContent(this)
     }
 
@@ -188,17 +210,74 @@ class LlmrpaComponent(
      */
     fun selectTab(tab: ActiveTabData) {
         _selectedTab.value = tab
+        _newTab.value = false
         tabPickedByUser = true
     }
 
-    /** Moves the pick to the focused browser tab, unless the person chose one or a run is going. */
+    /** Re-reads which tabs can be driven, e.g. as the picker opens after a space switch. */
+    fun refreshDrivable() = probeDrivable()
+
+    /** Run opens the page it needs in a new tab. */
+    fun selectNewTab() {
+        _selectedTab.value = null
+        _newTab.value = true
+        tabPickedByUser = true
+    }
+
+    /**
+     * Re-reads which tabs the host can drive, off the UI thread, then re-targets. Not while a run
+     * holds a tab, re-checked before each tab: the host resolves browsers through one static
+     * "selected tab", so a probe racing a run's rpa_observe could hand that run the wrong tab.
+     * An abandoned probe keeps the last answer.
+     */
+    private fun probeDrivable() {
+        val provider = activeTabsProvider ?: return followFocusedTab()
+        if (tabLocks.anyBusy()) return followFocusedTab()
+        if (!probing.compareAndSet(false, true)) { probeAgain.set(true); return followFocusedTab() }
+        lastProbeAt = System.currentTimeMillis()
+        scope.launch {
+            try {
+                val tabs = _availableTabs.value
+                withContext(io) {
+                    val out = mutableMapOf<String, Boolean>()
+                    for (t in tabs) {
+                        if (tabLocks.anyBusy()) return@withContext null
+                        out[t.tabId] = StartPages.drivable(provider, t.tabId)
+                    }
+                    out
+                }?.let { _drivable.value = it }
+            } finally {
+                probing.set(false)
+            }
+            if (probeAgain.getAndSet(false)) probeDrivable()
+            // Readiness follows _drivable in its own collector: this first runs from the tab
+            // collector in an earlier init block, before the model state exists.
+            followFocusedTab()
+        }
+    }
+
+    /**
+     * Moves the pick to the focused drivable tab, unless the person chose or a run is going. With
+     * no drivable tab focused (a terminal pane, say) it keeps a pick that is still drivable, else
+     * targets a new tab. Never an arbitrary open tab: Run acts in the person's logged-in session.
+     */
     private fun followFocusedTab() {
         if (tabPickedByUser || runJob?.isActive == true) return
         val provider = activeTabsProvider ?: return
-        val tabs = _availableTabs.value
+        // Drivable tabs are the space on screen, which also makes a panel id unambiguous.
+        val tabs = _availableTabs.value.filter { canDrive(it.tabId) }
         val id = runCatching { HeadlessRunner.activeTab(tabs, provider.activePanelId) { ws, panel -> provider.selectedTabId(ws, panel) } }
-            .getOrNull() ?: return
-        if (id != _selectedTab.value?.tabId) tabs.firstOrNull { it.tabId == id }?.let { _selectedTab.value = it }
+            .getOrNull()
+        val focused = id?.let { f -> tabs.firstOrNull { it.tabId == f } }
+        if (focused == null) {
+            if (_selectedTab.value?.let { canDrive(it.tabId) } != true) {
+                _selectedTab.value = null
+                _newTab.value = true
+            }
+        } else if (focused.tabId != _selectedTab.value?.tabId || _newTab.value) {
+            _selectedTab.value = focused
+            _newTab.value = false
+        }
     }
 
     fun toggleSettings() {
@@ -232,6 +311,8 @@ class LlmrpaComponent(
         }
 
         draftProblem()?.let { _errorMessage.value = it; return it }
+        // Refused here, not in the launched body: llmrpa_run would otherwise report a start.
+        if (_newTab.value || _selectedTab.value == null) { _errorMessage.value = DRAFT_NEEDS_TAB; return DRAFT_NEEDS_TAB }
 
         // Last, and with compareAndSet rather than a check then a set: llmrpa_run also calls this
         // and the MCP handler thread is not guaranteed to be the UI thread, so two calls could both
@@ -444,7 +525,9 @@ class LlmrpaComponent(
             jevSeen = jevNow
             refreshModels()
         }
-        followFocusedTab()
+        // Space switches have no signal, so re-probe now and then while the panel shows; tab changes
+        // and the picker probe at once.
+        if (shown.get() > 0 && now - lastProbeAt >= PROBE_EVERY_MS) probeDrivable() else followFocusedTab()
         _readiness.value = blocker()
     }
 
@@ -480,6 +563,8 @@ class LlmrpaComponent(
         }
         scope.launch { _selectedModel.collect { _readiness.value = blocker() } }
         scope.launch { _selectedTab.collect { _readiness.value = blocker() } }
+        scope.launch { _newTab.collect { _readiness.value = blocker() } }
+        scope.launch { _drivable.collect { _readiness.value = blocker() } }
     }
 
     /** What stops Run from starting, in words the panel shows; null when ready. */
@@ -488,7 +573,9 @@ class LlmrpaComponent(
         _selectedModel.value == null -> Blocker.MODEL
         _selectedModel.value?.kind == ModelOption.Kind.DECISION && !tools.has(ToolNames.JEV_DECIDE) -> Blocker.JEV
         _selectedModel.value?.kind == ModelOption.Kind.CHAT && !aiAvailable() -> Blocker.AI
+        _newTab.value -> if (activeTabsProvider == null) Blocker.TAB else null
         _selectedTab.value == null -> Blocker.TAB
+        _selectedTab.value?.let { !canDrive(it.tabId) } == true -> Blocker.AWAY
         else -> null
     }
 
@@ -498,6 +585,7 @@ class LlmrpaComponent(
         AI("Add an AI provider", "Add a provider and key in Settings → AI Providers, or pick Jev."),
         MODEL("Pick a model", "Install Jev from Toolbox or add an AI provider in Settings → AI Providers."),
         TAB("Open a page", "Open a web page in a browser tab to run a task on it."),
+        AWAY("Switch space", NO_BROWSER_HINT),
     }
 
     /**
@@ -511,12 +599,21 @@ class LlmrpaComponent(
         if (instruction.isEmpty()) return "Describe the task first"
         blocker()?.let { return it.detail }
         if (isRunning) return "A task is already running"
-        val tab = _selectedTab.value!!
+        val tab = _selectedTab.value.takeIf { !_newTab.value }
         val model = _selectedModel.value!!
-        tabLocks.tryAcquire(tab.tabId, TabLocks.Owner.PANEL)?.let { return it }
-        _errorMessage.value = null
         val decider = if (model.kind == ModelOption.Kind.DECISION) JevDecider(tools, model) else ChatDecider(aiGateway, model)
-        val r = TaskRunner(tools, decider, tab.tabId, instruction, baseLimits.copy(maxSteps = _maxSteps.value)) { asker.ask(it) }
+        val opener = when {
+            tab != null -> null
+            // On Main: the host adds the tab to its split view state.
+            else -> activeTabsProvider?.let { p ->
+                NewTab(open = { url, title -> withContext(Dispatchers.Main) { p.createBrowserTab(url, title) } },
+                    claim = { tabLocks.tryAcquire(it, TabLocks.Owner.PANEL) })
+            } ?: return Blocker.TAB.detail
+        }
+        val r = TaskRunner(tools, decider, tab?.tabId, instruction, baseLimits.copy(maxSteps = _maxSteps.value), newTab = opener) { asker.ask(it) }
+        // After the runner is built, as in HeadlessRunner, so nothing can throw between taking and handing over the lock.
+        tab?.let { t -> tabLocks.tryAcquire(t.tabId, TabLocks.Owner.PANEL)?.let { return it } }
+        _errorMessage.value = null
         runner = r
         runJob = scope.launch {
             val mirror = launch { r.state.collect { _run.value = it } }
@@ -535,7 +632,12 @@ class LlmrpaComponent(
             }
         }.also { job ->
             // On completion, not in finally: a job cancelled before it starts never runs its body.
-            job.invokeOnCompletion { tabLocks.release(tab.tabId) }
+            job.invokeOnCompletion {
+                r.state.value.tabId?.let(tabLocks::release)
+                // Probes skip while the run holds a tab, so the one it opened is not known yet. Launched,
+                // not called: this handler runs on whichever thread completed the job.
+                scope.launch { probeDrivable() }
+            }
         }
         return null
     }
@@ -555,10 +657,12 @@ class LlmrpaComponent(
         _currentInstruction.value = example
     }
 
-    private companion object {
-        const val READINESS_POLL_MS = 2_000L
+    companion object {
+        private const val READINESS_POLL_MS = 2_000L
+        private const val PROBE_EVERY_MS = 10_000L
+        const val DRAFT_NEEDS_TAB = "Draft steps needs an open page: pick a tab. New tab is only for Run."
 
         /** Statuses that carry something worth showing in the panel. */
-        val SHOWABLE_STATUSES = setOf("success", "error", LlmApiClient.STATUS_EXAMPLE)
+        private val SHOWABLE_STATUSES = setOf("success", "error", LlmApiClient.STATUS_EXAMPLE)
     }
 }

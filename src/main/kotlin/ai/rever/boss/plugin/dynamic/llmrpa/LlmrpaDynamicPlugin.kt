@@ -4,6 +4,8 @@ import ai.rever.boss.plugin.api.AiGatewayAPI
 import ai.rever.boss.plugin.api.DynamicPlugin
 import ai.rever.boss.plugin.api.PluginContext
 import com.arkivanov.essenty.lifecycle.doOnDestroy
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /**
  * LLM RPA dynamic plugin - Loaded from external JAR.
@@ -75,10 +77,14 @@ class LlmrpaDynamicPlugin : DynamicPlugin {
                 headless = HeadlessRunner(
                     tools, aiGateway, llmProvider,
                     tabs = { activeTabsProvider?.activeTabs?.value.orEmpty() },
-                    activeTabId = {
-                        activeTabsProvider?.let { p ->
-                            HeadlessRunner.activeTab(p.activeTabs.value, p.activePanelId) { ws, panel -> p.selectedTabId(ws, panel) }
-                        }
+                    activeTabId = { candidates ->
+                        activeTabsProvider?.let { p -> HeadlessRunner.activeTab(candidates, p.activePanelId) { ws, panel -> p.selectedTabId(ws, panel) } }
+                    },
+                    drivable = { id -> activeTabsProvider?.let { StartPages.drivable(it, id) } == true },
+                    // On Main: the host adds the tab to its split view state.
+                    openTab = { url, title ->
+                        val p = activeTabsProvider ?: error("This BOSS build exposes no tabs to plugins, so no tab can be opened")
+                        withContext(Dispatchers.Main) { p.createBrowserTab(url, title) }
                     },
                     locks = tabLocks,
                 ),

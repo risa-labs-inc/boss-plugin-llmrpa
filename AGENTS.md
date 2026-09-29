@@ -361,8 +361,8 @@ Found by running, not reviewing:
 - **The commit-word check only raises a chat model's risk.** The model grades its own pick from
   page text, so a misleading page could talk it into `irreversible:false` on a Delete. A person's
   pick with a harmless label is not confirmed a second time.
-- **The panel's tab follows the focused one** until the person picks a tab; `first()` is only the
-  fallback when the host cannot say. `llmrpa_execute` is bounded at 10 minutes.
+- **The panel's tab follows the focused one** until the person picks a tab. With none focused it
+  targets a new tab (1.4); it never falls back to an arbitrary open tab. `llmrpa_execute` is bounded at 10 minutes.
 - RPA Engine (`>=1.3.0`) and Jev are declared optional dependencies, for the same unload guard as
   the gateway. `TabLocks` has no default anywhere: a forgotten one splits the panel from headless.
 - With nothing installed, the empty model reload backs off to 32 s instead of every 2 s.
@@ -385,3 +385,112 @@ Found by running, not reviewing:
 - **`waitFor` starts `ask` before publishing the question** (`async(UNDISPATCHED)`), so an answer
   the instant the buttons appear is not dropped. The test answers from an Unconfined watcher.
 - `TabLocks` records who holds a tab, so a refusal can say the panel may be waiting for an answer.
+
+## Tabs in other spaces, and opening the page (1.4)
+
+- **The host resolves browsers only in the space on screen.** BossConsole's `findBrowserForTab` reads
+  the split view of the current space, so a tab in another running space is in `activeTabs` but
+  `getBrowserIntegration` is null and RPA Engine answers `NO_BROWSER` ("is not a browser tab").
+  Found live: every tab in the other space failed at step 0. Not fixable here.
+- Drivable = `getBrowserIntegration(id)?.isBrowserAvailable()`, the same test RPA Engine applies. The
+  panel probes off the UI thread on tab changes, when the picker opens and every 10 s (a space switch
+  has no signal); other tabs are listed disabled, as "not loaded" when their space has a drivable tab. `NO_BROWSER` from observe or a step ends the run with `NO_BROWSER_HINT`.
+- **Never probe while a run holds a tab.** `getBrowserIntegration` works through one static
+  `BrowserAccessor.selectedTabId`, so a probe racing a run's `rpa_observe` could hand that run the
+  wrong tab's browser. `TabLocks.anyBusy()` gates it and is re-checked before each tab, since a run
+  can start mid-probe; unknown reads as drivable, and the run-time mapping still explains a failure.
+  The window is one call wide, not closed, and direct `rpa_*` callers outside this plugin are not covered.
+- **New tab**: start URL is the first usable http(s) address in the instruction, else the selected
+  decider's (chat only; `jev_decide` answers choice/noul/score and cannot write one), https-only and
+  validated (no credentials; a dotted host with an alphabetic TLD, so no localhost, `.local`/`.internal`
+  style suffixes, reserved TLDs such as `.test`/`.example`, trailing dots or IP literals such as
+  `0x7f.1`), else a DuckDuckGo search. Smart quotes (‘x’) count as quotes for typing and scrubbing.
+- **The search never carries the instruction's values.** Quoted text, emails and addresses are what
+  a run may type, passwords included, so they are cut from the query; with nothing left the run stops
+  and asks for the site. So is the word after "password", "pin", "username" and the like
+  (`Candidates.scrub`, shared with `phrases` so Jev never types an unquoted password; the model-address
+  leak check uses `keywordSecrets`). Values are cut as whole words, longest first, and keywords in one
+  regex pass: replacing captured words one by one let `username bob` shield `password bob123`.: crude, and it over-cuts, but New
+  tab is the default route to this search. Any other unquoted secret is not detected. The scrub uses `Candidates.scrubbable`,
+  which is uncapped: `values` stops at 20 entries and 200-character quotes, fine for a typing list,
+  a leak for a scrubber.
+- **A model's address may not carry the instruction's values either.** The model saw the whole
+  instruction, passwords included; a URL containing any value (compared raw and percent-decoded, the
+  instruction's own addresses aside) is cut to its origin. A search URL the model builds from a
+  quoted term loses its path too, which is the price.
+- An address outside quotes is preferred as the start page: quoted text is for typing.
+- The create-and-claim runs `NonCancellable`, so a Stop mid-create still records the tab it made. A
+  start-address call that went out and failed counts in `model_calls` (`StartUrlCallFailed`). `createBrowserTab`
+  runs on Main (it edits split view state) and opens in the active space. The runner waits with
+  bounded backoff (`RunLimits.openWaitsMs`, about 13 s), errors included (a script can fail
+  mid-navigation). A page counts once it has an address and elements; it then gets `navSettleMs`
+  and a fresh look, which is the first step's page. A page with no elements is taken only after half
+  the budget and two identical reads: Gmail, Jira and dashboards spin under a final title for seconds.
+- The probe gate is the lock, which a new-tab run takes only once its tab exists: during the
+  start-address call nothing is observed, so a probe then is harmless.
+- **Focus on a pane with no browser keeps a drivable pick.** Clicking into a terminal and pressing
+  Run acts on the page just looked at; New tab is the target only when no drivable pick is left.
+- The periodic probe runs only while the panel is composed (`Content` counts itself in and out);
+  `rpa_*` callers outside this plugin read the same host static, so it should not tick unseen.
+- New tab is the default when no drivable tab is focused; the privacy line under the box says a scrubbed search
+  may go to DuckDuckGo, and the menu row says so too.
+- **Probe results are kept per tab** (`Map<String, Boolean>`), so a tab opened while a run held the
+  probe off is unknown, not away; a probe asked for mid-probe runs again after it. A set of drivable
+  ids made every unprobed tab look away for as long as a headless run held a lock (up to 10 min).
+- A NO_BROWSER that is still the last word when the new-tab wait runs out is reported with the hint.
+- Caller `start_url` and instruction addresses are deliberately not host-filtered (http, intranet
+  allowed); only a model's pick is held to the public-host rules.
+- **Draft steps refuses New tab synchronously** (`DRAFT_NEEDS_TAB`): it drafts against a page, and a
+  refusal from the launched body let `llmrpa_run` report a start that never happened.
+- A probe that throws reads as drivable, like a skipped one. After a panel run the panel probes at
+  once, since the tab it opened was skipped while locked.
+- The chosen address is used **only for that open**. "Go to" candidates still come from the
+  instruction alone, so a model-picked origin is never offered again mid-run.
+- The new tab's lock is taken by the runner once it exists (`NewTab.claim`) and released from
+  `RunState.tabId`, so the panel and `llmrpa_execute` keep one run per tab.
+- `llmrpa_execute` takes `new_tab` / `start_url`; its tab listing marks tabs that cannot be driven.
+  `HeadlessRunner.drivable` and `openTab` have no defaults, for the usual reason.
+- `createBrowserTab` and `getBrowserIntegration` are pre-1.0.87 members: the 1.0.91 floor stands.
+
+## Typing words from the instruction (1.4)
+
+Found live: "Open wikipedia home page, then follow links till you reach breast cancer" with Jev
+stopped at step 0 ("Needs text to type into 'Search Wikipedia'"). Every text field was offered as
+"Type into", Jev rightly picked the search box, and nothing could go in it: `values` is quoted text,
+emails and addresses only, and Jev cannot write.
+
+- **A field is offered only when something can go in it.** A non-private field needs a quoted value,
+  an instruction phrase, or a decider that writes (`StepDecider.writesText`, chat). A private field
+  needs a quoted value or a writer, as before; `build` takes `writes` with no default.
+- `Candidates.phrases`: 1-4 word spans of the unquoted instruction (quoted text, emails and addresses
+  cut first), not starting or ending on a stop/task word or the site's name (a word before "home
+  page", or a label of the page's or the instruction's host). Longest first, at most 8.
+- **With no value and not exactly one quoted value**, Jev gets a `jev_decide` choice ("Which text from
+  the instruction should be typed into '<field>'?", options plus `none`), used at `askBelow` or above.
+  Otherwise the panel asks (`PendingQuestion.ChooseText`, answered with `Answer.Text`, which must be
+  one of the options) and a headless run stops naming them. The call is counted either way.
+- **Phrases never reach a private field.** `fromInstruction` (what allows `allow_sensitive`) is still
+  "in `values`"; a private field skips the text question and keeps the old stop.
+- The timeline and transcript (`text_source`) say where typed text came from: quoted, words from the
+  instruction, written by the model, or picked by you.
+- **Enter after phrase-typed text commits unless the field is a search box** (`isSearchField`: role
+  searchbox, type search, or a one-line text field with "search" as a whole word in its label, so
+  "Research notes" is not one). The words are the person's, but the field was
+  the model's pick, and "breast cancer" + Enter in a comment box posts it. Quoted and person-picked
+  text keep the old rule (not committing); model-written text still always counts.
+- **Only a decider that cannot write gets `PHRASE`.** A chat model's text that happens to match a
+  phrase is still `MODEL`, so its timeline label and the Enter rule are exactly as in 1.3.
+- Phrase ranking puts spans with no inner stop word first, then longest: "search google for cats"
+  offers `cats` before `google for cats` (and `google`, between "search" and "for", counts as the site).
+- The panel hint passes the picked tab's address, so it leaves out the same site name the runner does.
+- **Jev is never offered a value that follows a secret keyword** for a field the page does not mark
+  private (`password "hunter2"` into 'Email'). The panel still lists it for the person, and a headless
+  stop masks it. Several quoted values for a plain field used to stop outright; they now go through
+  the text choice, which is the one relaxation, and this is its limit. The same holds for the single
+  quoted value shortcut and for Jev's own value pick, which 1.4 makes the common route. The check
+  (`isKeywordSecret`) is narrower than the search scrub: a username may go into a username box.
+  Such a value is masked in the step, the history and the transcript wherever it lands. The keyword
+  regexes also take the word after an "is", "=" or ":" up to three words on ("password for github is
+  hunter2").
+- **Text the person picks (`USER`) does not make Enter commit.** The card names the field ("Pick the
+  text to type into '<field>'"), so the person chose both; this is deliberate, like quoted text.
