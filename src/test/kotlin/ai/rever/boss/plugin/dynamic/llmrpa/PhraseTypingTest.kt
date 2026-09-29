@@ -189,6 +189,49 @@ class PhraseTypingTest {
     }
 
     @Test
+    fun `spans with no inner stop word rank first`() {
+        assertEquals("cats", Candidates.phrases("search google for cats", listOf("https://duckduckgo.com/")).first())
+    }
+
+    @Test
+    fun `jev's text answer parses none and out-of-range picks as none`() {
+        fun reply(pick: String) = json("""{"response":{"answers":{"text":{"type":"choice","choice":"$pick","probabilities":{"$pick":0.8}}},"usage":{"cost":0.1}}}""")
+        assertEquals(TextChoice(1, 0.8, 0.1), JevDecider.parseText(reply("t2"), 3))
+        assertEquals(null, JevDecider.parseText(reply("none"), 3).index)
+        assertEquals(null, JevDecider.parseText(reply("t4"), 3).index)
+        assertEquals(null, JevDecider.parseText(reply("t0"), 3).index)
+    }
+
+    @Test
+    fun `a chat model's text that matches the instruction's words is still its own`() = runTest {
+        val chat = ModelOption(ModelOption.Kind.CHAT, "OPENROUTER", "OpenRouter", "openrouter/free")
+        val type = Candidates.build(wiki, task, writes = true).first { it.needsValue }.key
+        val enter = Candidates.build(wiki, task, writes = true).first { it.kind == Candidate.Kind.KEY }.key
+        var n = 0
+        val replies = listOf(
+            """{"action":"$type","value":"breast cancer","confidence":0.95,"irreversible":false}""",
+            """{"action":"$enter","confidence":0.95,"irreversible":false}""",
+        )
+        val api = object : ai.rever.boss.plugin.api.AiGatewayAPI {
+            override suspend fun complete(request: ai.rever.boss.plugin.api.AiRequest) =
+                Result.success(ai.rever.boss.plugin.api.AiReply(replies[n.coerceAtMost(1)].also { n++ }))
+            override fun stream(request: ai.rever.boss.plugin.api.AiRequest) = kotlinx.coroutines.flow.emptyFlow<ai.rever.boss.plugin.api.AiChunk>()
+            override suspend fun runAgent(
+                request: ai.rever.boss.plugin.api.AiRequest, tools: List<ai.rever.boss.plugin.api.AiToolSpec>, budget: ai.rever.boss.plugin.api.AiBudget,
+                invoke: suspend (ai.rever.boss.plugin.api.AiToolCall) -> ai.rever.boss.plugin.api.AiToolOutcome,
+            ) = Result.failure<ai.rever.boss.plugin.api.AiAgentResult>(UnsupportedOperationException())
+            override fun capabilities() = setOf(ai.rever.boss.plugin.api.AiGatewayAPI.CAPABILITY_PROVIDER_OVERRIDE)
+            override fun activeModel(): ai.rever.boss.plugin.api.AiModelInfo? = null
+        }
+        val tools = FakeTools(page = wiki) { _, _ -> error("jev is not used") }
+        var q: PendingQuestion? = null
+        val state = TaskRunner(tools, ChatDecider({ api }, chat), "t1", task, RunLimits(navSettleMs = 0, stepSettleMs = 0)) { q = it; Answer.Stop }.run()
+        assertEquals(StepRecord.ValueSource.MODEL, state.steps.first().valueSource)
+        // Enter after model-written text asks, even in a search box, as in 1.3.
+        assertEquals(1.0, assertIs<PendingQuestion.Confirm>(q).risk)
+    }
+
+    @Test
     fun `the chat prompt says a search term from the instruction may be typed`() {
         assertTrue(ChatDecider.SYSTEM.contains("search term taken from the instruction"))
         val ctx = StepContext(task, wiki, Candidates.build(wiki, task, writes = true), emptyList(), emptyList(), Candidates.phrases(task))

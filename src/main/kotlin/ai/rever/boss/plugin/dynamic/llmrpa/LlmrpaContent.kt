@@ -294,10 +294,13 @@ private fun Compose(
     collapsed: Boolean,
 ) {
     val values = remember(instruction) { Candidates.values(instruction) }
-    val phrases = remember(instruction) { Candidates.phrases(instruction) }
     val decision = model?.kind == ModelOption.Kind.DECISION
-    val hasTab = component.selectedTab.collectAsState().value != null
+    val tab = component.selectedTab.collectAsState().value
+    val hasTab = tab != null
+    // The page's host as the runner sees it, so the hint leaves out the site's name too.
     val newTab = component.newTab.collectAsState().value
+    val site = tab?.url?.takeIf { !newTab }
+    val phrases = remember(instruction, site) { Candidates.phrases(instruction, listOfNotNull(site)) }
     Column(
         Modifier.fillMaxWidth().widthIn(max = PaneMaxWidth).padding(12.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),

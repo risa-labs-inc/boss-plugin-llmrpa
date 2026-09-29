@@ -154,6 +154,20 @@ class StartPageTest {
     }
 
     @Test
+    fun `the search drops the word after a secret-sounding keyword`() {
+        listOf(
+            "log into my bank, username bob, password hunter2",
+            "log into my bank with password: hunter2 and username=bob",
+            "log into my bank, the password is hunter2, user name bob",
+        ).forEach { text ->
+            val q = java.net.URLDecoder.decode(StartPages.searchUrl(text)!!.substringAfter("q="), Charsets.UTF_8)
+            assertTrue("hunter2" !in q && "bob" !in q, q)
+            assertTrue("bank" in q, q)
+        }
+        assertEquals(listOf("pin 1234", "1234"), Candidates.keywordSecrets("use pin 1234"))
+    }
+
+    @Test
     fun `an empty page followed by NO_BROWSER reports the hint, not the stale page`() = runTest {
         val tools = FakeTools(decide = done)
         var n = 0

@@ -325,7 +325,8 @@ class TaskRunner(
                 )
                 source = source ?: when {
                     value in values -> StepRecord.ValueSource.QUOTED
-                    phrases.any { it.equals(value, ignoreCase = true) } -> StepRecord.ValueSource.PHRASE
+                    // A writer's text stays its own, even when it matches the instruction's words.
+                    !decider.writesText && phrases.any { it.equals(value, ignoreCase = true) } -> StepRecord.ValueSource.PHRASE
                     else -> StepRecord.ValueSource.MODEL
                 }
             }

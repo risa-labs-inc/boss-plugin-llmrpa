@@ -82,13 +82,15 @@ internal object StartPages {
     }
 
     /**
-     * A web search for [instruction] without its quoted text, emails or addresses: those are the
-     * values it may type (passwords included) and must not reach a search engine. Null when
+     * A web search for [instruction] without its quoted text, emails or addresses, which are the
+     * values it may type (passwords included), nor the word after "password", "pin" and the like
+     * ([Candidates.keywordSecrets]): none of it may reach a search engine. Null when
      * nothing is left to search for.
      */
     fun searchUrl(instruction: String): String? {
         var q = instruction
-        Candidates.scrubbable(instruction).sortedByDescending { it.length }.forEach { q = q.replace(it, " ") }
+        // Values first, then whatever follows "password", "pin" and the like, which is unquoted.
+        (Candidates.scrubbable(instruction).sortedByDescending { it.length } + Candidates.keywordSecrets(instruction)).forEach { q = q.replace(it, " ") }
         q = q.replace(Regex("[\"“”‘’']\\s*[\"“”‘’']"), " ").replace(Regex("\\s+"), " ").trim().take(200)
         if (q.count { it.isLetterOrDigit() } < 3) return null
         return "https://duckduckgo.com/?q=" + URLEncoder.encode(q, Charsets.UTF_8)
@@ -110,7 +112,7 @@ internal object StartPages {
             // values (the user's own addresses aside) keeps only its origin.
             val own = Candidates.urls(instruction).toSet()
             // Decoded once, so %20, + and any hex case compare as the raw value.
-            val secrets = Candidates.scrubbable(instruction).filter { it !in own && it.length >= 3 }
+            val secrets = (Candidates.scrubbable(instruction) + Candidates.keywordSecrets(instruction)).filter { it !in own && it.length >= 3 }
             fun leaks(u: String): Boolean {
                 val plain = runCatching { URLDecoder.decode(u, Charsets.UTF_8) }.getOrDefault(u)
                 return secrets.any { v -> u.contains(v, ignoreCase = true) || plain.contains(v, ignoreCase = true) }

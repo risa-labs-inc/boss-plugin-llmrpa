@@ -423,7 +423,7 @@ If you do not know a fitting site, reply {"url": null}.
                 alternatives = alternatives,
                 confidence = ((obj["confidence"] as? JsonPrimitive)?.doubleOrNull ?: 0.5).coerceIn(0.0, 1.0),
                 value = value,
-                valueWritten = value != null && value !in ctx.values && ctx.phrases.none { it.equals(value, ignoreCase = true) },
+                valueWritten = value != null && value !in ctx.values,
                 risk = (obj["irreversible"] as? JsonPrimitive)?.booleanOrNull?.let { if (it) 1.0 else 0.0 },
                 reason = (obj["reason"] as? JsonPrimitive)?.content,
             )

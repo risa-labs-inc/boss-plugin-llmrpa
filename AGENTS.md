@@ -407,7 +407,9 @@ Found by running, not reviewing:
   `0x7f.1`), else a DuckDuckGo search. Smart quotes (‘x’) count as quotes for typing and scrubbing.
 - **The search never carries the instruction's values.** Quoted text, emails and addresses are what
   a run may type, passwords included, so they are cut from the query; with nothing left the run stops
-  and asks for the site. An unquoted secret is not detected. The scrub uses `Candidates.scrubbable`,
+  and asks for the site. So is the word after "password", "pin", "username" and the like
+  (`Candidates.keywordSecrets`, also in the model-address leak check): crude, and it over-cuts, but New
+  tab is the default route to this search. Any other unquoted secret is not detected. The scrub uses `Candidates.scrubbable`,
   which is uncapped: `values` stops at 20 entries and 200-character quotes, fine for a typing list,
   a leak for a scrubber.
 - **A model's address may not carry the instruction's values either.** The model saw the whole
@@ -473,3 +475,8 @@ emails and addresses only, and Jev cannot write.
   searchbox, type search, or "search" in the label). The words are the person's, but the field was
   the model's pick, and "breast cancer" + Enter in a comment box posts it. Quoted and person-picked
   text keep the old rule (not committing); model-written text still always counts.
+- **Only a decider that cannot write gets `PHRASE`.** A chat model's text that happens to match a
+  phrase is still `MODEL`, so its timeline label and the Enter rule are exactly as in 1.3.
+- Phrase ranking puts spans with no inner stop word first, then longest: "search google for cats"
+  offers `cats` before `google for cats` (and `google`, between "search" and "for", counts as the site).
+- The panel hint passes the picked tab's address, so it leaves out the same site name the runner does.

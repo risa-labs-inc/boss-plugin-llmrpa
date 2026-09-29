@@ -127,6 +127,18 @@ internal object Candidates {
         return found.toList()
     }
 
+    private val SECRET_AFTER = Regex(
+        """\b(?:passwords?|passcode|passwd|pwd|pin|otp|token|secret|ssn|cvv|cvc|card(?: number)?|account(?: number)?|api key|user ?name|login)\b(?:\s*(?:is|=|:))?\s*([^\s,;]+)""",
+        RegexOption.IGNORE_CASE,
+    )
+
+    /**
+     * The unquoted word after a secret-sounding keyword ("password hunter2", "pin: 1234"), with the
+     * keyword. Crude, and it over-cuts ("pin the tab"), which only costs a search some words.
+     */
+    fun keywordSecrets(instruction: String): List<String> =
+        SECRET_AFTER.findAll(instruction).flatMap { listOf(it.value, it.groupValues[1]) }.distinct().toList()
+
     /** Quoted phrases alone: text meant to be typed, not a place to go. */
     fun quotedPhrases(instruction: String): List<String> =
         quotedAll.flatMap { re -> re.findAll(instruction).map { it.groupValues[1] }.toList() }
@@ -153,7 +165,7 @@ internal object Candidates {
     /**
      * Words from the instruction that could be typed when nothing is quoted: contiguous spans of up
      * to four words, never starting or ending on a stop or task word or on the site's name (a word
-     * before "home page", or a label of [addresses]' hosts or the instruction's own). Quoted
+     * before "home page", X in "search X for", or a label of [addresses]' hosts or the instruction's own). Quoted
      * text, emails and addresses are left out: they are [values] already. Longest first, capped.
      */
     fun phrases(instruction: String, addresses: List<String> = emptyList()): List<String> {
@@ -165,6 +177,8 @@ internal object Candidates {
         clauses.forEach { words ->
             words.forEachIndexed { i, w ->
                 if (i + 1 < words.size && SITE_SUFFIX.containsMatchIn(words.drop(i + 1).joinToString(" "))) sites += w.lowercase()
+                // "search google for cats": the word between is where, not what.
+                if (i in 1 until words.lastIndex && words[i - 1].equals("search", true) && words[i + 1].equals("for", true)) sites += w.lowercase()
             }
         }
         val found = mutableListOf<Pair<String, Int>>()
@@ -176,8 +190,11 @@ internal object Candidates {
                 found += span.joinToString(" ") to len
             }
         }
-        // Stable sort: equal lengths keep the instruction's order.
-        return found.sortedByDescending { it.second }.map { it.first }.distinctBy { it.lowercase() }.take(MAX_PHRASES)
+        // Spans with no inner stop word first ("cats" over "google for cats"), then longest. The sort
+        // is stable, so ties keep the instruction's order.
+        fun clean(p: String) = p.split(' ').none { it.lowercase() in STOP_WORDS }
+        return found.sortedWith(compareByDescending<Pair<String, Int>> { clean(it.first) }.thenByDescending { it.second })
+            .map { it.first }.distinctBy { it.lowercase() }.take(MAX_PHRASES)
     }
 
     /** The name-like labels of [address]'s host: `en.wikipedia.org` gives `wikipedia` (and `en`). */
