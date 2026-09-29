@@ -1,6 +1,7 @@
 package ai.rever.boss.plugin.dynamic.llmrpa
 
 import ai.rever.boss.plugin.api.ActiveTabData
+import ai.rever.boss.plugin.api.ActiveTabsProvider
 import ai.rever.boss.plugin.api.AiAgentResult
 import ai.rever.boss.plugin.api.AiBudget
 import ai.rever.boss.plugin.api.AiChunk
@@ -171,6 +172,25 @@ class StartPageTest {
     }
 
     @Test
+    fun `focus on a pane with no browser keeps a drivable pick`() = withMain {
+        var focused: String? = "t1"
+        val c = component(FakeTools(decide = done), FakeTabs(listOf(tab("t1")), focused = { focused }))
+        assertEquals("t1", c.selectedTab.value?.tabId)
+        focused = null
+        c.refreshDrivable()
+        assertEquals("t1", c.selectedTab.value?.tabId)
+        assertFalse(c.newTab.value)
+    }
+
+    @Test
+    fun `a throwing probe reads as drivable`() {
+        val provider = object : ActiveTabsProvider by FakeTabs(listOf(tab("t1"))) {
+            override fun getBrowserIntegration(tabId: String): ai.rever.boss.plugin.api.BrowserIntegration? = throw NoSuchMethodError("x")
+        }
+        assertTrue(StartPages.drivable(provider, "t1"))
+    }
+
+    @Test
     fun `the panel does not probe the host while a run holds a tab`() = withMain {
         val locks = TabLocks()
         val provider = FakeTabs(listOf(tab("t1")), focused = { "t1" })
@@ -293,18 +313,22 @@ class StartPageTest {
         assertTrue(slow.summary!!.contains("could not be read"), slow.summary)
         assertEquals(fast.openWaitsMs.size, never.observedTabs.size)
 
-        // Any other error ends the wait at once.
+        // Other errors are retried too (a script can fail mid-navigation), and the last one is reported.
         val broken = FakeTools(decide = done).apply { observeHook = { ToolReply("""{"error":{"code":"SCRIPT_FAILED","message":"boom"}}""", true) } }
         val failed = headless(broken, emptyList(), emptySet()).execute("Open https://orders.example/", null, 3, null, newTab = true).getOrThrow()
         assertTrue(failed.summary!!.contains("boom"), failed.summary)
-        assertEquals(1, broken.observedTabs.size)
+        assertEquals(fast.openWaitsMs.size, broken.observedTabs.size)
     }
 
     @Test
-    fun `the page read while waiting for the new tab is the first step's page`() = runTest {
+    fun `the new tab is read again after it settles, and that look is the first step's page`() = runTest {
         val tools = FakeTools(decide = done)
+        var n = 0
+        // Loading: an address but nothing rendered yet, then the page.
+        tools.observeHook = { if (n++ == 0) ToolReply("""{"url":"https://orders.example/","title":"","elements":[]}""", false) else null }
         headless(tools, emptyList(), emptySet()).execute("Open https://orders.example/", null, 3, null, newTab = true).getOrThrow()
-        assertEquals(1, tools.observedTabs.size)
+        // Empty, loaded, settled re-read; the loop does not look again.
+        assertEquals(3, tools.observedTabs.size)
     }
 
     @Test

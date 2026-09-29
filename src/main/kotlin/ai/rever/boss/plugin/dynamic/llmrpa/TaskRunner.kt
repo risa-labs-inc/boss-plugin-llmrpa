@@ -131,51 +131,65 @@ class TaskRunner(
 
     /**
      * Picks a start page, opens it in a new tab and waits until it reads. Only this open may use
-     * the chosen address: later "Go to" steps still come from the instruction alone.
+     * the chosen address: later "Go to" steps still come from the instruction alone. A tab that
+     * opened but cannot be used is left open for the person to check: the api has no close here.
      */
     private suspend fun openStartPage(): Pair<OpenedPage, PageSnapshot>? {
-        val nt = newTab ?: return null.also { finish(RunStatus.FAILED, "No tab to run on") }
+        val nt = newTab ?: return stop(RunStatus.FAILED, "No tab to run on")
         val choice = nt.startUrl?.let { StartPages.Choice(OpenedPage(it, StartSource.CALLER), 0, 0.0) }
             ?: try {
                 StartPages.choose(instruction, decider)
             } catch (e: StartPages.NoStartPage) {
-                return null.also { finish(RunStatus.STOPPED, e.message.orEmpty()) }
+                return stop(RunStatus.STOPPED, e.message.orEmpty())
             }
         _state.update { it.copy(calls = it.calls + choice.calls, costUsd = it.costUsd + choice.costUsd) }
         val url = choice.page.url
         val id = nt.open(url, StartPages.TAB_TITLE)
-            ?: return null.also { finish(RunStatus.FAILED, "Could not open a new tab for $url: BOSS did not create one. Open the page yourself and pick its tab.") }
-        nt.claim(id)?.let { refusal -> return null.also { finish(RunStatus.FAILED, refusal) } }
+            ?: return stop(RunStatus.FAILED, "Could not open a new tab for $url: BOSS did not create one. Open the page yourself and pick its tab.")
+        nt.claim(id)?.let { return stop(RunStatus.FAILED, it) }
         tabId = id
         _state.update { it.copy(tabId = id, opened = choice.page) }
         val page = awaitPage(id).getOrElse {
-            return null.also { _ -> finish(RunStatus.FAILED, "Opened $url, but the page could not be read: ${it.message}. Check the new tab and run again on it.") }
+            return stop(RunStatus.FAILED, "Opened $url, but the page could not be read: ${it.message}. Check the new tab and run again on it.")
         }
         return choice.page to page
     }
 
+    private fun stop(status: RunStatus, summary: String): Nothing? { finish(status, summary); return null }
+
     /**
-     * Bounded retries while the tab registers and loads (NO_BROWSER, TAB_NOT_FOUND, about:blank);
-     * any other error ends the wait at once.
+     * Bounded retries while the tab registers and loads; an error is retried too (a script can
+     * fail mid-navigation) and the last one reported. A page counts once it has an address and
+     * something to act on, then gets the navigation settle time and a fresh look, since pages
+     * rebuild widgets on load. A page that stays empty is used as it is when the budget runs out.
      */
     private suspend fun awaitPage(id: String): Result<PageSnapshot> {
-        var last = "it did not load"
+        var last = "it did not load after ${limits.openWaitsMs.sum() / 1000} s"
+        var empty: PageSnapshot? = null
         for (wait in limits.openWaitsMs) {
             delay(wait)
-            val reply = tools.invoke(ToolNames.OBSERVE, buildJsonObject { put("tab_id", id) })
-            val json = reply.json
-            if (!reply.isError && json != null) {
-                val page = PageSnapshot.parse(json)
-                if (page.url.isNotBlank() && page.url != "about:blank") return Result.success(page)
-                last = "it is still blank"
-            } else if (reply.errorCode in LOADING_CODES) {
-                last = "it did not load after ${limits.openWaitsMs.sum() / 1000} s"
-            } else {
-                return Result.failure(IllegalStateException(reply.errorMessage))
-            }
+            val page = read(id)
+            if (page == null) continue
+            if (page.url.isBlank() || page.url == "about:blank") { last = "it is still blank"; continue }
+            if (page.elements.isEmpty()) { empty = page; continue }
+            delay(limits.navSettleMs)
+            return Result.success(read(id)?.takeIf { it.url.isNotBlank() } ?: page)
         }
-        return Result.failure(IllegalStateException(last))
+        return empty?.let { Result.success(it) } ?: Result.failure(IllegalStateException(lastReadError ?: last))
     }
+
+    /** One look at [id], or null; a failed look's reason is kept in [lastReadError]. */
+    private suspend fun read(id: String): PageSnapshot? {
+        val reply = tools.invoke(ToolNames.OBSERVE, buildJsonObject { put("tab_id", id) })
+        val json = reply.json
+        if (reply.isError || json == null) {
+            if (reply.errorCode !in LOADING_CODES) lastReadError = reply.errorMessage
+            return null
+        }
+        return PageSnapshot.parse(json)
+    }
+
+    private var lastReadError: String? = null
 
     /** [first] is a page already read for this step, so the first look is not repeated. */
     private suspend fun loop(seed: List<String>, first: PageSnapshot?): RunState {

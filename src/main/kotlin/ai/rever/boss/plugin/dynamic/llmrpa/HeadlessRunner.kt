@@ -89,7 +89,7 @@ class HeadlessRunner(
             // so a probe racing a run's rpa_observe could hand that run the wrong tab. Unknown then
             // reads as drivable, and a NO_BROWSER at the first look still says why.
             // Re-checked before each tab, since a run can start mid-probe.
-            val canDrive = browserTabs.associate { it.tabId to (locks.anyBusy() || runCatching { drivable(it.tabId) }.getOrDefault(false)) }
+            val canDrive = browserTabs.associate { it.tabId to (locks.anyBusy() || runCatching { drivable(it.tabId) }.getOrDefault(true)) }
             if (browserTabs.isEmpty()) return Result.failure(IllegalStateException("No browser tab is open. Pass new_tab: true to open one."))
             // Never an arbitrary tab: it acts in the user's logged-in session, so the focused one or a named one.
             // Drivable tabs are the space on screen, which also makes a panel id unambiguous.

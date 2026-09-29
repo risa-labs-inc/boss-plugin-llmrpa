@@ -63,6 +63,7 @@ internal object StartPages {
     /**
      * A model's pick is a public site: a dotted name with an alphabetic TLD, so no localhost,
      * intranet suffixes, trailing dots, or IP literals in any spelling (`0x7f.1`, `127.1`, `[::1]`).
+     * A public name can still resolve privately (wildcard DNS such as nip.io); nothing here resolves.
      */
     private fun publicHost(host: String): Boolean {
         if (host.endsWith(".") || host.startsWith("[") || !host.contains('.')) return false
@@ -118,6 +119,7 @@ internal object StartPages {
         else "In another space (${tab.workspaceName.take(40)}) — switch to it to use this tab"
 
     /** Whether the host can drive [tabId] now, as RPA Engine resolves it. */
+    // A throw is unknown, which reads as drivable: the NO_BROWSER mapping then explains a failure.
     fun drivable(provider: ActiveTabsProvider, tabId: String): Boolean =
-        runCatching { provider.getBrowserIntegration(tabId)?.isBrowserAvailable() == true }.getOrDefault(false)
+        runCatching { provider.getBrowserIntegration(tabId)?.isBrowserAvailable() == true }.getOrDefault(true)
 }

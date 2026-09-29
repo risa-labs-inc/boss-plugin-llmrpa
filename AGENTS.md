@@ -408,8 +408,13 @@ Found by running, not reviewing:
   a run may type, passwords included, so they are cut from the query; with nothing left the run stops
   and asks for the site. An unquoted secret is not detected. `createBrowserTab`
   runs on Main (it edits split view state) and opens in the active space. The runner waits with
-  bounded backoff (`RunLimits.openWaitsMs`, about 13 s) while the reply is NO_BROWSER, TAB_NOT_FOUND
-  or about:blank; any other error ends the wait. The page it read is the first step's page.
+  bounded backoff (`RunLimits.openWaitsMs`, about 13 s), errors included (a script can fail
+  mid-navigation). A page counts once it has an address and elements; it then gets `navSettleMs`
+  and a fresh look, which is the first step's page.
+- **Focus on a pane with no browser keeps a drivable pick.** Clicking into a terminal and pressing
+  Run acts on the page just looked at; New tab is the target only when no drivable pick is left.
+- A probe that throws reads as drivable, like a skipped one. After a panel run the panel probes at
+  once, since the tab it opened was skipped while locked.
 - The chosen address is used **only for that open**. "Go to" candidates still come from the
   instruction alone, so a model-picked origin is never offered again mid-run.
 - The new tab's lock is taken by the runner once it exists (`NewTab.claim`) and released from

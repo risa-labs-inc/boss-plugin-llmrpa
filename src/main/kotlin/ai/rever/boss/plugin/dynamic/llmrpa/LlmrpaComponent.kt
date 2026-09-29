@@ -241,8 +241,9 @@ class LlmrpaComponent(
     }
 
     /**
-     * Moves the pick to the focused drivable tab, else to a new tab, unless the person chose or a
-     * run is going. Never an arbitrary open tab: Run acts in the person's logged-in session.
+     * Moves the pick to the focused drivable tab, unless the person chose or a run is going. With
+     * no drivable tab focused (a terminal pane, say) it keeps a pick that is still drivable, else
+     * targets a new tab. Never an arbitrary open tab: Run acts in the person's logged-in session.
      */
     private fun followFocusedTab() {
         if (tabPickedByUser || runJob?.isActive == true) return
@@ -253,8 +254,10 @@ class LlmrpaComponent(
             .getOrNull()
         val focused = id?.let { f -> tabs.firstOrNull { it.tabId == f } }
         if (focused == null) {
-            _selectedTab.value = null
-            _newTab.value = true
+            if (_selectedTab.value?.let { canDrive(it.tabId) } != true) {
+                _selectedTab.value = null
+                _newTab.value = true
+            }
         } else if (focused.tabId != _selectedTab.value?.tabId || _newTab.value) {
             _selectedTab.value = focused
             _newTab.value = false
@@ -606,7 +609,11 @@ class LlmrpaComponent(
             }
         }.also { job ->
             // On completion, not in finally: a job cancelled before it starts never runs its body.
-            job.invokeOnCompletion { r.state.value.tabId?.let(tabLocks::release) }
+            job.invokeOnCompletion {
+                r.state.value.tabId?.let(tabLocks::release)
+                // Probes skip while the run holds a tab, so the one it opened is not known yet.
+                scope.launch { probeDrivable() }
+            }
         }
         return null
     }
