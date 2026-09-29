@@ -107,14 +107,14 @@ internal object StartPages {
 
     class NoStartPage(message: String) : Exception(message)
 
-    /** Whether [tabId] is drivable per a probe result; null (not probed yet) reads as drivable. */
-    fun drivableIn(probed: Set<String>?, tabId: String): Boolean = probed?.contains(tabId) ?: true
+    /** Whether [tabId] is drivable per the probe results; a tab not probed yet reads as drivable. */
+    fun drivableIn(probed: Map<String, Boolean>?, tabId: String): Boolean = probed?.get(tabId) ?: true
 
     /**
      * Why a tab cannot be driven, for the picker and the headless listing. A tab whose space also
      * has a drivable tab is on screen, so its browser is just not loaded.
      */
-    fun awayReason(tab: ActiveTabData, tabs: List<ActiveTabData>, probed: Set<String>?): String =
+    fun awayReason(tab: ActiveTabData, tabs: List<ActiveTabData>, probed: Map<String, Boolean>?): String =
         if (tabs.any { it.workspaceId == tab.workspaceId && drivableIn(probed, it.tabId) }) "Not loaded yet — open it once to use this tab"
         else "In another space (${tab.workspaceName.take(40)}) — switch to it to use this tab"
 

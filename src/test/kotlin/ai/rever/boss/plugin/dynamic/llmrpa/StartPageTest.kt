@@ -157,7 +157,7 @@ class StartPageTest {
         val away = tab("t2", workspace = "Fluck")
         val provider = FakeTabs(listOf(here, away), focused = { "t1" }, drivable = setOf("t1"))
         val c = component(FakeTools(decide = done), provider)
-        assertEquals(setOf("t1"), c.drivable.value)
+        assertEquals(mapOf("t1" to true, "t2" to false), c.drivable.value)
         assertEquals("t1", c.selectedTab.value?.tabId)
 
         c.selectTab(away)
@@ -202,6 +202,13 @@ class StartPageTest {
         locks.release("t9")
         c.refreshDrivable()
         assertTrue(provider.probes > before)
+        // A tab opened while a run holds the probe off is unknown, so it is not shown as away.
+        locks.tryAcquire("t9", TabLocks.Owner.HEADLESS)
+        provider.tabs.value = provider.tabs.value + tab("t5")
+        assertNull(c.drivable.value!!["t5"])
+        c.selectTab(tab("t5"))
+        assertNull(c.blocker())
+        locks.release("t9")
         // The readiness tick does not probe every time.
         val afterOne = provider.probes
         c.recheck()
@@ -296,8 +303,9 @@ class StartPageTest {
     @Test
     fun `a tab that is not drivable in the space on screen is called not loaded, not away`() {
         val a = tab("t1"); val b = tab("t2"); val c = tab("t3", workspace = "Fluck")
-        assertTrue(StartPages.awayReason(b, listOf(a, b, c), setOf("t1")).startsWith("Not loaded"))
-        assertTrue(StartPages.awayReason(c, listOf(a, b, c), setOf("t1")).startsWith("In another space (Fluck)"))
+        val probed = mapOf("t1" to true, "t2" to false, "t3" to false)
+        assertTrue(StartPages.awayReason(b, listOf(a, b, c), probed).startsWith("Not loaded"))
+        assertTrue(StartPages.awayReason(c, listOf(a, b, c), probed).startsWith("In another space (Fluck)"))
     }
 
     @Test
@@ -310,7 +318,7 @@ class StartPageTest {
         val never = FakeTools(decide = done).apply { observeHook = { noBrowser(it) } }
         val slow = headless(never, emptyList(), emptySet()).execute("Open https://orders.example/", null, 3, null, newTab = true).getOrThrow()
         assertEquals(RunStatus.FAILED, slow.status)
-        assertTrue(slow.summary!!.contains("could not be read"), slow.summary)
+        assertTrue(slow.summary!!.contains("could not be read") && slow.summary.contains("another space"), slow.summary)
         assertEquals(fast.openWaitsMs.size, never.observedTabs.size)
 
         // Other errors are retried too (a script can fail mid-navigation), and the last one is reported.
@@ -318,6 +326,13 @@ class StartPageTest {
         val failed = headless(broken, emptyList(), emptySet()).execute("Open https://orders.example/", null, 3, null, newTab = true).getOrThrow()
         assertTrue(failed.summary!!.contains("boom"), failed.summary)
         assertEquals(fast.openWaitsMs.size, broken.observedTabs.size)
+    }
+
+    @Test
+    fun `a new tab that never renders anything is used as it is when the wait runs out`() = runTest {
+        val tools = FakeTools(decide = done).apply { observeHook = { ToolReply("""{"url":"https://orders.example/","title":"Orders","elements":[]}""", false) } }
+        val state = headless(tools, emptyList(), emptySet()).execute("Open https://orders.example/", null, 3, null, newTab = true).getOrThrow()
+        assertEquals(RunStatus.DONE, state.status)
     }
 
     @Test

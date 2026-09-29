@@ -35,7 +35,8 @@ internal class LlmrpaMcpToolProvider(
                     "real, logged-in browser session, as them, and can open any web address the instruction contains. " +
                     "By default it uses the focused tab. With new_tab: true it opens a new tab in the space on screen at the first " +
                     "address in the instruction, else one the model picks (https only), else a web search for the instruction; " +
-                    "start_url names that address instead and is opened as given. Only tabs in the space on screen can be driven. " +
+                    "start_url names that address instead and is opened as given, with no host filtering (as an address in the instruction is). " +
+                    "Only tabs in the space on screen can be driven. " +
                     "A model (Jev by default, or any configured chat model) picks each step and RPA Engine performs it. " +
                     "Stops instead of guessing when the model is unsure or the next action looks irreversible, and returns " +
                     "the steps taken. Put any text to type in quotes in the instruction. Each step is one to three paid model calls, " +

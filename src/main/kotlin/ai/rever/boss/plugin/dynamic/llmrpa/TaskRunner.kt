@@ -170,6 +170,7 @@ class TaskRunner(
             delay(wait)
             val page = read(id)
             if (page == null) continue
+            lastReadError = null
             if (page.url.isBlank() || page.url == "about:blank") { last = "it is still blank"; continue }
             if (page.elements.isEmpty()) { empty = page; continue }
             delay(limits.navSettleMs)
@@ -178,12 +179,19 @@ class TaskRunner(
         return empty?.let { Result.success(it) } ?: Result.failure(IllegalStateException(lastReadError ?: last))
     }
 
-    /** One look at [id], or null; a failed look's reason is kept in [lastReadError]. */
+    /**
+     * One look at [id], or null; the latest failure is kept in [lastReadError]. NO_BROWSER reads as
+     * still loading, but if it is the last word the tab most likely left the space on screen.
+     */
     private suspend fun read(id: String): PageSnapshot? {
         val reply = tools.invoke(ToolNames.OBSERVE, buildJsonObject { put("tab_id", id) })
         val json = reply.json
         if (reply.isError || json == null) {
-            if (reply.errorCode !in LOADING_CODES) lastReadError = reply.errorMessage
+            lastReadError = when (reply.errorCode) {
+                ToolNames.NO_BROWSER -> NO_BROWSER_HINT.removeSuffix(".")
+                in LOADING_CODES -> null
+                else -> reply.errorMessage
+            }
             return null
         }
         return PageSnapshot.parse(json)

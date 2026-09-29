@@ -413,6 +413,12 @@ Found by running, not reviewing:
   and a fresh look, which is the first step's page.
 - **Focus on a pane with no browser keeps a drivable pick.** Clicking into a terminal and pressing
   Run acts on the page just looked at; New tab is the target only when no drivable pick is left.
+- **Probe results are kept per tab** (`Map<String, Boolean>`), so a tab opened while a run held the
+  probe off is unknown, not away; a probe asked for mid-probe runs again after it. A set of drivable
+  ids made every unprobed tab look away for as long as a headless run held a lock (up to 10 min).
+- A NO_BROWSER that is still the last word when the new-tab wait runs out is reported with the hint.
+- Caller `start_url` and instruction addresses are deliberately not host-filtered (http, intranet
+  allowed); only a model's pick is held to the public-host rules.
 - A probe that throws reads as drivable, like a skipped one. After a panel run the panel probes at
   once, since the tab it opened was skipped while locked.
 - The chosen address is used **only for that open**. "Go to" candidates still come from the

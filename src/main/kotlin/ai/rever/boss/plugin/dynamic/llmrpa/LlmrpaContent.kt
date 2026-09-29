@@ -165,7 +165,7 @@ private fun Header(
 }
 
 /** What Run acts on: an open tab, or a new one it opens itself. */
-private data class TabTarget(val tabs: List<ActiveTabData>, val selected: ActiveTabData?, val newTab: Boolean, val drivable: Set<String>?) {
+private data class TabTarget(val tabs: List<ActiveTabData>, val selected: ActiveTabData?, val newTab: Boolean, val drivable: Map<String, Boolean>?) {
     fun canDrive(tabId: String) = StartPages.drivableIn(drivable, tabId)
 }
 

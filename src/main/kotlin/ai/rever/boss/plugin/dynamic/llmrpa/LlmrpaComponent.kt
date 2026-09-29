@@ -129,12 +129,17 @@ class LlmrpaComponent(
     /** Run opens the right page in a new tab instead of using [selectedTab]. The default when no drivable tab is focused. */
     val newTab: StateFlow<Boolean> = _newTab
 
-    private val _drivable = MutableStateFlow<Set<String>?>(null)
-    /** Tabs the host can drive now (only the space on screen resolves a browser); null until first probed, read as all. */
-    val drivable: StateFlow<Set<String>?> = _drivable
+    private val _drivable = MutableStateFlow<Map<String, Boolean>?>(null)
+    /**
+     * Probe results by tab: whether the host can drive it now (only the space on screen resolves a
+     * browser). A tab not probed yet, e.g. opened while a run held the probe off, reads as drivable.
+     */
+    val drivable: StateFlow<Map<String, Boolean>?> = _drivable
 
     private fun canDrive(tabId: String): Boolean = StartPages.drivableIn(_drivable.value, tabId)
     private val probing = AtomicBoolean(false)
+    /** A probe was asked for while one ran; it runs again when that one ends. */
+    private val probeAgain = AtomicBoolean(false)
     private var lastProbeAt = 0L
 
     private val _errorMessage = MutableStateFlow<String?>(null)
@@ -218,22 +223,24 @@ class LlmrpaComponent(
      */
     private fun probeDrivable() {
         val provider = activeTabsProvider ?: return followFocusedTab()
-        if (tabLocks.anyBusy() || !probing.compareAndSet(false, true)) return followFocusedTab()
+        if (tabLocks.anyBusy()) return followFocusedTab()
+        if (!probing.compareAndSet(false, true)) { probeAgain.set(true); return followFocusedTab() }
         lastProbeAt = System.currentTimeMillis()
         scope.launch {
             try {
                 val tabs = _availableTabs.value
                 withContext(io) {
-                    val out = mutableSetOf<String>()
+                    val out = mutableMapOf<String, Boolean>()
                     for (t in tabs) {
                         if (tabLocks.anyBusy()) return@withContext null
-                        if (StartPages.drivable(provider, t.tabId)) out += t.tabId
+                        out[t.tabId] = StartPages.drivable(provider, t.tabId)
                     }
                     out
                 }?.let { _drivable.value = it }
             } finally {
                 probing.set(false)
             }
+            if (probeAgain.getAndSet(false)) probeDrivable()
             // Readiness follows _drivable in its own collector: this first runs from the tab
             // collector in an earlier init block, before the model state exists.
             followFocusedTab()
@@ -585,11 +592,14 @@ class LlmrpaComponent(
         tab?.let { t -> tabLocks.tryAcquire(t.tabId, TabLocks.Owner.PANEL)?.let { return it } }
         _errorMessage.value = null
         val decider = if (model.kind == ModelOption.Kind.DECISION) JevDecider(tools, model) else ChatDecider(aiGateway, model)
-        val opener = if (tab != null) null else activeTabsProvider?.let { p ->
+        val opener = when {
+            tab != null -> null
             // On Main: the host adds the tab to its split view state.
-            NewTab(open = { url, title -> withContext(Dispatchers.Main) { p.createBrowserTab(url, title) } },
-                claim = { tabLocks.tryAcquire(it, TabLocks.Owner.PANEL) })
-        } ?: return Blocker.TAB.detail
+            else -> activeTabsProvider?.let { p ->
+                NewTab(open = { url, title -> withContext(Dispatchers.Main) { p.createBrowserTab(url, title) } },
+                    claim = { tabLocks.tryAcquire(it, TabLocks.Owner.PANEL) })
+            } ?: return Blocker.TAB.detail
+        }
         val r = TaskRunner(tools, decider, tab?.tabId, instruction, baseLimits.copy(maxSteps = _maxSteps.value), newTab = opener) { asker.ask(it) }
         runner = r
         runJob = scope.launch {
