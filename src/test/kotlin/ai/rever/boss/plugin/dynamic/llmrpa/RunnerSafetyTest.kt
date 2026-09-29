@@ -604,6 +604,62 @@ class RunnerSafetyTest {
         assertEquals(RunStatus.DONE, runner.execute(instruction, null, 3, null).getOrThrow().status)
     }
 
+    @Test
+    fun `enter still asks after a harmless click between the model's text and it`() = runTest {
+        val box = element("e8", "textbox", "Write a reply", tag = "textarea")
+        val also = element("e9", "checkbox", "Also show in channel")
+        val page = SEARCH_PAGE.copy(elements = listOf(box, also))
+        val tools = FakeTools(page = page) { _, _ -> error("jev is not used") }
+        val decider = chatDecider(
+            """{"action":"${key("Type into 'Write a reply'", page)}","value":"Sounds good","confidence":0.9,"irreversible":false}""",
+            """{"action":"${key("Check 'Also show in channel'", page)}","confidence":0.9,"irreversible":false}""",
+            """{"action":"${key("Press Enter", page)}","confidence":0.9,"irreversible":false}""",
+        )
+        var asked: PendingQuestion? = null
+        TaskRunner(tools, decider, "t1", "Reply to the message") { asked = it; Answer.Stop }.run()
+        assertEquals("Press Enter in 'Write a reply'", assertIs<PendingQuestion.Confirm>(asked).action.description)
+        assertEquals(2, tools.steps.size)
+    }
+
+    @Test
+    fun `an address that commits is risk checked like a click`() {
+        val text = "Open https://mail.example/unsubscribe?id=1 and https://mail.example/inbox"
+        val c = Candidates.build(SEARCH_PAGE, text).filter { it.kind == Candidate.Kind.NAVIGATE }
+        assertEquals(listOf(true, false), c.map { it.canCommit })
+    }
+
+    @Test
+    fun `a chat done check that gives no confidence cannot confirm the task`() = runTest {
+        val ctx = StepContext(instruction, SEARCH_PAGE, Candidates.build(SEARCH_PAGE, instruction), Candidates.values(instruction), emptyList())
+        assertTrue(chatDecider("""{"complete":true}""").verifyDone(ctx).isFailure)
+        assertEquals(0.0, chatDecider("""{"complete":false}""").verifyDone(ctx).getOrThrow().first)
+        assertEquals(0.9, chatDecider("""{"complete":true,"confidence":0.9}""").verifyDone(ctx).getOrThrow().first)
+    }
+
+    @Test
+    fun `a step cut off by the time limit is not reported as still running`() = runTest {
+        val inner = FakeTools { _, _ -> Triple("Open 'Sign in' link", 0.9, null) }
+        val tools = object : ToolInvoker by inner {
+            override suspend fun invoke(toolName: String, arguments: kotlinx.serialization.json.JsonElement): ToolReply =
+                if (toolName == ToolNames.STEP) kotlinx.coroutines.awaitCancellation() else inner.invoke(toolName, arguments)
+        }
+        val runner = TaskRunner(tools, JevDecider(tools, JEV), "t1", instruction) { Answer.Stop }
+        val state = kotlinx.coroutines.withTimeoutOrNull(60_000) { runner.run() } ?: runner.also { it.timedOut(60_000) }.state.value
+        val step = state.steps.single()
+        assertEquals(StepRecord.Outcome.FAILED, step.outcome)
+        assertTrue(step.detail!!.contains("may or may not"), step.detail)
+        assertEquals("failed", ((LlmrpaMcpToolProvider.transcript(state)["steps"] as kotlinx.serialization.json.JsonArray)[0] as kotlinx.serialization.json.JsonObject)["result"].let { (it as JsonPrimitive).content })
+    }
+
+    @Test
+    fun `a person's pick does not carry the model's runners-up`() = runTest {
+        val tools = FakeTools { _, call -> if (call == 0) Triple("Open 'Sign in' link", 0.4, null) else Triple("The task is complete", 0.95, null) }
+        val order = Candidates.build(SEARCH_PAGE, instruction).first { it.description == "Type into 'Search shop'" }
+        val state = TaskRunner(tools, JevDecider(tools, JEV), "t1", instruction) { q -> if (q is PendingQuestion.Choose) Answer.Pick(order) else Answer.Proceed }.run()
+        assertEquals(StepRecord.ChosenBy.USER, state.steps.first().chosenBy)
+        assertTrue(state.steps.first().alternatives.isEmpty())
+    }
+
     private fun tab(id: String, title: String = "Shop") = ActiveTabData(id, "fluck", title, "w", "Work", "p", "win", url = "https://shop.example/$id")
 
     private fun component(tools: ToolInvoker, locks: TabLocks = TabLocks(), provider: ActiveTabsProvider = tabs(listOf(tab("t1")))) =

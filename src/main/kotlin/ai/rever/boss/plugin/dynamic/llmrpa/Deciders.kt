@@ -248,8 +248,10 @@ class ChatDecider(
         return runCatching {
             val obj = Json.parseToJsonElement(LlmApiClient.firstJsonObject(reply.text) ?: error("The model did not reply with JSON")).jsonObject
             val complete = (obj["complete"] as? JsonPrimitive)?.booleanOrNull ?: false
-            val confidence = ((obj["confidence"] as? JsonPrimitive)?.doubleOrNull ?: 0.8).coerceIn(0.0, 1.0)
-            (if (complete) confidence else 1 - confidence) to 0.0
+            val confidence = (obj["confidence"] as? JsonPrimitive)?.doubleOrNull?.coerceIn(0.0, 1.0)
+            // A bare "complete: true" is the model's word alone, which this check exists to doubt.
+            val p = if (complete) confidence ?: error("The model said the task is complete without saying how sure") else 1 - (confidence ?: 1.0)
+            p to 0.0
         }
     }
 

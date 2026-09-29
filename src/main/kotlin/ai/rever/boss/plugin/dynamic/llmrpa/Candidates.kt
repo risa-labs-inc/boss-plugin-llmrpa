@@ -67,9 +67,11 @@ data class Candidate(
 
     /**
      * Whether this action could commit something on the page and so deserves a risk check. A select
-     * counts when its label says so: some sites submit on change.
+     * counts when its label says so (some sites submit on change), and so does an address that does
+     * (one-click unsubscribe, confirm and approve links act on a GET in a logged-in session).
      */
-    val canCommit: Boolean get() = kind == Kind.CLICK || kind == Kind.KEY || (kind == Kind.SELECT && Candidates.soundsCommitting(this))
+    val canCommit: Boolean get() = kind == Kind.CLICK || kind == Kind.KEY ||
+        ((kind == Kind.SELECT || kind == Kind.NAVIGATE) && Candidates.soundsCommitting(this))
 }
 
 data class StepAction(val type: String, val selector: SelectorInfo? = null, val value: String? = null)
@@ -157,7 +159,7 @@ internal object Candidates {
     }
 
     private val COMMIT_WORDS = Regex(
-        """\b(submit|pay|buy|purchase|order|send|delete|remove|confirm|check ?out|transfer|publish|post|sign ?up|register|save|accept|agree|book|reserve|donate|unsubscribe|cancel)\b""",
+        """\b(submit|pay|buy|purchase|order|send|delete|remove|confirm|check ?out|transfer|publish|post|sign ?up|register|save|accept|agree|book|reserve|donate|unsubscribe|cancel|approve|verify|activate)\b""",
         RegexOption.IGNORE_CASE,
     )
 

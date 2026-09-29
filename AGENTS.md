@@ -374,7 +374,12 @@ Found by running, not reviewing:
 - The run loop runs on `Dispatchers.Default` (each step parses the page and builds candidates);
   settle times live in `RunLimits`, not in mutable statics.
 - **Enter is judged by the field it lands in.** "Press Enter" alone names nothing, so the risk check
-  sees "Press Enter in '<last typed field>'", and Enter after text the model wrote always asks.
+  sees "Press Enter in '<last typed field>'", and Enter after text the model wrote always asks. The
+  field is kept until the page navigates: focus stays in it across a harmless click.
+- **A "Go to" address that sounds committing is risk-checked** (unsubscribe, confirm, approve links
+  act on a GET). A chat done check that says complete without a confidence cannot confirm the task.
+- A step cut off by Stop or the time limit is marked failed ("may or may not have happened"),
+  never left reading as running in the timeline or transcript.
 - **Chat models are asked for runners-up** (`alternatives`), so an unsure or stuck chat pick offers
   choices. A missing `confidence` reads as 0.5, below `askBelow`: that asks, deliberately.
 - **`waitFor` starts `ask` before publishing the question** (`async(UNDISPATCHED)`), so an answer

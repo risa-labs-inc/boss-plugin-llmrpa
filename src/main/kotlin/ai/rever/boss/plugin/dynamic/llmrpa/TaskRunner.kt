@@ -121,7 +121,8 @@ class TaskRunner(
         val history = mutableListOf<String>()
         var failures = 0
         var doneRejected = false
-        // The field the last step typed into, and whether the model wrote that text: Enter lands there.
+        // The field last typed into, and whether the model wrote that text: Enter lands there. Kept
+        // until the page navigates, since focus stays in the field across a harmless click.
         var typedInto: PageElement? = null
         var typedWritten = false
         // Counted in actions taken, so a rejected done check does not use up the budget.
@@ -226,14 +227,21 @@ class TaskRunner(
             }
             val action = chosen.action ?: return finish(RunStatus.FAILED, "'${chosen.description}' has nothing to perform")
 
-            val record = StepRecord(stepNo, description, decision.confidence, decision.alternatives.mapNotNull { (k, p) ->
+            // The model's runners-up describe its pick, not one the person made.
+            val runnersUp = if (chosenBy == StepRecord.ChosenBy.USER) emptyList() else decision.alternatives.mapNotNull { (k, p) ->
                 candidates.firstOrNull { it.key == k }?.let { it.description to p }
-            }, valueWritten = chosen.needsValue && !fromInstruction, chosenBy = chosenBy)
+            }
+            val record = StepRecord(stepNo, description, decision.confidence, runnersUp, valueWritten = chosen.needsValue && !fromInstruction, chosenBy = chosenBy)
             _state.update { it.copy(steps = it.steps + record) }
 
             val (ok, error, navigated) = act(action.copy(value = value), allowSensitive = chosen.element?.sensitive == true && fromInstruction)
-            typedInto = chosen.element.takeIf { chosen.needsValue && ok }
-            typedWritten = typedInto != null && !fromInstruction
+            if (chosen.needsValue && ok) {
+                typedInto = chosen.element
+                typedWritten = !fromInstruction
+            } else if (navigated) {
+                typedInto = null
+                typedWritten = false
+            }
             _state.update { s ->
                 s.copy(steps = s.steps.map {
                     if (it.index == stepNo) it.copy(outcome = if (ok) StepRecord.Outcome.OK else StepRecord.Outcome.FAILED, detail = error) else it
@@ -305,15 +313,22 @@ class TaskRunner(
     /** Ends a live run that ran past [limitMs]. */
     fun timedOut(limitMs: Long) {
         if (_state.value.status == RunStatus.RUNNING || _state.value.status == RunStatus.WAITING) {
-            finish(RunStatus.STOPPED, "Stopped at step ${_state.value.steps.size + 1}: the run reached its ${limitMs / 60_000}-minute limit")
+            interrupt("Interrupted by the time limit; it may or may not have happened")
+            finish(RunStatus.STOPPED, "Stopped at step ${_state.value.steps.size.coerceAtLeast(1)}: the run reached its ${limitMs / 60_000}-minute limit")
         }
     }
 
     /** Called when the coroutine is cancelled by Stop. */
     fun markStopped() {
         if (_state.value.status == RunStatus.RUNNING || _state.value.status == RunStatus.WAITING) {
+            interrupt("Stopped while running; it may or may not have happened")
             finish(RunStatus.STOPPED, "Stopped by you at step ${_state.value.steps.size.coerceAtLeast(1)}")
         }
+    }
+
+    /** A step cut off mid-action is not left reading as still running. */
+    private fun interrupt(detail: String) = _state.update { s ->
+        s.copy(steps = s.steps.map { if (it.outcome == StepRecord.Outcome.RUNNING) it.copy(outcome = StepRecord.Outcome.FAILED, detail = detail) else it })
     }
 
     companion object {
