@@ -3,6 +3,8 @@ package ai.rever.boss.plugin.dynamic.llmrpa
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
@@ -144,11 +146,18 @@ class TaskRunner(
             }
         _state.update { it.copy(calls = it.calls + choice.calls, costUsd = it.costUsd + choice.costUsd) }
         val url = choice.page.url
-        val id = nt.open(url, StartPages.TAB_TITLE)
-            ?: return stop(RunStatus.FAILED, "Could not open a new tab for $url: BOSS did not create one. Open the page yourself and pick its tab.")
-        nt.claim(id)?.let { return stop(RunStatus.FAILED, it) }
-        tabId = id
-        _state.update { it.copy(tabId = id, opened = choice.page) }
+        // Not cancellable: a Stop landing mid-create would lose the id of a tab that exists.
+        var refusal: String? = null
+        val id = withContext(NonCancellable) {
+            nt.open(url, StartPages.TAB_TITLE)?.also { id ->
+                refusal = nt.claim(id)
+                if (refusal == null) {
+                    tabId = id
+                    _state.update { it.copy(tabId = id, opened = choice.page) }
+                }
+            }
+        } ?: return stop(RunStatus.FAILED, "Could not open a new tab for $url: BOSS did not create one. Open the page yourself and pick its tab.")
+        refusal?.let { return stop(RunStatus.FAILED, "Opened $id, but: $it") }
         val page = awaitPage(id).getOrElse {
             return stop(RunStatus.FAILED, "Opened $url, but the page could not be read: ${it.message}. Check the new tab and run again on it.")
         }

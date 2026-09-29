@@ -410,10 +410,12 @@ Found by running, not reviewing:
   which is uncapped: `values` stops at 20 entries and 200-character quotes, fine for a typing list,
   a leak for a scrubber.
 - **A model's address may not carry the instruction's values either.** The model saw the whole
-  instruction, passwords included; a URL containing any value (raw or form-encoded, the
+  instruction, passwords included; a URL containing any value (compared raw and percent-decoded, the
   instruction's own addresses aside) is cut to its origin. A search URL the model builds from a
   quoted term loses its path too, which is the price.
-- An address outside quotes is preferred as the start page: quoted text is for typing. `createBrowserTab`
+- An address outside quotes is preferred as the start page: quoted text is for typing.
+- The create-and-claim runs `NonCancellable`, so a Stop mid-create still records the tab it made. A
+  start-address call that went out and failed counts in `model_calls` (`StartUrlCallFailed`). `createBrowserTab`
   runs on Main (it edits split view state) and opens in the active space. The runner waits with
   bounded backoff (`RunLimits.openWaitsMs`, about 13 s), errors included (a script can fail
   mid-navigation). A page counts once it has an address and elements; it then gets `navSettleMs`

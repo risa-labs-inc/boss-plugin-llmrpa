@@ -79,6 +79,9 @@ interface StepDecider {
 /** A model's suggested start address, unvalidated. */
 data class StartUrlReply(val url: String?, val costUsd: Double = 0.0)
 
+/** The start-address request went out and failed, so it counts as a call. */
+class StartUrlCallFailed(cause: Throwable) : Exception(cause.message, cause)
+
 /**
  * Jev picks each step with one `jev_decide` call: which action, and which instruction value to
  * type. It cannot write text, so a typed value is always one the instruction contains.
@@ -275,7 +278,7 @@ class ChatDecider(
         val reply = api.complete(
             AiRequest(system = START_SYSTEM, messages = listOf(AiMessage.user("Instruction: ${quote(instruction, 1_000)}")),
                 temperature = 0f, maxTokens = 2_000, timeoutMs = 90_000, extras = routingExtras(option)),
-        ).getOrElse { return@guarded Result.failure(it) }
+        ).getOrElse { return@guarded Result.failure(StartUrlCallFailed(it)) }
         Result.success(StartUrlReply(parseStartUrl(reply.text)))
     }
 

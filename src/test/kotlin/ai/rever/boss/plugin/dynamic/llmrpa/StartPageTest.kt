@@ -123,6 +123,10 @@ class StartPageTest {
         assertEquals(StartSource.MODEL, leaky.page.source)
         val encoded = StartPages.choose("Search for 'wireless keyboard'", chatDecider("""{"url":"https://shop.example/s?k=wireless+keyboard"}"""))
         assertEquals("https://shop.example/", encoded.page.url)
+        val spaced = StartPages.choose("Sign in with passphrase 'my secret phrase'", chatDecider("""{"url":"https://shop.example/login?pw=my%20Secret%20phrase"}"""))
+        assertEquals("https://shop.example/", spaced.page.url)
+        val inPath = StartPages.choose("Search for 'wireless keyboard'", chatDecider("""{"url":"https://shop.example/search/wireless%20keyboard"}"""))
+        assertEquals("https://shop.example/", inPath.page.url)
         val clean = StartPages.choose(text, chatDecider("""{"url":"https://shop.example/orders"}"""))
         assertEquals("https://shop.example/orders", clean.page.url)
     }
@@ -396,6 +400,41 @@ class StartPageTest {
         assertEquals(listOf("https://orders.example/", "https://b.example/"), opened)
         val schema = provider.tools().first { it.name == "llmrpa_execute" }.inputSchema
         assertTrue(schema.contains("\"new_tab\"") && schema.contains("\"start_url\""), schema)
+    }
+
+    @Test
+    fun `a start-address call that went out and failed still counts as a call`() = runTest {
+        val failing = ChatDecider({
+            object : AiGatewayAPI {
+                override suspend fun complete(request: AiRequest): Result<AiReply> = Result.failure(IllegalStateException("HTTP 502"))
+                override fun stream(request: AiRequest): Flow<AiChunk> = emptyFlow()
+                override suspend fun runAgent(request: AiRequest, tools: List<AiToolSpec>, budget: AiBudget, invoke: suspend (AiToolCall) -> AiToolOutcome): Result<AiAgentResult> =
+                    Result.failure(UnsupportedOperationException())
+                override fun capabilities(): Set<String> = setOf(AiGatewayAPI.CAPABILITY_PROVIDER_OVERRIDE)
+                override fun activeModel(): AiModelInfo? = null
+            }
+        }, chat)
+        val choice = StartPages.choose("Check the weather", failing)
+        assertEquals(StartSource.SEARCH, choice.page.source)
+        assertEquals(1, choice.calls)
+        assertEquals("HTTP 502", choice.page.note)
+    }
+
+    @Test
+    fun `a headless run that times out before its tab exists releases nothing and names no tab`() = runTest {
+        val locks = TabLocks()
+        val slowDecider = object : StepDecider by JevDecider(FakeTools(decide = done), JEV) {
+            override suspend fun startUrl(instruction: String): Result<StartUrlReply> = kotlinx.coroutines.awaitCancellation()
+        }
+        assertNull(locks.tryAcquire("other", TabLocks.Owner.PANEL))
+        val runner = TaskRunner(FakeTools(decide = done), slowDecider, null, "Check the weather", fast,
+            newTab = NewTab(open = { _, _ -> error("must not open") }, claim = { locks.tryAcquire(it, TabLocks.Owner.HEADLESS) })) { Answer.Stop }
+        val state = kotlinx.coroutines.withTimeoutOrNull(1_000) { runner.run() } ?: runner.also { it.timedOut(1_000) }.state.value
+        assertEquals(RunStatus.STOPPED, state.status)
+        assertNull(state.tabId)
+        assertNull(LlmrpaMcpToolProvider.transcript(state)["opened"])
+        // The other tab's lock is untouched.
+        assertEquals(TabLocks.Owner.PANEL.busy, locks.tryAcquire("other", TabLocks.Owner.HEADLESS))
     }
 
     @Test

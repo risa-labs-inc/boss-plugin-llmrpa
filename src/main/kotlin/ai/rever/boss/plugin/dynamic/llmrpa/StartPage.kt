@@ -3,6 +3,7 @@ package ai.rever.boss.plugin.dynamic.llmrpa
 import ai.rever.boss.plugin.api.ActiveTabData
 import ai.rever.boss.plugin.api.ActiveTabsProvider
 import java.net.URI
+import java.net.URLDecoder
 import java.net.URLEncoder
 
 /**
@@ -98,14 +99,17 @@ internal object StartPages {
         fromInstruction(instruction)?.let { return Choice(OpenedPage(it, StartSource.INSTRUCTION), 0, 0.0) }
         val reply = decider.startUrl(instruction)
         val suggested = reply.getOrNull()
-        val calls = if (suggested != null) 1 else 0
+        // A call that went out and failed may still have been billed.
+        val calls = if (suggested != null || reply.exceptionOrNull() is StartUrlCallFailed) 1 else 0
         val cost = suggested?.costUsd ?: 0.0
         usable(suggested?.url, httpsOnly = true)?.let { url ->
             // The model saw the whole instruction, secrets included: an address carrying any of its
             // values (the user's own addresses aside) keeps only its origin.
             val own = Candidates.urls(instruction).toSet()
+            // Decoded once, so %20, + and any hex case compare as the raw value.
+            val plain = runCatching { URLDecoder.decode(url, Charsets.UTF_8) }.getOrDefault(url)
             val leaks = Candidates.scrubbable(instruction).filter { it !in own && it.length >= 3 }
-                .any { v -> url.contains(v, ignoreCase = true) || url.contains(URLEncoder.encode(v, Charsets.UTF_8), ignoreCase = true) }
+                .any { v -> url.contains(v, ignoreCase = true) || plain.contains(v, ignoreCase = true) }
             if (!leaks) return Choice(OpenedPage(url, StartSource.MODEL), calls, cost)
             val origin = URI(url).let { "${it.scheme}://${it.rawAuthority}/" }
             return Choice(OpenedPage(origin, StartSource.MODEL, "its path carried text from your instruction, so only the site was opened"), calls, cost)

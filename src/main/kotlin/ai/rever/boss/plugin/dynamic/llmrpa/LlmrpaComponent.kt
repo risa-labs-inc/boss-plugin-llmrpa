@@ -140,7 +140,7 @@ class LlmrpaComponent(
     private val probing = AtomicBoolean(false)
     /** A probe was asked for while one ran; it runs again when that one ends. */
     private val probeAgain = AtomicBoolean(false)
-    private var lastProbeAt = 0L
+    @Volatile private var lastProbeAt = 0L
 
     private val _errorMessage = MutableStateFlow<String?>(null)
     val errorMessage: StateFlow<String?> = _errorMessage
