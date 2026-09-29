@@ -42,6 +42,10 @@ class PhraseTypingTest {
         val q = Candidates.phrases("Log in as ada@example.com with 'hunter two' at https://shop.example/login and buy socks")
         assertTrue(q.none { "hunter" in it || "ada" in it || "example" in it }, q.toString())
         assertTrue("socks" in q, q.toString())
+        // An unquoted password is not a phrase either.
+        val pw = Candidates.phrases("log in with username bob and password hunter2, then search cats")
+        assertTrue(pw.none { "hunter2" in it || "bob" in it || "password" in it }, pw.toString())
+        assertTrue("cats" in pw, pw.toString())
         assertTrue(Candidates.phrases("red green blue cyan magenta yellow black white orange purple").size <= 8)
         assertEquals(emptyList(), Candidates.phrases("Open the home page"))
     }

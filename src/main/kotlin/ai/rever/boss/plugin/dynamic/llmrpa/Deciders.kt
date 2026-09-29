@@ -119,10 +119,10 @@ class JevDecider(private val tools: ToolInvoker, override val option: ModelOptio
         return guarded { Result.success(noul(reply, "complete")) }
     }
 
-    override suspend fun chooseText(ctx: StepContext, field: String, options: List<String>): Result<TextChoice> {
+    override suspend fun chooseText(ctx: StepContext, field: String, options: List<String>): Result<TextChoice> = guarded {
         val reply = tools.invoke(ToolNames.JEV_DECIDE, textArgs(ctx, field, options, option.modelId))
-        if (reply.isError) return Result.failure(IllegalStateException(reply.errorMessage))
-        return guarded { Result.success(parseText(reply.json ?: error("Jev returned no JSON"), options.size)) }
+        if (reply.isError) Result.failure(IllegalStateException(reply.errorMessage))
+        else Result.success(parseText(reply.json ?: error("Jev returned no JSON"), options.size))
     }
 
     // jev_decide answers choice, yes/no and score questions only, so it cannot write an address.

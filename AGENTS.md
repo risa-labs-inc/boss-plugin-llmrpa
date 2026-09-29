@@ -408,7 +408,8 @@ Found by running, not reviewing:
 - **The search never carries the instruction's values.** Quoted text, emails and addresses are what
   a run may type, passwords included, so they are cut from the query; with nothing left the run stops
   and asks for the site. So is the word after "password", "pin", "username" and the like
-  (`Candidates.keywordSecrets`, also in the model-address leak check): crude, and it over-cuts, but New
+  (`Candidates.keywordSecrets`, also in the model-address leak check and cut from `phrases`, so Jev
+  never types an unquoted password): crude, and it over-cuts, but New
   tab is the default route to this search. Any other unquoted secret is not detected. The scrub uses `Candidates.scrubbable`,
   which is uncapped: `values` stops at 20 entries and 200-character quotes, fine for a typing list,
   a leak for a scrubber.

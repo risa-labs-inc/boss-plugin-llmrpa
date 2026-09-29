@@ -166,11 +166,13 @@ internal object Candidates {
      * Words from the instruction that could be typed when nothing is quoted: contiguous spans of up
      * to four words, never starting or ending on a stop or task word or on the site's name (a word
      * before "home page", X in "search X for", or a label of [addresses]' hosts or the instruction's own). Quoted
-     * text, emails and addresses are left out: they are [values] already. Longest first, capped.
+     * text, emails and addresses are left out (they are [values] already), and so is [keywordSecrets].
+     * Spans with no inner stop word first, then longest; capped.
      */
     fun phrases(instruction: String, addresses: List<String> = emptyList()): List<String> {
         var text = instruction
-        scrubbable(instruction).sortedByDescending { it.length }.forEach { text = text.replace(it, " , ") }
+        // The word after "password" and the like goes too: before 1.4 unquoted text was never typed.
+        (scrubbable(instruction).sortedByDescending { it.length } + keywordSecrets(instruction)).forEach { text = text.replace(it, " , ") }
         val sites = (addresses + urls(instruction)).flatMap { hostLabels(it) }.toMutableSet()
         // Clauses break on punctuation, so a span never runs across "page, then".
         val clauses = text.split(Regex("""[.,;:!?()\[\]{}"“”‘’]|\s'|'\s""")).map { c -> word.findAll(c).map { it.value }.toList() }
