@@ -166,11 +166,10 @@ private fun Header(
 
 /** What Run acts on: an open tab, or a new one it opens itself. */
 private data class TabTarget(val tabs: List<ActiveTabData>, val selected: ActiveTabData?, val newTab: Boolean, val drivable: Set<String>?) {
-    fun canDrive(tabId: String) = drivable?.contains(tabId) ?: true
+    fun canDrive(tabId: String) = StartPages.drivableIn(drivable, tabId)
 }
 
 private const val NEW_TAB_LABEL = "New tab (pick the page for me)"
-private const val AWAY_DETAIL = "In another space — switch to it to use this tab"
 
 /** The tab every action lands on. Always visible, because it is where clicks will happen. */
 @Composable
@@ -212,7 +211,7 @@ private fun TabPicker(component: LlmrpaComponent, target: TabTarget, showHost: B
                 tabs.sortedByDescending { target.canDrive(it.tabId) }.forEach { t ->
                     val canDrive = target.canDrive(t.tabId)
                     MenuRow(t.title.ifBlank { host(t.url) }, onClick = { open = false; component.selectTab(t) },
-                        detail = if (canDrive) host(t.url) else AWAY_DETAIL, selected = t.tabId == selected?.tabId, enabled = canDrive)
+                        detail = if (canDrive) host(t.url) else StartPages.awayReason(t, tabs, target.drivable), selected = t.tabId == selected?.tabId, enabled = canDrive)
                 }
             }
         }

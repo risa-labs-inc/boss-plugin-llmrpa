@@ -77,12 +77,8 @@ class LlmrpaDynamicPlugin : DynamicPlugin {
                 headless = HeadlessRunner(
                     tools, aiGateway, llmProvider,
                     tabs = { activeTabsProvider?.activeTabs?.value.orEmpty() },
-                    activeTabId = {
-                        activeTabsProvider?.let { p ->
-                            // Drivable tabs only: they are the space on screen, which also makes a panel id unambiguous.
-                            val onScreen = if (tabLocks.anyBusy()) p.activeTabs.value else p.activeTabs.value.filter { StartPages.drivable(p, it.tabId) }
-                            HeadlessRunner.activeTab(onScreen, p.activePanelId) { ws, panel -> p.selectedTabId(ws, panel) }
-                        }
+                    activeTabId = { candidates ->
+                        activeTabsProvider?.let { p -> HeadlessRunner.activeTab(candidates, p.activePanelId) { ws, panel -> p.selectedTabId(ws, panel) } }
                     },
                     drivable = { id -> activeTabsProvider?.let { StartPages.drivable(it, id) } == true },
                     // On Main: the host adds the tab to its split view state.

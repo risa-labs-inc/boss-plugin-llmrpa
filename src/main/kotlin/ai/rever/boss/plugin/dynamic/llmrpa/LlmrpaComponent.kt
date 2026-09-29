@@ -26,6 +26,7 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.concurrent.atomic.AtomicBoolean
 
 private const val AI_PROVIDERS_SETTINGS_SECTION = "LLM_PROVIDERS"
 
@@ -132,8 +133,9 @@ class LlmrpaComponent(
     /** Tabs the host can drive now (only the space on screen resolves a browser); null until first probed, read as all. */
     val drivable: StateFlow<Set<String>?> = _drivable
 
-    private fun canDrive(tabId: String): Boolean = _drivable.value?.contains(tabId) ?: true
-    private val probing = java.util.concurrent.atomic.AtomicBoolean(false)
+    private fun canDrive(tabId: String): Boolean = StartPages.drivableIn(_drivable.value, tabId)
+    private val probing = AtomicBoolean(false)
+    private var lastProbeAt = 0L
 
     private val _errorMessage = MutableStateFlow<String?>(null)
     val errorMessage: StateFlow<String?> = _errorMessage
@@ -209,17 +211,26 @@ class LlmrpaComponent(
     }
 
     /**
-     * Re-reads which tabs the host can drive, off the UI thread, then re-targets. Skipped while a
-     * run holds a tab: the host resolves browsers through one static "selected tab", so a probe
-     * racing a run's rpa_observe could hand that run the wrong tab.
+     * Re-reads which tabs the host can drive, off the UI thread, then re-targets. Not while a run
+     * holds a tab, re-checked before each tab: the host resolves browsers through one static
+     * "selected tab", so a probe racing a run's rpa_observe could hand that run the wrong tab.
+     * An abandoned probe keeps the last answer.
      */
     private fun probeDrivable() {
         val provider = activeTabsProvider ?: return followFocusedTab()
         if (tabLocks.anyBusy() || !probing.compareAndSet(false, true)) return followFocusedTab()
+        lastProbeAt = System.currentTimeMillis()
         scope.launch {
             try {
                 val tabs = _availableTabs.value
-                _drivable.value = withContext(io) { tabs.filter { StartPages.drivable(provider, it.tabId) }.map { it.tabId }.toSet() }
+                withContext(io) {
+                    val out = mutableSetOf<String>()
+                    for (t in tabs) {
+                        if (tabLocks.anyBusy()) return@withContext null
+                        if (StartPages.drivable(provider, t.tabId)) out += t.tabId
+                    }
+                    out
+                }?.let { _drivable.value = it }
             } finally {
                 probing.set(false)
             }
@@ -493,7 +504,8 @@ class LlmrpaComponent(
             jevSeen = jevNow
             refreshModels()
         }
-        probeDrivable()
+        // Space switches have no signal, so re-probe now and then; tab changes and the picker probe at once.
+        if (now - lastProbeAt >= PROBE_EVERY_MS) probeDrivable() else followFocusedTab()
         _readiness.value = blocker()
     }
 
@@ -616,6 +628,7 @@ class LlmrpaComponent(
 
     private companion object {
         const val READINESS_POLL_MS = 2_000L
+        const val PROBE_EVERY_MS = 10_000L
 
         /** Statuses that carry something worth showing in the panel. */
         val SHOWABLE_STATUSES = setOf("success", "error", LlmApiClient.STATUS_EXAMPLE)

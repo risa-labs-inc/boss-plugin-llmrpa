@@ -78,6 +78,8 @@ class StartPageTest {
         listOf(
             "http://example.com", "javascript:alert(1)", "data:text/html,hi", "file:///etc/passwd", "https://user:pw@example.com/",
             "https://localhost/", "https://127.0.0.1/", "https://[::1]/", "https://exa mple.com", "example.com", "", null,
+            "https://0x7f.1/", "https://127.1/", "https://localhost./", "https://foo.localhost/", "https://nas.local/",
+            "https://git.internal/", "https://router.lan/", "https://box.home.arpa/", "https://example.com./",
         ).forEach { assertNull(StartPages.usable(it, httpsOnly = true), "$it") }
     }
 
@@ -110,6 +112,22 @@ class StartPageTest {
         assertEquals("https://duckduckgo.com/?q=Check+the+weather+%26+wind", jev.page.url)
         assertEquals(0, jev.calls)
         assertEquals(0, tools.decideCalls)
+    }
+
+    @Test
+    fun `the search never carries the quoted values, emails or addresses from the instruction`() = runTest {
+        val text = "Log in to my bank with username \"ada@bank.example\" and password 'hunter2', then download the statement"
+        val choice = StartPages.choose(text, JevDecider(FakeTools(decide = done), JEV))
+        val url = choice.page.url
+        assertEquals(StartSource.SEARCH, choice.page.source)
+        listOf("hunter2", "ada", "bank.example", "%22", "%27").forEach { assertFalse(url.contains(it), "$it in $url") }
+        assertTrue(url.contains("Log+in+to+my+bank"), url)
+
+        // Nothing left to search for: stop and ask for the site rather than search for the secret.
+        val bare = TaskRunner(FakeTools(decide = done), JevDecider(FakeTools(decide = done), JEV), null, "'hunter2'", fast,
+            newTab = NewTab(open = { _, _ -> error("must not open") }, claim = { null })) { Answer.Stop }.run()
+        assertEquals(RunStatus.STOPPED, bare.status)
+        assertTrue(bare.summary!!.contains("Put the site's address in the instruction"), bare.summary)
     }
 
     // ---- NO_BROWSER ----
@@ -159,11 +177,15 @@ class StartPageTest {
         val c = component(FakeTools(decide = done), provider, locks)
         val before = provider.probes
         locks.tryAcquire("t9", TabLocks.Owner.HEADLESS)
-        c.recheck()
+        c.refreshDrivable()
         assertEquals(before, provider.probes)
         locks.release("t9")
-        c.recheck()
+        c.refreshDrivable()
         assertTrue(provider.probes > before)
+        // The readiness tick does not probe every time.
+        val afterOne = provider.probes
+        c.recheck()
+        assertEquals(afterOne, provider.probes)
     }
 
     @Test
@@ -238,9 +260,24 @@ class StartPageTest {
         val r = headless(FakeTools(decide = done), tabs, setOf("t1"))
         val err = r.execute("x", "t2", 3, null).exceptionOrNull()!!.message!!
         assertTrue(err.contains(NO_BROWSER_HINT) && err.contains("new_tab"), err)
-        assertTrue(err.contains("t2 ('Tab t2', shop.example, in another space 'Fluck', not drivable)"), err)
+        assertTrue(err.contains("t2 ('Tab t2', shop.example, not drivable: In another space (Fluck) — switch to it to use this tab)"), err)
         assertFalse(err.substringAfter("one of: ").startsWith("t2"), "drivable tabs are listed first: $err")
         assertEquals(RunStatus.DONE, r.execute("x", "t1", 3, null).getOrThrow().status)
+
+        // Focused only in the host's eyes: the drivable tabs are what it is asked about.
+        val asked = mutableListOf<List<String>>()
+        val focused = HeadlessRunner(FakeTools(decide = done), { null }, { null }, tabs = { tabs }, activeTabId = { c -> asked += c.map { it.tabId }; null },
+            drivable = { it == "t1" }, openTab = { _, _ -> null }, locks = TabLocks(), limits = fast)
+        val none = focused.execute("x", null, 3, null).exceptionOrNull()!!.message!!
+        assertTrue(none.startsWith("No drivable tab is focused"), none)
+        assertEquals(listOf(listOf("t1")), asked)
+    }
+
+    @Test
+    fun `a tab that is not drivable in the space on screen is called not loaded, not away`() {
+        val a = tab("t1"); val b = tab("t2"); val c = tab("t3", workspace = "Fluck")
+        assertTrue(StartPages.awayReason(b, listOf(a, b, c), setOf("t1")).startsWith("Not loaded"))
+        assertTrue(StartPages.awayReason(c, listOf(a, b, c), setOf("t1")).startsWith("In another space (Fluck)"))
     }
 
     @Test
@@ -255,6 +292,19 @@ class StartPageTest {
         assertEquals(RunStatus.FAILED, slow.status)
         assertTrue(slow.summary!!.contains("could not be read"), slow.summary)
         assertEquals(fast.openWaitsMs.size, never.observedTabs.size)
+
+        // Any other error ends the wait at once.
+        val broken = FakeTools(decide = done).apply { observeHook = { ToolReply("""{"error":{"code":"SCRIPT_FAILED","message":"boom"}}""", true) } }
+        val failed = headless(broken, emptyList(), emptySet()).execute("Open https://orders.example/", null, 3, null, newTab = true).getOrThrow()
+        assertTrue(failed.summary!!.contains("boom"), failed.summary)
+        assertEquals(1, broken.observedTabs.size)
+    }
+
+    @Test
+    fun `the page read while waiting for the new tab is the first step's page`() = runTest {
+        val tools = FakeTools(decide = done)
+        headless(tools, emptyList(), emptySet()).execute("Open https://orders.example/", null, 3, null, newTab = true).getOrThrow()
+        assertEquals(1, tools.observedTabs.size)
     }
 
     @Test

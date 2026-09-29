@@ -39,8 +39,8 @@ class HeadlessRunner(
     private val gateway: () -> AiGatewayAPI?,
     private val llmProvider: () -> LlmProvider?,
     private val tabs: () -> List<ActiveTabData>,
-    /** The tab the user is looking at, or null when the host cannot say. */
-    private val activeTabId: () -> String?,
+    /** The tab the user is looking at among these (drivable) tabs, or null when the host cannot say. */
+    private val activeTabId: (List<ActiveTabData>) -> String?,
     // No defaults: a forgotten one would look like every tab being drivable, or none being openable.
     /** Whether the host can drive a tab now (only the space on screen resolves). */
     private val drivable: (tabId: String) -> Boolean,
@@ -88,12 +88,13 @@ class HeadlessRunner(
             // Not while a run holds a tab: the host resolves browsers through one static "selected tab",
             // so a probe racing a run's rpa_observe could hand that run the wrong tab. Unknown then
             // reads as drivable, and a NO_BROWSER at the first look still says why.
-            val probe = !locks.anyBusy()
-            val canDrive = browserTabs.associate { it.tabId to (!probe || runCatching { drivable(it.tabId) }.getOrDefault(false)) }
+            // Re-checked before each tab, since a run can start mid-probe.
+            val canDrive = browserTabs.associate { it.tabId to (locks.anyBusy() || runCatching { drivable(it.tabId) }.getOrDefault(false)) }
             if (browserTabs.isEmpty()) return Result.failure(IllegalStateException("No browser tab is open. Pass new_tab: true to open one."))
             // Never an arbitrary tab: it acts in the user's logged-in session, so the focused one or a named one.
-            val wanted = tabId ?: runCatching { activeTabId() }.getOrNull()?.takeIf { canDrive[it] == true }
-                ?: return Result.failure(IllegalArgumentException("No tab is focused. Pass tab_id, one of: ${describe(browserTabs, canDrive)}; or new_tab: true"))
+            // Drivable tabs are the space on screen, which also makes a panel id unambiguous.
+            val wanted = tabId ?: runCatching { activeTabId(browserTabs.filter { canDrive[it.tabId] == true }) }.getOrNull()
+                ?: return Result.failure(IllegalArgumentException("No drivable tab is focused. Pass tab_id, one of: ${describe(browserTabs, canDrive)}; or new_tab: true"))
             val found = browserTabs.firstOrNull { it.tabId == wanted }
                 ?: return Result.failure(IllegalArgumentException("No browser tab with id $wanted. Open browser tabs: ${describe(browserTabs, canDrive)}"))
             if (canDrive[found.tabId] != true) {
@@ -147,7 +148,7 @@ class HeadlessRunner(
             val sorted = tabs.sortedByDescending { drivable[it.tabId] == true }
             return sorted.take(20).joinToString { t ->
                 "${t.tabId} ('${t.title.take(40)}', ${host(t.url)}" +
-                    (if (drivable[t.tabId] == true) "" else ", in another space '${t.workspaceName.take(40)}', not drivable") + ")"
+                    (if (drivable[t.tabId] == true) "" else ", not drivable: ${StartPages.awayReason(t, tabs, drivable.filterValues { it }.keys)}") + ")"
             } + if (tabs.size > 20) ", …" else ""
         }
 

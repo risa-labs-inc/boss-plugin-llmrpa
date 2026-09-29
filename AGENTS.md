@@ -393,17 +393,23 @@ Found by running, not reviewing:
   `getBrowserIntegration` is null and RPA Engine answers `NO_BROWSER` ("is not a browser tab").
   Found live: every tab in the other space failed at step 0. Not fixable here.
 - Drivable = `getBrowserIntegration(id)?.isBrowserAvailable()`, the same test RPA Engine applies. The
-  panel probes off the UI thread on tab changes, every readiness tick and when the picker opens; other
-  tabs are listed disabled. `NO_BROWSER` from observe or a step ends the run with `NO_BROWSER_HINT`.
+  panel probes off the UI thread on tab changes, when the picker opens and every 10 s (a space switch
+  has no signal); other tabs are listed disabled, as "not loaded" when their space has a drivable tab. `NO_BROWSER` from observe or a step ends the run with `NO_BROWSER_HINT`.
 - **Never probe while a run holds a tab.** `getBrowserIntegration` works through one static
   `BrowserAccessor.selectedTabId`, so a probe racing a run's `rpa_observe` could hand that run the
-  wrong tab's browser. `TabLocks.anyBusy()` gates it; unknown reads as drivable, and the run-time
-  mapping still explains a failure. Direct `rpa_*` callers outside this plugin are not covered.
+  wrong tab's browser. `TabLocks.anyBusy()` gates it and is re-checked before each tab, since a run
+  can start mid-probe; unknown reads as drivable, and the run-time mapping still explains a failure.
+  The window is one call wide, not closed, and direct `rpa_*` callers outside this plugin are not covered.
 - **New tab**: start URL is the first usable http(s) address in the instruction, else the selected
   decider's (chat only; `jev_decide` answers choice/noul/score and cannot write one), https-only and
-  validated (no credentials, no localhost or bare IP), else a DuckDuckGo search. `createBrowserTab`
+  validated (no credentials; a dotted host with an alphabetic TLD, so no localhost, `.local`/`.internal`
+  style suffixes, trailing dots or IP literals such as `0x7f.1`), else a DuckDuckGo search.
+- **The search never carries the instruction's values.** Quoted text, emails and addresses are what
+  a run may type, passwords included, so they are cut from the query; with nothing left the run stops
+  and asks for the site. An unquoted secret is not detected. `createBrowserTab`
   runs on Main (it edits split view state) and opens in the active space. The runner waits with
-  bounded backoff (`RunLimits.openWaitsMs`, about 13 s; about:blank is not loaded).
+  bounded backoff (`RunLimits.openWaitsMs`, about 13 s) while the reply is NO_BROWSER, TAB_NOT_FOUND
+  or about:blank; any other error ends the wait. The page it read is the first step's page.
 - The chosen address is used **only for that open**. "Go to" candidates still come from the
   instruction alone, so a model-picked origin is never offered again mid-run.
 - The new tab's lock is taken by the runner once it exists (`NewTab.claim`) and released from

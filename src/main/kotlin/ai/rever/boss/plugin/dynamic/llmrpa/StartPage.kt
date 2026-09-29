@@ -1,5 +1,6 @@
 package ai.rever.boss.plugin.dynamic.llmrpa
 
+import ai.rever.boss.plugin.api.ActiveTabData
 import ai.rever.boss.plugin.api.ActiveTabsProvider
 import java.net.URI
 import java.net.URLEncoder
@@ -51,14 +52,38 @@ internal object StartPages {
         val scheme = uri.scheme?.lowercase() ?: return null
         if (scheme != "https" && (httpsOnly || scheme != "http")) return null
         if (uri.rawUserInfo != null) return null
-        val host = uri.host?.takeIf { it.isNotBlank() } ?: return null
-        // A model's pick is a public site: no localhost, intranet names or bare IPs.
-        if (httpsOnly && (!host.contains('.') || host.startsWith("[") || host.all { it.isDigit() || it == '.' })) return null
+        val host = uri.host?.takeIf { it.isNotBlank() }?.lowercase() ?: return null
+        if (httpsOnly && !publicHost(host)) return null
         return uri.toString()
     }
 
-    fun searchUrl(instruction: String): String =
-        "https://duckduckgo.com/?q=" + URLEncoder.encode(instruction.trim().take(500), Charsets.UTF_8)
+    private val LOCAL_SUFFIXES = listOf(".localhost", ".local", ".internal", ".lan", ".home.arpa", ".intranet", ".corp")
+    private val TLD = Regex("[a-z]{2,63}|xn--[a-z0-9-]{1,59}")
+
+    /**
+     * A model's pick is a public site: a dotted name with an alphabetic TLD, so no localhost,
+     * intranet suffixes, trailing dots, or IP literals in any spelling (`0x7f.1`, `127.1`, `[::1]`).
+     */
+    private fun publicHost(host: String): Boolean {
+        if (host.endsWith(".") || host.startsWith("[") || !host.contains('.')) return false
+        if (LOCAL_SUFFIXES.any { host.endsWith(it) }) return false
+        val labels = host.split('.')
+        if (labels.any { it.isEmpty() || it.startsWith("0x") }) return false
+        return TLD.matches(labels.last())
+    }
+
+    /**
+     * A web search for [instruction] without its quoted text, emails or addresses: those are the
+     * values it may type (passwords included) and must not reach a search engine. Null when
+     * nothing is left to search for.
+     */
+    fun searchUrl(instruction: String): String? {
+        var q = instruction
+        Candidates.values(instruction).sortedByDescending { it.length }.forEach { q = q.replace(it, " ") }
+        q = q.replace(Regex("[\"“”']\\s*[\"“”']"), " ").replace(Regex("\\s+"), " ").trim().take(200)
+        if (q.count { it.isLetterOrDigit() } < 3) return null
+        return "https://duckduckgo.com/?q=" + URLEncoder.encode(q, Charsets.UTF_8)
+    }
 
     /** The chosen start page, plus the cost and number of model calls it took. */
     data class Choice(val page: OpenedPage, val calls: Int, val costUsd: Double)
@@ -68,12 +93,29 @@ internal object StartPages {
         fromInstruction(instruction)?.let { return Choice(OpenedPage(it, StartSource.INSTRUCTION), 0, 0.0) }
         val reply = decider.startUrl(instruction)
         val suggested = reply.getOrNull()
-        usable(suggested?.url, httpsOnly = true)?.let { return Choice(OpenedPage(it, StartSource.MODEL), 1, suggested!!.costUsd) }
+        val calls = if (suggested != null) 1 else 0
+        val cost = suggested?.costUsd ?: 0.0
+        usable(suggested?.url, httpsOnly = true)?.let { return Choice(OpenedPage(it, StartSource.MODEL), calls, cost) }
         val why = reply.exceptionOrNull()?.message
             ?: suggested?.url?.let { "the model's address '${it.take(80)}' is not a safe https address" }
             ?: "the model named no address"
-        return Choice(OpenedPage(searchUrl(instruction), StartSource.SEARCH, why), if (suggested != null) 1 else 0, suggested?.costUsd ?: 0.0)
+        val search = searchUrl(instruction)
+            ?: throw NoStartPage("Could not tell which page to start on ($why). Put the site's address in the instruction, or pick a tab.")
+        return Choice(OpenedPage(search, StartSource.SEARCH, why), calls, cost)
     }
+
+    class NoStartPage(message: String) : Exception(message)
+
+    /** Whether [tabId] is drivable per a probe result; null (not probed yet) reads as drivable. */
+    fun drivableIn(probed: Set<String>?, tabId: String): Boolean = probed?.contains(tabId) ?: true
+
+    /**
+     * Why a tab cannot be driven, for the picker and the headless listing. A tab whose space also
+     * has a drivable tab is on screen, so its browser is just not loaded.
+     */
+    fun awayReason(tab: ActiveTabData, tabs: List<ActiveTabData>, probed: Set<String>?): String =
+        if (tabs.any { it.workspaceId == tab.workspaceId && drivableIn(probed, it.tabId) }) "Not loaded yet — open it once to use this tab"
+        else "In another space (${tab.workspaceName.take(40)}) — switch to it to use this tab"
 
     /** Whether the host can drive [tabId] now, as RPA Engine resolves it. */
     fun drivable(provider: ActiveTabsProvider, tabId: String): Boolean =

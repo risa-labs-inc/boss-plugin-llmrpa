@@ -113,8 +113,8 @@ class TaskRunner(
      * boundary ends the run as FAILED with the reason, not as "Stopped by you".
      */
     suspend fun run(): RunState = try {
-        if (tabId == null) openStartPage()?.let { loop(listOf(it.description)) } ?: state.value
-        else loop(emptyList())
+        if (tabId == null) openStartPage()?.let { (opened, page) -> loop(listOf(opened.description), page) } ?: state.value
+        else loop(emptyList(), null)
     } catch (e: CancellationException) {
         throw e
     } catch (e: Throwable) {
@@ -133,10 +133,14 @@ class TaskRunner(
      * Picks a start page, opens it in a new tab and waits until it reads. Only this open may use
      * the chosen address: later "Go to" steps still come from the instruction alone.
      */
-    private suspend fun openStartPage(): OpenedPage? {
+    private suspend fun openStartPage(): Pair<OpenedPage, PageSnapshot>? {
         val nt = newTab ?: return null.also { finish(RunStatus.FAILED, "No tab to run on") }
         val choice = nt.startUrl?.let { StartPages.Choice(OpenedPage(it, StartSource.CALLER), 0, 0.0) }
-            ?: StartPages.choose(instruction, decider)
+            ?: try {
+                StartPages.choose(instruction, decider)
+            } catch (e: StartPages.NoStartPage) {
+                return null.also { finish(RunStatus.STOPPED, e.message.orEmpty()) }
+            }
         _state.update { it.copy(calls = it.calls + choice.calls, costUsd = it.costUsd + choice.costUsd) }
         val url = choice.page.url
         val id = nt.open(url, StartPages.TAB_TITLE)
@@ -144,24 +148,38 @@ class TaskRunner(
         nt.claim(id)?.let { refusal -> return null.also { finish(RunStatus.FAILED, refusal) } }
         tabId = id
         _state.update { it.copy(tabId = id, opened = choice.page) }
-        if (!awaitPage(id)) {
-            return null.also { finish(RunStatus.FAILED, "Opened $url, but the page could not be read after ${limits.openWaitsMs.sum() / 1000} s. Check the new tab and run again on it.") }
+        val page = awaitPage(id).getOrElse {
+            return null.also { _ -> finish(RunStatus.FAILED, "Opened $url, but the page could not be read: ${it.message}. Check the new tab and run again on it.") }
         }
-        return choice.page
+        return choice.page to page
     }
 
-    /** Bounded retries, since the page is still loading; about:blank does not count as loaded. */
-    private suspend fun awaitPage(id: String): Boolean {
+    /**
+     * Bounded retries while the tab registers and loads (NO_BROWSER, TAB_NOT_FOUND, about:blank);
+     * any other error ends the wait at once.
+     */
+    private suspend fun awaitPage(id: String): Result<PageSnapshot> {
+        var last = "it did not load"
         for (wait in limits.openWaitsMs) {
             delay(wait)
             val reply = tools.invoke(ToolNames.OBSERVE, buildJsonObject { put("tab_id", id) })
-            val url = (reply.json?.get("url") as? JsonPrimitive)?.content.orEmpty()
-            if (!reply.isError && reply.json != null && url.isNotBlank() && url != "about:blank") return true
+            val json = reply.json
+            if (!reply.isError && json != null) {
+                val page = PageSnapshot.parse(json)
+                if (page.url.isNotBlank() && page.url != "about:blank") return Result.success(page)
+                last = "it is still blank"
+            } else if (reply.errorCode in LOADING_CODES) {
+                last = "it did not load after ${limits.openWaitsMs.sum() / 1000} s"
+            } else {
+                return Result.failure(IllegalStateException(reply.errorMessage))
+            }
         }
-        return false
+        return Result.failure(IllegalStateException(last))
     }
 
-    private suspend fun loop(seed: List<String>): RunState {
+    /** [first] is a page already read for this step, so the first look is not repeated. */
+    private suspend fun loop(seed: List<String>, first: PageSnapshot?): RunState {
+        var pending = first
         val history = seed.toMutableList()
         var failures = 0
         var doneRejected = false
@@ -172,7 +190,7 @@ class TaskRunner(
         // Counted in actions taken, so a rejected done check does not use up the budget.
         while (_state.value.steps.size < limits.maxSteps) {
             val stepNo = _state.value.steps.size + 1
-            val page = observe() ?: return state.value
+            val page = pending?.also { pending = null } ?: observe() ?: return state.value
             // Where the last step landed, so the model can tell a search results page from the article.
             if (history.isNotEmpty() && !history.last().contains(" → now on ")) {
                 history[history.lastIndex] = "${history.last()} → now on '${page.title.take(80)}'"
@@ -381,6 +399,8 @@ class TaskRunner(
     }
 
     companion object {
+        private val LOADING_CODES = setOf(ToolNames.NO_BROWSER, "TAB_NOT_FOUND")
+
         fun pct(p: Double): String = "${(p * 100).toInt()}%"
     }
 }
