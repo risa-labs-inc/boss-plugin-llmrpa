@@ -494,3 +494,43 @@ emails and addresses only, and Jev cannot write.
   hunter2").
 - **Text the person picks (`USER`) does not make Enter commit.** The card names the field ("Pick the
   text to type into '<field>'"), so the person chose both; this is deliberate, like quoted text.
+
+## Model calls and export (1.5)
+
+- **Every decider call is a `ModelCall` in `RunState.modelCalls`**, linked to its step (0 = the start
+  page). Deciders report through `CallRecorder`, a coroutine-context element the runner installs
+  around each call, so they hold no run state and a decider used outside a run records nothing.
+  `RunState.calls` and `costUsd` are derived from the list, so the header cannot disagree with it.
+  A chat retry is two calls, and a failed `jev_decide` is recorded with its error.
+- **Masked, then capped.** Stored text is masked (keyword secrets from the start, a value typed into a
+  private field from then on, re-masking earlier calls) and only then cut to 8 KB, and the cut never
+  splits an instruction value, so a mask added later still finds all of it. Masking is whole-word:
+  the keyword regex over-cuts ("pin the tab"), and substring masking would blank every "there".
+- Calls with no step of their own (the decision and done check that ended the run) show as "Last
+  decision" and as `other_model_calls` in the transcript. `include_calls`/`verbose` adds them in full.
+- **Export reuses `RpaEngineHandoff`'s envelope and writer.** A navigate to `RunState.startUrl`, then
+  each OK step's recorded `StepAction`. `download` is `rpa_step`-only in the engine and is left out
+  with a note. The engine has no variables, so a private field is written with `value: ""`,
+  `meta.private = "true"` and a note in the description. The name, description and filename use
+  `Candidates.scrub` (every quoted value, email and address masked): a run that stopped before its
+  private field never learned which quoted value was private. Credentials leave every address.
+- **An export never replaces a file.** The name is reserved with `Files.createFile` and the content
+  moved over it: an atomic rename replaces silently on Unix. A scan in between reads an empty file,
+  which the engine skips as unparseable.
+- "Open in RPA Engine" is `rpa_load` by the configuration's name, which needs the engine's panel open;
+  its answer is shown as is. `RunHistory` is shared like `TabLocks` so `llmrpa_export` reaches panel
+  and headless runs.
+- **Recording is best-effort** (`recordCall` takes a builder and swallows its throws): it runs after
+  the answer is in, so an api mismatch reading `AiReply.usage` must not fail a good pick.
+- **A tab the run found open is exported without its query and fragment** (a session or sign-in
+  token rides there); an address the run opened itself is kept, since a search fallback needs its `?q=`.
+- `RunHistory` keeps call text for the newest 3 runs only; export needs just the steps.
+- **Quoted values are masked in calls once a page shows a private field**, unless already typed into a
+  plain one: the run cannot know which value is the password until it types it. Accepted gap: before
+  any private field is seen, a quoted password with no keyword in front is in the call text (the
+  person's own instruction, shown only locally). Exports scrub every quoted value regardless.
+- A record that cannot be built or stored becomes a text-less stub, so `calls` still counts it.
+- The export adds a 1.5 s `wait` after the start page and after each step that navigated, where the
+  live run waited before looking again. Selectors are written as the page gave them.
+- Masking every untyped quoted value errs safe and over-masks the call view: a search term or the
+  username about to be typed is blanked too, and stays blanked. Expected; the timeline shows them.

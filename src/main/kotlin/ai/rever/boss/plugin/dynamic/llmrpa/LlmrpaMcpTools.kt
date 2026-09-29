@@ -1,9 +1,12 @@
 package ai.rever.boss.plugin.dynamic.llmrpa
 
+import ai.rever.boss.plugin.api.McpToolArgs
 import ai.rever.boss.plugin.api.McpToolDefinition
 import ai.rever.boss.plugin.api.McpToolHandler
 import ai.rever.boss.plugin.api.McpToolProvider
 import ai.rever.boss.plugin.api.McpToolResult
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -25,6 +28,9 @@ internal class LlmrpaMcpToolProvider(
     override val providerId: String,
     private val component: () -> LlmrpaComponent?,
     private val headless: HeadlessRunner,
+    private val runs: RunHistory,
+    /** Where `llmrpa_export` writes; tests pass a temp directory. */
+    private val exportDir: java.io.File = RpaEngineHandoff.defaultConfigDir,
 ) : McpToolProvider {
 
     override fun tools(): List<McpToolDefinition> = listOf(
@@ -49,7 +55,9 @@ internal class LlmrpaMcpToolProvider(
                 """"new_tab":{"type":"boolean","default":false,"description":"Open the right page in a new tab first instead of using an open tab"},""" +
                 """"start_url":{"type":"string","description":"http(s) address to open in a new tab first; implies new_tab"},""" +
                 """"max_steps":{"type":"integer","minimum":1,"maximum":50,"default":12},""" +
-                """"model":{"type":"string","description":"Model id, e.g. typesafe/jev-1.13 or a chat model id; defaults to Jev"}""" +
+                """"model":{"type":"string","description":"Model id, e.g. typesafe/jev-1.13 or a chat model id; defaults to Jev"},""" +
+                """"include_calls":{"type":"boolean","default":false,"description":"Add every model call in full: request, response, parsed pick, latency, cost (private text masked)"},""" +
+                """"verbose":{"type":"boolean","default":false,"description":"Same as include_calls"}""" +
                 """},"required":["instruction"]}""",
             readOnly = false,
             handler = McpToolHandler { args ->
@@ -66,7 +74,7 @@ internal class LlmrpaMcpToolProvider(
                     newTab = (root["new_tab"] as? JsonPrimitive)?.booleanOrNull ?: false,
                     startUrl = (root["start_url"] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() },
                 ).fold(
-                    onSuccess = { McpToolResult(transcript(it).toString(), isError = it.status == RunStatus.FAILED) },
+                    onSuccess = { McpToolResult(transcript(it, includeCalls(root)).toString(), isError = it.status == RunStatus.FAILED) },
                     onFailure = { McpToolResult(it.message ?: "Could not run the task", isError = true) },
                 )
             },
@@ -74,8 +82,12 @@ internal class LlmrpaMcpToolProvider(
         McpToolDefinition(
             name = "llmrpa_status",
             description =
-                "Report the LLM RPA panel's state: the live run (status, steps, summary) and the last drafted plan.",
-            handler = McpToolHandler {
+                "Report the LLM RPA panel's state: the live run (status, steps, summary, model calls per step) and the last drafted plan. " +
+                    "include_calls: true adds each model call in full.",
+            inputSchema = """{"type":"object","properties":{""" +
+                """"include_calls":{"type":"boolean","default":false,"description":"Add every model call of the run in full: request, response, parsed pick, latency, cost (private text masked)"},""" +
+                """"verbose":{"type":"boolean","default":false,"description":"Same as include_calls"}}}""",
+            handler = McpToolHandler { args ->
                 val c = component() ?: return@McpToolHandler notOpen()
                 // The last history entry, not just errorMessage. errorMessage only carries a
                 // *save* failure, so a generation that produced nothing runnable reported
@@ -94,9 +106,23 @@ internal class LlmrpaMcpToolProvider(
                         "plan=${c.handoffPath.value ?: "not written"}\n" +
                         "message=${last?.message ?: "none"}\n" +
                         "error=${last?.error ?: c.errorMessage.value ?: "none"}\n" +
-                        "instruction=${c.currentInstruction.value}"
+                        "instruction=${c.currentInstruction.value}" +
+                        (run?.let { "\nrun_detail=" + transcript(it, includeCalls(parse(args.raw))) } ?: "")
                 )
             },
+        ),
+        McpToolDefinition(
+            name = "llmrpa_export",
+            description =
+                "Save a finished LLM RPA run as an RPA Engine configuration: a navigate to where it started, then each step that worked, " +
+                    "in ~/.boss/config/rpaengine as a new file (never replacing one). Downloads are left out (RPA Engine plans cannot download), " +
+                    "and a private field's text is never written: that step types nothing and the description says so. " +
+                    "Addresses from the instruction are kept; a tab the run found open is written without its query and fragment. " +
+                    "Works for a done run, or a stopped or failed one with at least one step that worked. Returns the path and the action count.",
+            inputSchema = """{"type":"object","properties":{""" +
+                """"run":{"type":"integer","minimum":1,"default":1,"description":"Which finished run, newest first: 1 is the last one"}}}""",
+            readOnly = false,
+            handler = McpToolHandler { args -> export(args) },
         ),
         McpToolDefinition(
             name = "llmrpa_run",
@@ -122,11 +148,89 @@ internal class LlmrpaMcpToolProvider(
         ),
     )
 
+    private suspend fun export(args: McpToolArgs): McpToolResult {
+        val root = parse(args.raw) ?: return McpToolResult("Arguments must be a JSON object", isError = true)
+        val recent = runs.recent()
+        if (recent.isEmpty()) return McpToolResult("No run has finished yet. Run a task first (llmrpa_execute or the panel).", isError = true)
+        val n = (root["run"] as? JsonPrimitive)?.intOrNull ?: 1
+        val run = recent.getOrNull(n - 1)
+            ?: return McpToolResult("There is no run $n. Finished runs, newest first: ${listing(recent)}", isError = true)
+        if (!RpaEngineHandoff.exportable(run)) {
+            return McpToolResult("Run $n (${run.status.name.lowercase()}) has no step that worked to export. Finished runs: ${listing(recent)}", isError = true)
+        }
+        return withContext(Dispatchers.IO) { RpaEngineHandoff.exportRun(run, exportDir) }.fold(
+            onSuccess = { e ->
+                McpToolResult(buildJsonObject {
+                    put("path", e.file.absolutePath)
+                    put("name", e.name)
+                    put("actions", e.actionCount)
+                    if (e.notes.isNotEmpty()) put("notes", buildJsonArray { e.notes.forEach { add(JsonPrimitive(it)) } })
+                    put("hint", "Load it in RPA Engine with rpa_load and this name, then rpa_run.")
+                }.toString())
+            },
+            onFailure = { McpToolResult("Could not export: ${it.message ?: it::class.simpleName}", isError = true) },
+        )
+    }
+
     private fun notOpen(): McpToolResult =
         McpToolResult("Open the LLM RPA panel first (no active instance).", isError = true)
 
     companion object {
-        internal fun transcript(state: RunState) = buildJsonObject {
+        private fun parse(raw: String): JsonObject? = runCatching { Json.parseToJsonElement(raw.ifBlank { "{}" }) as JsonObject }.getOrNull()
+
+        private fun includeCalls(root: JsonObject?): Boolean =
+            listOf("include_calls", "verbose").any { (root?.get(it) as? JsonPrimitive)?.booleanOrNull == true }
+
+        private fun listing(runs: List<RunState>): String = runs.take(10).withIndex().joinToString { (i, r) ->
+            // Scrubbed like an export's name: a run that stopped early never learned which value was private.
+            "${i + 1}: ${r.status.name.lowercase()} '${Candidates.scrub(r.instruction, Secrets.MASK).take(50)}' (${r.steps.count { it.outcome == StepRecord.Outcome.OK }} steps ok)"
+        }
+
+        /** A step's model calls in one line each: what was asked, the pick, how sure, how long. */
+        private fun callSummary(c: ModelCall) = buildJsonObject {
+            put("kind", c.kind.name.lowercase())
+            c.pick?.let { put("pick", it.take(120)) }
+            c.confidence?.let { put("confidence", it) }
+            c.risk?.let { put("risk", it) }
+            put("latency_ms", c.latencyMs)
+            c.costUsd?.takeIf { it > 0 }?.let { put("cost_usd", it) }
+            c.error?.let { put("error", it.take(200)) }
+        }
+
+        internal fun callDetail(c: ModelCall) = buildJsonObject {
+            put("step", c.step)
+            put("kind", c.kind.name.lowercase())
+            put("tool", c.tool)
+            put("model", c.model)
+            if (c.questions.isNotEmpty()) put("questions", buildJsonArray {
+                c.questions.forEach { q ->
+                    add(buildJsonObject {
+                        put("id", q.id)
+                        put("question", q.text)
+                        q.pick?.let { put("pick", it) }
+                        put("options", buildJsonArray {
+                            q.options.forEach { o -> add(buildJsonObject { put("key", o.key); put("label", o.label); o.probability?.let { put("p", it) } }) }
+                        })
+                    })
+                }
+            })
+            // An older run's text is let go to save memory; saying so reads better than an empty string.
+            if (c.request.dropped) put("text_dropped", ModelCall.TEXT_DROPPED) else {
+                put("request", c.request.text)
+                if (c.request.truncated) put("request_truncated", true)
+                c.response?.let { put("response", it.text); if (it.truncated) put("response_truncated", true) }
+            }
+            c.pick?.let { put("pick", it) }
+            c.confidence?.let { put("confidence", it) }
+            c.risk?.let { put("risk", it) }
+            put("latency_ms", c.latencyMs)
+            c.costUsd?.let { put("cost_usd", it) }
+            c.inputTokens?.let { put("input_tokens", it) }
+            c.outputTokens?.let { put("output_tokens", it) }
+            c.error?.let { put("error", it) }
+        }
+
+        internal fun transcript(state: RunState, includeCalls: Boolean = false) = buildJsonObject {
             put("status", state.status.name.lowercase())
             put("summary", state.summary)
             put("model", state.modelLabel)
@@ -171,9 +275,15 @@ internal class LlmrpaMcpToolProvider(
                         put("result", s.outcome.name.lowercase())
                         s.valueSource?.let { put("text_source", it.name.lowercase()) }
                         s.detail?.let { put(if (s.outcome == StepRecord.Outcome.FAILED) "error" else "detail", it) }
+                        val calls = state.modelCalls.filter { it.step == s.index }
+                        if (calls.isNotEmpty()) put("model_calls", buildJsonArray { calls.forEach { add(callSummary(it)) } })
                     })
                 }
             })
+            // Calls that led to no step: choosing the start page (step 0), and the last decision and done check.
+            val stepless = state.modelCalls.filter { c -> state.steps.none { it.index == c.step } }
+            if (stepless.isNotEmpty()) put("other_model_calls", buildJsonArray { stepless.forEach { c -> add(buildJsonObject { put("step", c.step); callSummary(c).forEach { (k, v) -> put(k, v) } }) } })
+            if (includeCalls) put("calls", buildJsonArray { state.modelCalls.forEach { add(callDetail(it)) } })
         }
     }
 }

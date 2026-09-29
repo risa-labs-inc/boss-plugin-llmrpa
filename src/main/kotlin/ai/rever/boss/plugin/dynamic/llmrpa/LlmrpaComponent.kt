@@ -61,12 +61,16 @@ class LlmrpaComponent(
     private val llmProvider: () -> LlmProvider?,
     /** Shared with `llmrpa_execute`, so a panel run and a headless one never drive the same tab. No default, for the same reason. */
     private val tabLocks: TabLocks,
+    /** Shared with `llmrpa_execute`, so `llmrpa_export` reaches panel runs too. No default, for the same reason. */
+    private val runHistory: RunHistory,
     /** Where catalog reads run; tests pass the test Main so the model list lands synchronously. */
     private val io: CoroutineDispatcher = Dispatchers.IO,
     /** Where a run's loop runs, off the UI thread: each step parses the page and builds candidates. */
     private val work: CoroutineDispatcher = Dispatchers.Default,
     /** Limits every run starts from; the step limit comes from the panel. */
     private val baseLimits: RunLimits = RunLimits(),
+    /** Where exports are written; tests pass a temp directory. */
+    private val exportDir: java.io.File = RpaEngineHandoff.defaultConfigDir,
 ) : PanelComponentWithUI, ComponentContext by ctx {
 
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
@@ -628,7 +632,9 @@ class LlmrpaComponent(
                 r.markStopped()
                 _run.value = r.state.value
                 mirror.cancel()
-                _pastRuns.update { (listOf(r.state.value) + it).take(10) }
+                // Only the newest few keep their call text; the panel expands calls for the run on screen.
+                _pastRuns.update { (listOf(r.state.value) + it).take(PAST_RUNS).mapIndexed { i, p -> ModelCall.trimmed(p, i) } }
+                runHistory.add(r.state.value)
             }
         }.also { job ->
             // On completion, not in finally: a job cancelled before it starts never runs its body.
@@ -650,6 +656,41 @@ class LlmrpaComponent(
         runJob?.cancel()
     }
 
+    /** The last export from this panel, shown on the result card of the run it came from. */
+    internal data class ExportNotice(val runStartedAt: Long, val export: RpaEngineHandoff.Export? = null, val error: String? = null, val loaded: String? = null)
+
+    private val _export = MutableStateFlow<ExportNotice?>(null)
+    internal val export: StateFlow<ExportNotice?> = _export
+
+    private val _exporting = MutableStateFlow(false)
+    /** An export is being written; the button waits, so a double click cannot write two files. */
+    val exporting: StateFlow<Boolean> = _exporting
+
+    /** Writes [run]'s steps that worked as an RPA Engine configuration. */
+    fun exportRun(run: RunState) {
+        if (!_exporting.compareAndSet(expect = false, update = true)) return
+        scope.launch {
+            try {
+                val result = withContext(io) { RpaEngineHandoff.exportRun(run, exportDir) }
+                _export.value = ExportNotice(run.startedAt, result.getOrNull(), result.exceptionOrNull()?.let { it.message ?: it::class.simpleName })
+            } finally {
+                _exporting.value = false
+            }
+        }
+    }
+
+    /** Whether RPA Engine can load a configuration by name (`rpa_load`). */
+    fun canOpenInEngine(): Boolean = tools.has(RPA_LOAD)
+
+    /** Loads the exported configuration into the open RPA Engine panel, and shows what it said. */
+    internal fun openInEngine(notice: ExportNotice) {
+        val name = notice.export?.name ?: return
+        scope.launch {
+            val reply = withContext(io) { tools.invoke(RPA_LOAD, kotlinx.serialization.json.buildJsonObject { put("name", kotlinx.serialization.json.JsonPrimitive(name)) }) }
+            _export.update { n -> n?.takeIf { it.runStartedAt == notice.runStartedAt }?.copy(loaded = if (reply.isError) reply.errorMessage else reply.text) ?: n }
+        }
+    }
+
     /** Puts a finished run's instruction back in the box. */
     fun reuse(past: RunState) { _currentInstruction.value = past.instruction }
 
@@ -659,7 +700,11 @@ class LlmrpaComponent(
 
     companion object {
         private const val READINESS_POLL_MS = 2_000L
+        /** Finished runs the panel lists under "Earlier". */
+        private const val PAST_RUNS = 10
         private const val PROBE_EVERY_MS = 10_000L
+        /** RPA Engine's tool that loads a saved configuration into its panel by name. */
+        internal const val RPA_LOAD = "rpa_load"
         const val DRAFT_NEEDS_TAB = "Draft steps needs an open page: pick a tab. New tab is only for Run."
 
         /** Statuses that carry something worth showing in the panel. */

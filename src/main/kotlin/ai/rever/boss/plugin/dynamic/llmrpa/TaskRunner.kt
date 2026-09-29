@@ -34,6 +34,12 @@ data class StepRecord(
     /** Where a typed value came from; null for steps that type nothing. */
     val valueSource: ValueSource? = null,
     val chosenBy: ChosenBy = ChosenBy.MODEL,
+    /** What `rpa_step` was sent, for export; the value is null when [privateValue]. */
+    val action: StepAction? = null,
+    /** The typed text is masked: a private field, or text after a word like "password". */
+    val privateValue: Boolean = false,
+    /** The step loaded a new page, so a replay should wait after it. */
+    val navigated: Boolean = false,
 ) {
     enum class Outcome { RUNNING, OK, FAILED }
     enum class ChosenBy { MODEL, USER }
@@ -76,14 +82,23 @@ data class RunState(
     /** The last question asked, kept after the run ends so a headless caller can see where it stopped. */
     val lastQuestion: PendingQuestion? = null,
     val summary: String? = null,
-    val calls: Int = 0,
-    val costUsd: Double = 0.0,
+    /** Every decider call, in order, each linked to its step. */
+    val modelCalls: List<ModelCall> = emptyList(),
     val startedAt: Long,
     /** The tab the run acts on; null until a new tab is open. */
     val tabId: String? = null,
     /** Set when the run opened its own tab. */
     val opened: OpenedPage? = null,
-)
+    /** Where the run started: the page it opened, else the first page it read. */
+    val startUrl: String? = null,
+    /** [instruction] with its secrets masked, for anything written or shared. */
+    val shareableInstruction: String = instruction,
+    /** Provider and model id, e.g. "Jev typesafe/jev-1.13". */
+    val modelName: String = modelLabel,
+) {
+    val calls: Int get() = modelCalls.size
+    val costUsd: Double get() = modelCalls.sumOf { it.costUsd ?: 0.0 }
+}
 
 data class RunLimits(
     val maxSteps: Int = 12,
@@ -120,10 +135,31 @@ class TaskRunner(
     init { require(tabId != null || newTab != null) { "A run needs a tab or a way to open one" } }
 
     private var tabId: String? = tabId
-    private val _state = MutableStateFlow(RunState(instruction, decider.option.label, limits.maxSteps, startedAt = clock(), tabId = tabId))
+    private val _state = MutableStateFlow(RunState(
+        instruction, decider.option.label, limits.maxSteps, startedAt = clock(), tabId = tabId,
+        modelName = "${decider.option.providerName} ${decider.option.modelId}",
+    ))
     val state: StateFlow<RunState> = _state.asStateFlow()
 
     private val values = Candidates.values(instruction)
+
+    /** Quoted values typed into a field the page does not mark private: evidently not a secret. */
+    private val typedPlain = mutableSetOf<String>()
+
+    /** Text never shown or written: keyword secrets, plus whatever went into a private field. */
+    private val secrets = Secrets.of(instruction).toMutableSet()
+
+    init { _state.update { it.copy(shareableInstruction = Secrets.mask(instruction, secrets)) } }
+
+    /** Runs a decider call with its model calls recorded against [step], masked. */
+    private suspend fun <T> atStep(step: Int, block: suspend () -> T): T =
+        withContext(CallRecorder(step) { c -> _state.update { it.copy(modelCalls = it.modelCalls + c.stored(secrets, values)) } }) { block() }
+
+    /** [value] went into a private field: masked from now on, and in every call already recorded. */
+    private fun keepSecret(value: String) {
+        if (!secrets.add(value)) return
+        _state.update { s -> s.copy(modelCalls = s.modelCalls.map { it.masked(secrets) }, shareableInstruction = Secrets.mask(instruction, secrets)) }
+    }
 
     /**
      * Never throws except on cancellation: anything a decider or tool raises across the plugin
@@ -155,11 +191,10 @@ class TaskRunner(
         val nt = newTab ?: return stop(RunStatus.FAILED, "No tab to run on")
         val choice = nt.startUrl?.let { StartPages.Choice(OpenedPage(it, StartSource.CALLER), 0, 0.0) }
             ?: try {
-                StartPages.choose(instruction, decider)
+                atStep(0) { StartPages.choose(instruction, decider) }
             } catch (e: StartPages.NoStartPage) {
                 return stop(RunStatus.STOPPED, e.message.orEmpty())
             }
-        _state.update { it.copy(calls = it.calls + choice.calls, costUsd = it.costUsd + choice.costUsd) }
         val url = choice.page.url
         // Not cancellable: a Stop landing mid-create would lose the id of a tab that exists.
         var refusal: String? = null
@@ -168,7 +203,7 @@ class TaskRunner(
                 refusal = nt.claim(id)
                 if (refusal == null) {
                     tabId = id
-                    _state.update { it.copy(tabId = id, opened = choice.page) }
+                    _state.update { it.copy(tabId = id, opened = choice.page, startUrl = choice.page.url) }
                 }
             }
         } ?: return stop(RunStatus.FAILED, "Could not open a new tab for $url: BOSS did not create one. Open the page yourself and pick its tab.")
@@ -252,6 +287,10 @@ class TaskRunner(
         while (_state.value.steps.size < limits.maxSteps) {
             val stepNo = _state.value.steps.size + 1
             val page = pending?.also { pending = null } ?: observe() ?: return state.value
+            if (_state.value.startUrl == null) _state.update { it.copy(startUrl = page.url) }
+            // Once a page shows a private field, any quoted value not yet typed into a plain one may
+            // be its text, so the calls mask it; the run cannot know which until it types.
+            if (page.elements.any { it.sensitive }) values.filter { it !in typedPlain }.forEach(::keepSecret)
             // Where the last step landed, so the model can tell a search results page from the article.
             if (history.isNotEmpty() && !history.last().contains(" → now on ")) {
                 history[history.lastIndex] = "${history.last()} → now on '${page.title.take(80)}'"
@@ -260,10 +299,9 @@ class TaskRunner(
             val candidates = Candidates.build(page, instruction, decider.writesText, phrases)
             val ctx = StepContext(instruction, page, candidates, values, history.toList(), phrases)
 
-            val decision = decider.decide(ctx).getOrElse {
+            val decision = atStep(stepNo) { decider.decide(ctx) }.getOrElse {
                 return finish(RunStatus.FAILED, "${decider.option.providerName} could not decide the next step: ${it.message}")
             }
-            _state.update { it.copy(calls = it.calls + 1, costUsd = it.costUsd + decision.costUsd) }
 
             var chosen = candidates.firstOrNull { it.key == decision.key }
                 ?: return finish(RunStatus.FAILED, "The model picked an action that is not on the page")
@@ -289,10 +327,8 @@ class TaskRunner(
                 // The person said so; the model does not get to overrule them.
                 if (chosenBy == StepRecord.ChosenBy.USER) return finish(RunStatus.DONE, "Done in $steps. You said the task is complete.")
                 // A model can claim success on the wrong page. Check once, with the page named.
-                val check = decider.verifyDone(ctx)
-                val verified = check.getOrNull()?.also { (_, cost) ->
-                    _state.update { it.copy(calls = it.calls + 1, costUsd = it.costUsd + cost) }
-                }?.first
+                val check = atStep(stepNo) { decider.verifyDone(ctx) }
+                val verified = check.getOrNull()?.first
                     // Fails closed like the risk check: an unchecked done is not reported as done.
                     ?: return finish(RunStatus.STOPPED, "Stopped: could not confirm the task is complete (${check.exceptionOrNull()?.message}). Check the page.")
                 if (verified >= limits.doneAbove) return finish(RunStatus.DONE, "Done in $steps. ${pct(verified)} sure the task is complete.")
@@ -338,8 +374,10 @@ class TaskRunner(
             if (chosen.needsValue && chosen.element?.sensitive == true && !fromInstruction) {
                 return finish(RunStatus.STOPPED, "Stopped before typing into the private field '${chosen.element.label?.take(60)}': only text from your instruction goes there.")
             }
-            // A private field's text never reaches the timeline, the history the model sees, or the transcript.
-            val shown = if (chosen.element?.sensitive == true || (value != null && Candidates.isKeywordSecret(instruction, value))) "••••••" else "'${value?.take(60)}'"
+            // A private field's text never reaches the timeline, the history the model sees, the transcript or an export.
+            val private = chosen.needsValue && (chosen.element?.sensitive == true || (value != null && Candidates.isKeywordSecret(instruction, value)))
+            if (private && value != null) keepSecret(value)
+            val shown = if (private) Secrets.MASK else "'${value?.take(60)}'"
             val description = if (chosen.needsValue) "Type $shown into '${chosen.element?.label?.take(60)}'" else chosen.description
 
             if (chosen.canCommit) {
@@ -349,9 +387,7 @@ class TaskRunner(
                 // Fails closed: an unassessed risk asks (and stops a headless run). The model's flag
                 // describes its own pick, never an alternative the person chose.
                 val assessed = decision.risk.takeIf { chosenBy == StepRecord.ChosenBy.MODEL }
-                    ?: decider.risk(ctx, target).getOrNull()?.also { (_, cost) ->
-                        _state.update { it.copy(calls = it.calls + 1, costUsd = it.costUsd + cost) }
-                    }?.first
+                    ?: atStep(stepNo) { decider.risk(ctx, target) }.getOrNull()?.first
                 // The label check can only raise a model's answer: a chat model grades its own pick
                 // from page text, so a misleading page could otherwise talk it past a Delete. Enter
                 // after text the model wrote (or instruction words outside a search box) could post it.
@@ -373,10 +409,12 @@ class TaskRunner(
             val runnersUp = if (chosenBy == StepRecord.ChosenBy.USER) emptyList() else decision.alternatives.mapNotNull { (k, p) ->
                 candidates.firstOrNull { it.key == k }?.let { it.description to p }
             }
-            val record = StepRecord(stepNo, description, decision.confidence, runnersUp, valueSource = source, chosenBy = chosenBy)
+            val record = StepRecord(stepNo, description, decision.confidence, runnersUp, valueSource = source, chosenBy = chosenBy,
+                action = action.copy(value = if (private) null else value), privateValue = private)
             _state.update { it.copy(steps = it.steps + record) }
 
             val (ok, error, navigated, noBrowser) = act(action.copy(value = value), allowSensitive = chosen.element?.sensitive == true && fromInstruction)
+            if (chosen.needsValue && ok && !private && value != null) typedPlain += value
             if (chosen.needsValue && ok) {
                 typedInto = chosen.element
                 typedCommits = when (source) {
@@ -391,7 +429,7 @@ class TaskRunner(
             }
             _state.update { s ->
                 s.copy(steps = s.steps.map {
-                    if (it.index == stepNo) it.copy(outcome = if (ok) StepRecord.Outcome.OK else StepRecord.Outcome.FAILED, detail = error) else it
+                    if (it.index == stepNo) it.copy(outcome = if (ok) StepRecord.Outcome.OK else StepRecord.Outcome.FAILED, detail = error, navigated = navigated) else it
                 })
             }
             if (noBrowser) return finish(RunStatus.FAILED, "Stopped at step $stepNo: $NO_BROWSER_HINT")
@@ -419,11 +457,10 @@ class TaskRunner(
         // A value after "password" and the like is the person's to place in a field the page does
         // not mark private, never the model's.
         val offered = options.filterNot { Candidates.isKeywordSecret(instruction, it) }
-        val asked = offered.takeIf { it.isNotEmpty() }?.let { decider.chooseText(ctx, field, it) }
+        val asked = offered.takeIf { it.isNotEmpty() }?.let { atStep(stepNo) { decider.chooseText(ctx, field, it) } }
         var reason = if (offered.isEmpty()) "Only text after a word like 'password' fits, which the model may not place in '$field'"
         else "The model gave no text for '$field'"
         if (asked != null) {
-            _state.update { it.copy(calls = it.calls + 1, costUsd = it.costUsd + (asked.getOrNull()?.costUsd ?: 0.0)) }
             val choice = asked.getOrNull()
             val pick = choice?.index?.let(offered::getOrNull)
             if (pick != null && choice.confidence >= limits.askBelow) return pick to sourceOf(pick)
