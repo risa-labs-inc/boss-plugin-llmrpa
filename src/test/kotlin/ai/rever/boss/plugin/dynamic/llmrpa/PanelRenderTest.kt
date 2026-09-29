@@ -43,13 +43,12 @@ class PanelRenderTest {
     }
 
     private fun component(tools: ToolInvoker, openTabs: List<ActiveTabData> = listOf(tab)) =
-        LlmrpaComponent(DefaultComponentContext(LifecycleRegistry()), LlmrpaInfo, tabs(openTabs), { null }, tools = tools, llmProvider = { null }, tabLocks = TabLocks(), io = Dispatchers.Main)
+        LlmrpaComponent(DefaultComponentContext(LifecycleRegistry()), LlmrpaInfo, tabs(openTabs), { null }, tools = tools, llmProvider = { null }, tabLocks = TabLocks(),
+            io = Dispatchers.Main, work = Dispatchers.Main, baseLimits = RunLimits(navSettleMs = 0, stepSettleMs = 0))
 
     @Test
     fun `renders every state at every width`() {
         Dispatchers.setMain(UnconfinedTestDispatcher())
-        TaskRunner.NAV_SETTLE_MS = 0
-        TaskRunner.STEP_SETTLE_MS = 0
         try {
             val instruction = "Search for 'wireless keyboard' and open the first result"
 

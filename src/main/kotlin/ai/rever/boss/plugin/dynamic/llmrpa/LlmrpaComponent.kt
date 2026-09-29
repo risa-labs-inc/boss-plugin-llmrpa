@@ -60,6 +60,10 @@ class LlmrpaComponent(
     private val tabLocks: TabLocks,
     /** Where catalog reads run; tests pass the test Main so the model list lands synchronously. */
     private val io: CoroutineDispatcher = Dispatchers.IO,
+    /** Where a run's loop runs, off the UI thread: each step parses the page and builds candidates. */
+    private val work: CoroutineDispatcher = Dispatchers.Default,
+    /** Limits every run starts from; the step limit comes from the panel. */
+    private val baseLimits: RunLimits = RunLimits(),
 ) : PanelComponentWithUI, ComponentContext by ctx {
 
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
@@ -213,9 +217,6 @@ class LlmrpaComponent(
      * run's result.
      */
     fun generateActions(): String? {
-        // compareAndSet, not a check then a set: llmrpa_run also calls this, and the MCP handler
-        // thread is not guaranteed to be the UI thread - two calls could both pass a plain check,
-        // lose one history append, resolve the same index and race on _handoffPath.
         val instruction = _currentInstruction.value
         if (instruction.isBlank()) {
             _errorMessage.value = "Please enter an instruction"
@@ -258,7 +259,6 @@ class LlmrpaComponent(
 
         scope.launch {
             try {
-                // Use selected tab's URL or fallback
                 // No example.com fallback: Draft steps is disabled without a tab, and a plan
                 // written for a made-up page is worse than none.
                 val sourceUrl = _selectedTab.value?.url ?: error("Pick a tab first")
@@ -270,12 +270,9 @@ class LlmrpaComponent(
 
                 val response = apiClient.callLLMApi(request, _selectedModel.value)
 
-                // The example response carries its own status so runnablePlan() excludes it; it
-                // still has actions to show, so it belongs on this branch rather than the
-                // error-only one below. Listed explicitly, so an unrecognised status keeps
-                // falling through to the else rather than being treated as showable.
-                // Everything with a status we recognise or actions to show goes here; the else
-                // is for a response that is neither, which is nothing this plugin produces today.
+                // Everything with a status we recognise (including the example response, which
+                // runnablePlan() excludes) or actions to show goes here; the else is for a response
+                // that is neither, which is nothing this plugin produces today.
                 if (response.status in SHOWABLE_STATUSES || response.configuration.isNotEmpty()) {
                     val plan = response.runnablePlan()
                     updateExecutionStatus(
@@ -467,7 +464,7 @@ class LlmrpaComponent(
 
     private var runJob: Job? = null
     private var runner: TaskRunner? = null
-    private val asker = TaskRunner.Companion.Asker()
+    private val asker = PanelAsker()
 
     val isRunning: Boolean get() = runJob?.isActive == true
 
@@ -519,12 +516,12 @@ class LlmrpaComponent(
         if (!tabLocks.tryAcquire(tab.tabId)) return TabLocks.BUSY
         _errorMessage.value = null
         val decider = if (model.kind == ModelOption.Kind.DECISION) JevDecider(tools, model) else ChatDecider(aiGateway, model)
-        val r = TaskRunner(tools, decider, tab.tabId, instruction, RunLimits(maxSteps = _maxSteps.value)) { asker.ask(it) }
+        val r = TaskRunner(tools, decider, tab.tabId, instruction, baseLimits.copy(maxSteps = _maxSteps.value)) { asker.ask(it) }
         runner = r
         runJob = scope.launch {
             val mirror = launch { r.state.collect { _run.value = it } }
             try {
-                r.run()
+                withContext(work) { r.run() }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Throwable) {

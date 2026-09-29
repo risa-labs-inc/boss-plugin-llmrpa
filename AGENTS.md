@@ -366,3 +366,10 @@ Found by running, not reviewing:
 - RPA Engine (`>=1.3.0`) and Jev are declared optional dependencies, for the same unload guard as
   the gateway. `TabLocks` has no default anywhere: a forgotten one splits the panel from headless.
 - With nothing installed, the empty model reload backs off to 32 s instead of every 2 s.
+- **A private field's text is masked** (`Type •••••• into 'Password'`) in the timeline, the
+  history sent to the model, and the transcript. Only `rpa_step` gets the real value.
+- **Downloads are not risk-checked, deliberately.** RPA Engine's `download` saves an image into
+  Downloads and commits nothing on the site; the other commit rules stay on CLICK, KEY and
+  committing SELECTs.
+- The run loop runs on `Dispatchers.Default` (each step parses the page and builds candidates);
+  settle times live in `RunLimits`, not in mutable statics.

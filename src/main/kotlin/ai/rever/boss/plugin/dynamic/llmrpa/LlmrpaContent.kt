@@ -221,7 +221,7 @@ private fun ModelPicker(
                 .border(1.dp, if (ready) RpaTokens.Border else RpaTokens.Warning.copy(alpha = 0.5f), RoundedCornerShape(12.dp))
                 .clickable(enabled = enabled, role = Role.Button) { open = true; component.refreshModels() }
                 .pointerHoverIcon(PointerIcon.Hand).padding(start = 8.dp, end = 6.dp, top = 3.dp, bottom = 3.dp)
-                .semantics { contentDescription = "Model: $label. ${if (ready) "Ready" else blocker!!.short}. Change" },
+                .semantics { contentDescription = "Model: $label. ${if (ready) "Ready" else blocker.short}. Change" },
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
@@ -318,7 +318,7 @@ private fun Compose(
         draftPath?.let { Notice("Draft saved for RPA Engine as ${java.io.File(it).name}. Load it there to run the whole plan.", Tone.SUCCESS) }
         if (!collapsed && model != null) {
             val where = if (decision) "OpenRouter" else model.providerName
-            Text("Each step sends element labels, the page address and your instruction to $where. Never field values or passwords.",
+            Text("Each step sends your instruction (including anything quoted in it), element labels and the page address to $where. Text already in fields is never read.",
                 color = RpaTokens.TextMuted, fontSize = 11.sp)
         }
     }

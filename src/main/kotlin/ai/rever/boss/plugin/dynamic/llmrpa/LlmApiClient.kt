@@ -36,8 +36,7 @@ class LlmApiClient(
      */
     suspend fun callLLMApi(request: LLMRpaRequest, model: ModelOption? = null): LLMRpaResponse {
         val api = gateway() ?: return createUnconfiguredResponse(request)
-        // A routable model picked in the panel does not need an active one.
-        if (api.activeModel() == null && (model == null || model.kind != ModelOption.Kind.CHAT)) return createUnconfiguredResponse(request)
+        if (api.activeModel() == null) return createUnconfiguredResponse(request)
 
         // The model picked in the panel, or none. Never a silent fallback to the active model:
         // the draft would then come from a model the user did not choose.

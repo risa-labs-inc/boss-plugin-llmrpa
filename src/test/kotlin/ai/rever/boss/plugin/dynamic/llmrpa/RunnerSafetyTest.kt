@@ -41,11 +41,6 @@ class RunnerSafetyTest {
     private val instruction = "Search for 'wireless keyboard' and open the first result"
     private val chat = ModelOption(ModelOption.Kind.CHAT, "OPENROUTER", "OpenRouter", "openrouter/free")
 
-    init {
-        TaskRunner.NAV_SETTLE_MS = 0
-        TaskRunner.STEP_SETTLE_MS = 0
-    }
-
     private fun key(description: String, page: PageSnapshot = SEARCH_PAGE, text: String = instruction) =
         Candidates.build(page, text).first { it.description == description }.key
 
@@ -212,6 +207,9 @@ class RunnerSafetyTest {
         assertEquals(RunStatus.DONE, state.status)
         assertEquals(JsonPrimitive(true), tools.stepArgs.single()["allow_sensitive"])
         assertFalse(state.steps.single().valueWritten)
+        // The password reaches the engine and nothing else: not the timeline, the history or the transcript.
+        assertEquals("Type •••••• into 'Password'", state.steps.single().description)
+        assertFalse(LlmrpaMcpToolProvider.transcript(state).toString().contains("hunter2"))
     }
 
     @Test
@@ -473,10 +471,68 @@ class RunnerSafetyTest {
         assertTrue(bad.isError && bad.text.contains("DECISION:JEV:typesafe/jev-1.13"), bad.text)
     }
 
+    @Test
+    fun `the commit words cover every verb the chat prompt calls irreversible`() {
+        val line = ChatDecider.SYSTEM.lines().first { "\"irreversible\"" in it }
+        val verbs = line.substringAfter("if the action ").substringBefore(">").split(", ", " or ").map { it.trim() }
+        assertTrue(verbs.size >= 5, verbs.toString())
+        verbs.forEach { v ->
+            val stem = if (v.endsWith("shes")) v.removeSuffix("es") else v.removeSuffix("s")
+            val c = Candidate("a1", Candidate.Kind.CLICK, "Click '$stem' button", element = element("e1", "button", stem.replaceFirstChar { it.uppercase() }))
+            assertTrue(Candidates.soundsCommitting(c), stem)
+        }
+    }
+
+    @Test
+    fun `several quoted values and no pick says which is unclear, not to add quotes`() = runTest {
+        val text = "Search for 'wireless keyboard' or 'mouse'"
+        val tools = FakeTools { _, _ -> Triple("Type into 'Search shop'", 0.95, null) }
+        val state = TaskRunner(tools, JevDecider(tools, JEV), "t1", text) { Answer.Stop }.run()
+        assertEquals(RunStatus.STOPPED, state.status)
+        assertTrue(state.summary!!.contains("Not sure which text"), state.summary)
+    }
+
+    @Test
+    fun `model directory prefers the gateway catalog with the settings pick first, then falls back`() {
+        val tools = FakeTools { _, _ -> Triple("", 0.0, null) }.apply { registered = setOf(ToolNames.OBSERVE) }
+        fun cfg(p: String, m: String) = ai.rever.boss.plugin.api.LlmConfig(p, p.lowercase(), ai.rever.boss.plugin.api.LlmApiFormat.ANTHROPIC_MESSAGES, "k", "u", m)
+        fun provider(catalog: List<ai.rever.boss.plugin.api.AiProviderModels> = emptyList(), configured: List<ai.rever.boss.plugin.api.LlmConfig> = emptyList()) =
+            object : ai.rever.boss.plugin.api.LlmProvider {
+                override fun activeConfig(): ai.rever.boss.plugin.api.LlmConfig? = null
+                override fun configuredProviders() = configured
+                override fun availableModels() = catalog
+            }
+        fun gw(catalog: List<ai.rever.boss.plugin.api.AiProviderModels> = emptyList(), active: AiModelInfo? = null) = object : AiGatewayAPI {
+            override suspend fun complete(request: AiRequest): Result<AiReply> = Result.failure(UnsupportedOperationException())
+            override fun stream(request: AiRequest): Flow<AiChunk> = emptyFlow()
+            override suspend fun runAgent(request: AiRequest, tools: List<AiToolSpec>, budget: AiBudget, invoke: suspend (AiToolCall) -> AiToolOutcome): Result<AiAgentResult> =
+                Result.failure(UnsupportedOperationException())
+            override fun activeModel(): AiModelInfo? = active
+            override fun availableModels() = catalog
+        }
+        val anthropic = ai.rever.boss.plugin.api.AiProviderModels("ANTHROPIC", "Anthropic", listOf(
+            ai.rever.boss.plugin.api.AiAvailableModel("opus", "Opus"), ai.rever.boss.plugin.api.AiAvailableModel("haiku", "Haiku"),
+        ))
+        val fromGateway = ModelDirectory(tools, { provider(configured = listOf(cfg("ANTHROPIC", "haiku"))) }, { gw(listOf(anthropic)) }).load()
+        assertEquals(listOf("haiku", "opus"), fromGateway.single().models.map { it.modelId })
+
+        val fromProvider = ModelDirectory(tools, { provider(catalog = listOf(anthropic)) }, { gw() }).load()
+        assertEquals(listOf("opus", "haiku"), fromProvider.single().models.map { it.modelId })
+
+        val fromConfigured = ModelDirectory(tools, { provider(configured = listOf(cfg("OPENAI", "gpt-5"))) }, { gw() }).load()
+        assertEquals("gpt-5", fromConfigured.single().models.single().modelId)
+
+        val fromActive = ModelDirectory(tools, { null }, { gw(active = AiModelInfo("LOCAL", "Local", "gemma4")) }).load()
+        assertEquals("gemma4", fromActive.single().models.single().modelId)
+
+        assertTrue(ModelDirectory(tools, { null }, { null }).load().isEmpty())
+    }
+
     private fun tab(id: String, title: String = "Shop") = ActiveTabData(id, "fluck", title, "w", "Work", "p", "win", url = "https://shop.example/$id")
 
     private fun component(tools: ToolInvoker, locks: TabLocks = TabLocks(), provider: ActiveTabsProvider = tabs(listOf(tab("t1")))) =
-        LlmrpaComponent(DefaultComponentContext(LifecycleRegistry()), LlmrpaInfo, provider, { null }, tools = tools, llmProvider = { null }, tabLocks = locks, io = Dispatchers.Main)
+        LlmrpaComponent(DefaultComponentContext(LifecycleRegistry()), LlmrpaInfo, provider, { null }, tools = tools, llmProvider = { null }, tabLocks = locks,
+            io = Dispatchers.Main, work = Dispatchers.Main, baseLimits = RunLimits(navSettleMs = 0, stepSettleMs = 0))
 
     private fun withMain(block: () -> Unit) {
         Dispatchers.setMain(UnconfinedTestDispatcher())

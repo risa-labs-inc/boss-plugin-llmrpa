@@ -170,7 +170,7 @@ class JevDecider(private val tools: ToolInvoker, override val option: ModelOptio
             val answers = response.at("answers")
             val next = answers.at("next")
             val key = (next["choice"] as? JsonPrimitive)?.content ?: error("The reply has no 'answers.next.choice'")
-            val probs = next.at("probabilities").mapValues { (_, v) -> (v as JsonPrimitive).doubleOrNull ?: 0.0 }
+            val probs = next.at("probabilities").mapValues { (_, v) -> (v as? JsonPrimitive)?.doubleOrNull ?: 0.0 }
             val ranked = probs.entries.sortedByDescending { it.value }
             val value = (answers["value"] as? JsonObject)?.let { v ->
                 val pick = (v["choice"] as? JsonPrimitive)?.content.orEmpty()
@@ -284,7 +284,7 @@ class ChatDecider(
             else "This AI Gateway can only use the model selected in Settings → AI Providers (${active?.modelId ?: "none"}). Update AI Gateway, or pick that model."
         }
 
-        private val SYSTEM = """
+        internal val SYSTEM = """
 You operate a web browser one step at a time to complete the user's instruction.
 Each turn you get the instruction, the current page, what is already done, and a list of actions.
 Reply with only a JSON object:

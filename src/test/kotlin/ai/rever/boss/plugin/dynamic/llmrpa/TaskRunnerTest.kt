@@ -23,11 +23,6 @@ import kotlinx.serialization.json.JsonPrimitive
 class TaskRunnerTest {
     private val instruction = "Search for 'wireless keyboard' and open the first result"
 
-    init {
-        TaskRunner.NAV_SETTLE_MS = 0
-        TaskRunner.STEP_SETTLE_MS = 0
-    }
-
     @Test
     fun `values come from quotes, emails and urls but not apostrophes`() {
         assertEquals(listOf("wireless keyboard"), Candidates.values("Don't stop: search for 'wireless keyboard' now"))

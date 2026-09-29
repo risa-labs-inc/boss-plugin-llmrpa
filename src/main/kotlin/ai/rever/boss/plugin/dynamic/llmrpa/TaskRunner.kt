@@ -70,6 +70,9 @@ data class RunLimits(
     /** Below this, the done check says the page does not show the task complete. */
     val doneAbove: Double = 0.5,
     val maxConsecutiveFailures: Int = 2,
+    /** Settle times after a step, so the next look sees the rebuilt page; tests set them to zero. */
+    val navSettleMs: Long = 900,
+    val stepSettleMs: Long = 250,
 )
 
 /**
@@ -175,14 +178,20 @@ class TaskRunner(
             // The model's value only describes the model's own pick.
             val modelValue = decision.value.takeIf { chosenBy == StepRecord.ChosenBy.MODEL }
             if (chosen.needsValue) {
-                value = modelValue ?: values.singleOrNull()
-                    ?: return finish(RunStatus.STOPPED, "Needs text to type into ${chosen.element?.label ?: "the field"}. Put it in quotes in the instruction.")
+                val field = chosen.element?.label?.take(60) ?: "the field"
+                value = modelValue ?: values.singleOrNull() ?: return finish(
+                    RunStatus.STOPPED,
+                    if (values.isEmpty()) "Needs text to type into '$field'. Put it in quotes in the instruction."
+                    else "Not sure which text from the instruction goes into '$field'. Name the field next to each quoted value.",
+                )
             }
             val fromInstruction = value != null && value in values
             if (chosen.needsValue && chosen.element?.sensitive == true && !fromInstruction) {
                 return finish(RunStatus.STOPPED, "Stopped before typing into the private field '${chosen.element.label?.take(60)}': only text from your instruction goes there.")
             }
-            val description = if (chosen.needsValue) "Type '${value!!.take(60)}' into '${chosen.element?.label?.take(60)}'" else chosen.description
+            // A private field's text never reaches the timeline, the history the model sees, or the transcript.
+            val shown = if (chosen.element?.sensitive == true) "••••••" else "'${value?.take(60)}'"
+            val description = if (chosen.needsValue) "Type $shown into '${chosen.element?.label?.take(60)}'" else chosen.description
 
             if (chosen.canCommit) {
                 // Fails closed: an unassessed risk asks (and stops a headless run). The model's flag
@@ -218,7 +227,7 @@ class TaskRunner(
                 })
             }
             // Let the page finish rendering before the next look: scripts often rebuild widgets on load.
-            delay(if (navigated) NAV_SETTLE_MS else STEP_SETTLE_MS)
+            delay(if (navigated) limits.navSettleMs else limits.stepSettleMs)
             if (ok) {
                 failures = 0
                 history += if (error != null) "$description ($error)" else description
@@ -290,19 +299,15 @@ class TaskRunner(
     }
 
     companion object {
-        /** Settle times after a step; tests set them to zero. */
-        internal var NAV_SETTLE_MS = 900L
-        internal var STEP_SETTLE_MS = 250L
-
         fun pct(p: Double): String = "${(p * 100).toInt()}%"
-
-        /** An [ask] that the panel completes from a button press. */
-        class Asker {
-            // Atomic: ask and answer run on Main today, but answer is public and Stop may come from elsewhere.
-            private val pending = AtomicReference<CompletableDeferred<Answer>?>(null)
-            suspend fun ask(q: PendingQuestion): Answer =
-                CompletableDeferred<Answer>().also { pending.getAndSet(it)?.complete(Answer.Stop) }.await()
-            fun answer(a: Answer) { pending.getAndSet(null)?.complete(a) }
-        }
     }
+}
+
+/** The panel's [TaskRunner] ask: suspends until a button press answers it. One per panel. */
+internal class PanelAsker {
+    // Atomic: the run asks off the UI thread and the panel answers on it.
+    private val pending = AtomicReference<CompletableDeferred<Answer>?>(null)
+    suspend fun ask(q: PendingQuestion): Answer =
+        CompletableDeferred<Answer>().also { pending.getAndSet(it)?.complete(Answer.Stop) }.await()
+    fun answer(a: Answer) { pending.getAndSet(null)?.complete(a) }
 }

@@ -157,7 +157,7 @@ internal object Candidates {
     }
 
     private val COMMIT_WORDS = Regex(
-        """\b(submit|pay|buy|purchase|order|send|delete|remove|confirm|place order|check ?out|transfer)\b""",
+        """\b(submit|pay|buy|purchase|order|send|delete|remove|confirm|check ?out|transfer|publish|post|sign ?up|register|save|accept|agree|book|reserve|donate|unsubscribe|cancel)\b""",
         RegexOption.IGNORE_CASE,
     )
 
