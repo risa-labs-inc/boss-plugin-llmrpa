@@ -8,6 +8,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Tabs with a run on them, shared by the panel and `llmrpa_execute` across the plugin, so two
@@ -30,6 +31,17 @@ class TabLocks {
 }
 
 /**
+ * Finished runs from the panel and `llmrpa_execute`, newest first, so `llmrpa_export` reaches
+ * either. In memory only.
+ */
+class RunHistory(private val keep: Int = 20) {
+    private val runs = AtomicReference<List<RunState>>(emptyList())
+
+    fun add(run: RunState) { runs.updateAndGet { (listOf(run) + it).take(keep) } }
+    fun recent(): List<RunState> = runs.get()
+}
+
+/**
  * Runs a task for an MCP caller, with no panel. Nobody is there to answer a question, so the
  * runner stops wherever the panel would have asked: when the model is unsure or the next action
  * looks irreversible. The caller gets the transcript and can decide what to do.
@@ -48,6 +60,8 @@ class HeadlessRunner(
     private val openTab: suspend (url: String, title: String) -> String?,
     // No default: a forgotten one would give headless runs their own locks, apart from the panel's.
     private val locks: TabLocks,
+    // No default, for the same reason: a forgotten one would hide headless runs from llmrpa_export.
+    private val runs: RunHistory,
     private val timeLimitMs: Long = TIME_LIMIT_MS,
     private val limits: RunLimits = RunLimits(),
 ) {
@@ -140,6 +154,7 @@ class HeadlessRunner(
             Result.success(withTimeoutOrNull(timeLimitMs) { runner.run() } ?: runner.also { it.timedOut(timeLimitMs) }.state.value)
         } finally {
             runner.state.value.tabId?.let(locks::release)
+            runs.add(runner.state.value)
         }
     }
 

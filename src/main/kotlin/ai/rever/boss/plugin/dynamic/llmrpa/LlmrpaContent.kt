@@ -37,6 +37,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -394,9 +395,20 @@ private fun RunPane(component: LlmrpaComponent, run: RunState?, pastRuns: List<R
                 if (run == null) {
                     Empty(component)
                 } else {
+                    val byStep = run.modelCalls.groupBy { it.step }
                     run.opened?.let { OpenedRow(it) }
                     if (active && run.tabId == null) Text("Finding the page to start on…", color = RpaTokens.TextSecondary, fontSize = 12.sp)
-                    run.steps.forEach { StepRow(it, current = active && it == run.steps.last() && it.outcome == StepRecord.Outcome.RUNNING) }
+                    // Choosing the start page is step 0; a run on an open tab makes no call there.
+                    ModelCallsRow(byStep[0].orEmpty(), label = "Start page")
+                    run.steps.forEach {
+                        key(it.index) {
+                            StepRow(it, current = active && it == run.steps.last() && it.outcome == StepRecord.Outcome.RUNNING)
+                            ModelCallsRow(byStep[it.index].orEmpty(), Modifier.padding(start = 30.dp))
+                        }
+                    }
+                    // The step being decided, or the decision and done check that ended the run.
+                    val known = run.steps.map { it.index }.toSet() + 0
+                    ModelCallsRow(run.modelCalls.filter { it.step !in known }, label = if (active) "Deciding the next step" else "Last decision")
                     if (active && run.tabId != null && run.question == null && run.steps.lastOrNull()?.outcome != StepRecord.Outcome.RUNNING) {
                         Text("Reading the page…", color = RpaTokens.TextSecondary, fontSize = 12.sp)
                     }
@@ -425,7 +437,7 @@ private fun RunHeader(component: LlmrpaComponent, run: RunState, active: Boolean
     ) {
         Text(status, color = RpaTokens.Text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
         Text(
-            "Step ${run.steps.size} of up to ${run.maxSteps} · ${run.calls} calls" + if (run.costUsd > 0) " · $%.5f".format(run.costUsd) else "",
+            "Step ${run.steps.size} of up to ${run.maxSteps} · ${run.calls} model ${if (run.calls == 1) "call" else "calls"}" + if (run.costUsd > 0) " · ${usd(run.costUsd)}" else "",
             color = RpaTokens.TextMuted, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f),
         )
         if (active) OutlineButton("Stop", component::stopRun, tone = Tone.ERROR)
@@ -572,6 +584,7 @@ private fun OptionRow(index: Int, text: String, confidence: Double?, mono: Boole
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun ResultCard(component: LlmrpaComponent, run: RunState) {
     val tone = if (run.status == RunStatus.DONE) Tone.SUCCESS else Tone.ERROR
@@ -587,8 +600,23 @@ private fun ResultCard(component: LlmrpaComponent, run: RunState) {
     ) {
         Text(title, color = RpaTokens.Text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
         run.summary?.let { Text(it, color = RpaTokens.TextSecondary, fontSize = 12.sp) }
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        val notice = component.export.collectAsState().value?.takeIf { it.runStartedAt == run.startedAt }
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             OutlineButton("Run again", { component.reuse(run); component.startRun() })
+            if (RpaEngineHandoff.exportable(run)) OutlineButton("Export as RPA config", { component.exportRun(run) }, tone = Tone.NEUTRAL)
+        }
+        notice?.let { n ->
+            n.error?.let { Notice("Could not export: $it", Tone.ERROR) }
+            n.export?.let { e ->
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text("Saved ${e.actionCount} actions as ${e.file.name}", color = RpaTokens.Text, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                    Text(e.file.absolutePath, color = RpaTokens.TextMuted, fontSize = 11.sp, fontFamily = RpaTokens.Mono)
+                    e.notes.forEach { Text(it, color = RpaTokens.Warning, fontSize = 11.sp) }
+                    if (component.canOpenInEngine()) LinkText("Open in RPA Engine", { component.openInEngine(n) })
+                    else Text("RPA Engine lists it under saved configurations.", color = RpaTokens.TextSecondary, fontSize = 11.sp)
+                    n.loaded?.let { Text(it, color = RpaTokens.TextSecondary, fontSize = 11.sp) }
+                }
+            }
         }
     }
 }

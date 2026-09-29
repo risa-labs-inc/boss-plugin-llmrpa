@@ -238,7 +238,7 @@ class RunnerSafetyTest {
         val locks = TabLocks()
         assertNull(locks.tryAcquire("t1", TabLocks.Owner.PANEL))
         val tools = FakeTools { _, _ -> Triple("The task is complete", 0.9, null) }
-        val headless = HeadlessRunner(tools, { null }, { null }, tabs = { listOf(tab("t1")) }, activeTabId = { null }, drivable = { true }, openTab = { _, _ -> null }, locks = locks)
+        val headless = HeadlessRunner(tools, { null }, { null }, tabs = { listOf(tab("t1")) }, activeTabId = { null }, drivable = { true }, openTab = { _, _ -> null }, locks = locks, runs = RunHistory())
         val err = headless.execute(instruction, "t1", 3, null).exceptionOrNull()?.message.orEmpty()
         assertTrue(err.contains("panel") && err.contains("waiting for an answer"), err)
     }
@@ -254,11 +254,11 @@ class RunnerSafetyTest {
     fun `headless runs use the focused tab, or ask for one and list what is open`() = runTest {
         val tools = FakeTools { _, _ -> Triple("The task is complete", 0.9, null) }
         val open = listOf(tab("t1", "Mail"), tab("t2", "Shop"))
-        val none = HeadlessRunner(tools, { null }, { null }, tabs = { open }, activeTabId = { null }, drivable = { true }, openTab = { _, _ -> null }, locks = TabLocks())
+        val none = HeadlessRunner(tools, { null }, { null }, tabs = { open }, activeTabId = { null }, drivable = { true }, openTab = { _, _ -> null }, locks = TabLocks(), runs = RunHistory())
         val err = none.execute(instruction, null, 3, null).exceptionOrNull()!!.message!!
         assertTrue(err.contains("tab_id") && err.contains("t1 ('Mail'") && err.contains("t2 ('Shop'"), err)
 
-        val focused = HeadlessRunner(tools, { null }, { null }, tabs = { open }, activeTabId = { "t2" }, drivable = { true }, openTab = { _, _ -> null }, locks = TabLocks())
+        val focused = HeadlessRunner(tools, { null }, { null }, tabs = { open }, activeTabId = { "t2" }, drivable = { true }, openTab = { _, _ -> null }, locks = TabLocks(), runs = RunHistory())
         assertEquals(RunStatus.DONE, focused.execute(instruction, null, 3, null).getOrThrow().status)
 
         val unknown = none.execute(instruction, "t9", 3, null).exceptionOrNull()!!.message!!
@@ -377,7 +377,7 @@ class RunnerSafetyTest {
                 ai.rever.boss.plugin.api.AiProviderModels("ANTHROPIC", "Anthropic", listOf(ai.rever.boss.plugin.api.AiAvailableModel("claude-haiku", "Haiku"))),
             )
         }
-        val runner = HeadlessRunner(tools, { api }, { null }, tabs = { listOf(tab("t1")) }, activeTabId = { "t1" }, drivable = { true }, openTab = { _, _ -> null }, locks = TabLocks())
+        val runner = HeadlessRunner(tools, { api }, { null }, tabs = { listOf(tab("t1")) }, activeTabId = { "t1" }, drivable = { true }, openTab = { _, _ -> null }, locks = TabLocks(), runs = RunHistory())
         val byDefault = runner.execute(instruction, null, 3, null).getOrThrow()
         assertEquals("Haiku", byDefault.modelLabel)
         assertEquals(RunStatus.DONE, byDefault.status)
@@ -390,9 +390,10 @@ class RunnerSafetyTest {
     fun `the mcp transcript keeps the shape agents parse`() = runTest {
         val tools = FakeTools { _, call -> if (call == 0) Triple("Open 'Sign in' link", 0.9, null) else Triple("The task is complete", 0.9, null) }
         val t = LlmrpaMcpToolProvider.transcript(TaskRunner(tools, JevDecider(tools, JEV), "t1", instruction) { Answer.Stop }.run())
-        assertEquals(setOf("status", "summary", "model", "model_calls", "cost_usd", "steps"), t.keys)
+        // The final decision and done check led to no step, so they are listed apart.
+        assertEquals(setOf("status", "summary", "model", "model_calls", "cost_usd", "steps", "other_model_calls"), t.keys)
         val step = (t["steps"] as kotlinx.serialization.json.JsonArray).single() as kotlinx.serialization.json.JsonObject
-        assertEquals(setOf("step", "action", "confidence", "result"), step.keys)
+        assertEquals(setOf("step", "action", "confidence", "result", "model_calls"), step.keys)
         assertEquals("ok", (step["result"] as JsonPrimitive).content)
     }
 
@@ -464,7 +465,8 @@ class RunnerSafetyTest {
         val tools = FakeTools { _, _ -> Triple("Open 'Sign in' link", 0.9, null) }
         val provider = LlmrpaMcpToolProvider(
             "p", component = { null },
-            headless = HeadlessRunner(tools, { null }, { null }, tabs = { listOf(tab("t1")) }, activeTabId = { "t1" }, drivable = { true }, openTab = { _, _ -> null }, locks = TabLocks()),
+            headless = HeadlessRunner(tools, { null }, { null }, tabs = { listOf(tab("t1")) }, activeTabId = { "t1" }, drivable = { true }, openTab = { _, _ -> null }, locks = TabLocks(), runs = RunHistory()),
+            runs = RunHistory(),
         )
         val execute = provider.tools().first { it.name == "llmrpa_execute" }.handler
         suspend fun call(raw: String) = execute.call(ai.rever.boss.plugin.api.McpToolArgs(emptyMap(), raw))
@@ -587,14 +589,14 @@ class RunnerSafetyTest {
     @Test
     fun `headless with a Jev model and no jev_decide says Jev is missing`() = runTest {
         val tools = FakeTools { _, _ -> Triple("The task is complete", 0.9, null) }
-        val runner = HeadlessRunner(tools, { null }, { null }, tabs = { listOf(tab("t1")) }, activeTabId = { "t1" }, drivable = { true }, openTab = { _, _ -> null }, locks = TabLocks())
+        val runner = HeadlessRunner(tools, { null }, { null }, tabs = { listOf(tab("t1")) }, activeTabId = { "t1" }, drivable = { true }, openTab = { _, _ -> null }, locks = TabLocks(), runs = RunHistory())
         // The catalog saw Jev, then it unloaded before the run started.
         var calls = 0
         tools.registered = null
         val flaky = object : ToolInvoker by tools {
             override fun has(toolName: String) = if (toolName == ToolNames.JEV_DECIDE) calls++ == 0 else tools.has(toolName)
         }
-        val err = HeadlessRunner(flaky, { null }, { null }, tabs = { listOf(tab("t1")) }, activeTabId = { "t1" }, drivable = { true }, openTab = { _, _ -> null }, locks = TabLocks())
+        val err = HeadlessRunner(flaky, { null }, { null }, tabs = { listOf(tab("t1")) }, activeTabId = { "t1" }, drivable = { true }, openTab = { _, _ -> null }, locks = TabLocks(), runs = RunHistory())
             .execute(instruction, null, 3, null).exceptionOrNull()?.message.orEmpty()
         assertTrue(err.contains("Jev is not installed"), err)
         assertEquals(RunStatus.DONE, runner.execute(instruction, null, 3, null).getOrThrow().status)
@@ -659,7 +661,7 @@ class RunnerSafetyTest {
     private fun tab(id: String, title: String = "Shop") = ActiveTabData(id, "fluck", title, "w", "Work", "p", "win", url = "https://shop.example/$id")
 
     private fun component(tools: ToolInvoker, locks: TabLocks = TabLocks(), provider: ActiveTabsProvider = tabs(listOf(tab("t1")))) =
-        LlmrpaComponent(DefaultComponentContext(LifecycleRegistry()), LlmrpaInfo, provider, { null }, tools = tools, llmProvider = { null }, tabLocks = locks,
+        LlmrpaComponent(DefaultComponentContext(LifecycleRegistry()), LlmrpaInfo, provider, { null }, tools = tools, llmProvider = { null }, tabLocks = locks, runHistory = RunHistory(),
             io = Dispatchers.Main, work = Dispatchers.Main, baseLimits = RunLimits(navSettleMs = 0, stepSettleMs = 0))
 
     private fun withMain(block: () -> Unit) {

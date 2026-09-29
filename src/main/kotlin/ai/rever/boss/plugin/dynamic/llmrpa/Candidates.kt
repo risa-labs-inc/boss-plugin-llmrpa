@@ -149,8 +149,11 @@ internal object Candidates {
      * Whether [value] is the word after a password-like keyword, quoted or bare: text only a private
      * field or the person may place, and masked wherever it is shown.
      */
-    fun isKeywordSecret(instruction: String, value: String): Boolean =
-        PRIVATE_AFTER.findAll(instruction).any { m -> m.groupValues.drop(1).any { it.isNotEmpty() && it.trim('"', '\'', '“', '”', '‘', '’') == value } }
+    fun isKeywordSecret(instruction: String, value: String): Boolean = value in keywordPrivate(instruction)
+
+    /** Every value [isKeywordSecret] accepts, unquoted. */
+    fun keywordPrivate(instruction: String): Set<String> =
+        PRIVATE_AFTER.findAll(instruction).flatMap { it.groupValues.drop(1) }.filter { it.isNotEmpty() }.map { it.trim('"', '\'', '“', '”', '‘', '’') }.toSet()
 
     /**
      * [instruction] with each secret keyword and its word, then its values ([scrubbable]), replaced

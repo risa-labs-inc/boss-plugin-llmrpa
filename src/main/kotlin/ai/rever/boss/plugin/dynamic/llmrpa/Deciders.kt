@@ -2,6 +2,7 @@ package ai.rever.boss.plugin.dynamic.llmrpa
 
 import ai.rever.boss.plugin.api.AiGatewayAPI
 import ai.rever.boss.plugin.api.AiMessage
+import ai.rever.boss.plugin.api.AiReply
 import ai.rever.boss.plugin.api.AiRequest
 import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.Json
@@ -101,38 +102,58 @@ class StartUrlCallFailed(cause: Throwable) : Exception(cause.message, cause)
  * type. It cannot write text, so a typed value is always one the instruction contains.
  */
 class JevDecider(private val tools: ToolInvoker, override val option: ModelOption) : StepDecider {
-    override suspend fun decide(ctx: StepContext): Result<Decision> {
-        val reply = tools.invoke(ToolNames.JEV_DECIDE, decideArgs(ctx, option.modelId))
-        if (reply.isError) return Result.failure(IllegalStateException(reply.errorMessage))
-        return guarded { Result.success(parseDecision(reply.json ?: error("Jev returned no JSON"), ctx)) }
-    }
+    override suspend fun decide(ctx: StepContext): Result<Decision> =
+        ask(CallKind.DECIDE, decideArgs(ctx, option.modelId), { parseDecision(it, ctx) }) { d ->
+            CallOutcome(ctx.candidates.firstOrNull { it.key == d.key }?.description ?: d.key, d.confidence)
+        }
 
-    override suspend fun risk(ctx: StepContext, action: Candidate): Result<Pair<Double, Double>> {
-        val reply = tools.invoke(ToolNames.JEV_DECIDE, riskArgs(ctx, action, option.modelId))
-        if (reply.isError) return Result.failure(IllegalStateException(reply.errorMessage))
-        return guarded { Result.success(noul(reply, "irreversible")) }
-    }
+    override suspend fun risk(ctx: StepContext, action: Candidate): Result<Pair<Double, Double>> =
+        ask(CallKind.RISK, riskArgs(ctx, action, option.modelId), { noul(it, "irreversible") }) { (p, _) -> CallOutcome(risk = p) }
 
-    override suspend fun verifyDone(ctx: StepContext): Result<Pair<Double, Double>> {
-        val reply = tools.invoke(ToolNames.JEV_DECIDE, verifyArgs(ctx, option.modelId))
-        if (reply.isError) return Result.failure(IllegalStateException(reply.errorMessage))
-        return guarded { Result.success(noul(reply, "complete")) }
-    }
+    override suspend fun verifyDone(ctx: StepContext): Result<Pair<Double, Double>> =
+        ask(CallKind.VERIFY_DONE, verifyArgs(ctx, option.modelId), { noul(it, "complete") }) { (p, _) -> CallOutcome(confidence = p) }
 
     override suspend fun chooseText(ctx: StepContext, field: String, options: List<String>): Result<TextChoice> = guarded {
-        val reply = tools.invoke(ToolNames.JEV_DECIDE, textArgs(ctx, field, options, option.modelId))
-        if (reply.isError) Result.failure(IllegalStateException(reply.errorMessage))
-        else Result.success(parseText(reply.json ?: error("Jev returned no JSON"), options.size))
+        ask(CallKind.TEXT, textArgs(ctx, field, options, option.modelId), { parseText(it, options.size) }) { c ->
+            CallOutcome(c.index?.let(options::getOrNull) ?: "None of these", c.confidence)
+        }
     }
 
     // jev_decide answers choice, yes/no and score questions only, so it cannot write an address.
     override suspend fun startUrl(instruction: String): Result<StartUrlReply> =
         Result.failure(UnsupportedOperationException("Jev picks from options and cannot write an address"))
 
+    /**
+     * One `jev_decide` call, recorded with its questions, Jev's probabilities and what it parsed
+     * to. A throw from the tool is recorded, then rethrown for the caller's guard.
+     */
+    private suspend fun <T> ask(kind: CallKind, args: JsonObject, parse: (JsonObject) -> T, outcome: (T) -> CallOutcome): Result<T> {
+        val started = System.nanoTime()
+        fun record(reply: ToolReply?, result: Result<T>) = ModelCall(
+            step = 0, kind = kind, tool = ToolNames.JEV_DECIDE, model = option.modelId,
+            questions = questions(args, reply?.json), request = CappedText(args.toString()),
+            response = reply?.let { CappedText(it.text) }, latencyMs = (System.nanoTime() - started) / 1_000_000,
+            costUsd = (reply?.json?.get("response") as? JsonObject)?.let(::cost),
+            error = result.exceptionOrNull()?.let { it.message ?: it::class.simpleName },
+        ).let { c -> result.getOrNull()?.let(outcome)?.let { o -> c.copy(pick = o.pick, confidence = o.confidence, risk = o.risk) } ?: c }
+        val reply = try {
+            tools.invoke(ToolNames.JEV_DECIDE, args)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            recordCall(record(null, Result.failure(e)))
+            throw e
+        }
+        val result = if (reply.isError) Result.failure(IllegalStateException(reply.errorMessage))
+        else guarded { Result.success(parse(reply.json ?: error("Jev returned no JSON"))) }
+        recordCall(record(reply, result))
+        return result
+    }
+
     companion object {
         /** A yes/no answer's probability and the call's cost. A missing answer fails rather than reading as 0. */
-        private fun noul(reply: ToolReply, question: String): Pair<Double, Double> {
-            val response = (reply.json ?: error("Jev returned no JSON")).at("response")
+        private fun noul(root: JsonObject, question: String): Pair<Double, Double> {
+            val response = root.at("response")
             val answer = response.at("answers.$question")["noul"] as? JsonPrimitive ?: error("The reply has no 'answers.$question.noul'")
             return (answer.doubleOrNull ?: error("'answers.$question.noul' is not a number")) to cost(response)
         }
@@ -253,8 +274,34 @@ class JevDecider(private val tools: ToolInvoker, override val option: ModelOptio
 
         private fun cost(response: JsonObject): Double =
             ((response["usage"] as? JsonObject)?.get("cost") as? JsonPrimitive)?.doubleOrNull ?: 0.0
+
+        /**
+         * The questions in [args] with their options, and Jev's probability for each from [reply]
+         * when it answered. A yes/no answer's probability is the "true" option's.
+         */
+        internal fun questions(args: JsonObject, reply: JsonObject?): List<CallQuestion> {
+            val answers = ((reply?.get("response") as? JsonObject)?.get("answers") as? JsonObject)
+            return (args["questions"] as? JsonObject).orEmpty().map { (id, q) ->
+                val o = q as? JsonObject
+                val answer = answers?.get(id) as? JsonObject
+                val probs = answer?.get("probabilities") as? JsonObject
+                val noul = (answer?.get("noul") as? JsonPrimitive)?.doubleOrNull
+                val options = (o?.get("criteria") as? JsonObject).orEmpty().map { (key, label) ->
+                    val p = when {
+                        noul != null && key == "true" -> noul
+                        noul != null && key == "false" -> 1 - noul
+                        else -> (probs?.get(key) as? JsonPrimitive)?.doubleOrNull
+                    }
+                    CallOption(key, (label as? JsonPrimitive)?.content.orEmpty(), p)
+                }
+                CallQuestion(id, (o?.get("instructions") as? JsonPrimitive)?.content.orEmpty(), options, (answer?.get("choice") as? JsonPrimitive)?.content)
+            }
+        }
     }
 }
+
+/** What a call parsed to, for its [ModelCall] record. */
+internal data class CallOutcome(val pick: String? = null, val confidence: Double? = null, val risk: Double? = null)
 
 /**
  * Any chat model configured in Settings → AI Providers, reached through the AI Gateway with the
@@ -271,8 +318,9 @@ class ChatDecider(
         val api = runCatching { gateway() }.getOrNull() ?: return Result.failure(IllegalStateException("The AI Gateway plugin is not available"))
         routingProblem(api, option)?.let { return Result.failure(IllegalStateException(it)) }
         val first = request(prompt(ctx))
-        val reply = api.complete(first).getOrElse { return Result.failure(it) }
-        runCatching { parseReply(reply.text, ctx) }.onSuccess { return Result.success(it) }
+        fun outcome(d: Decision) = CallOutcome(ctx.candidates.firstOrNull { it.key == d.key }?.description ?: d.key, d.confidence, d.risk)
+        val (reply, parsed) = call(api, CallKind.DECIDE, first, { parseReply(it, ctx) }, ::outcome)
+        if (reply == null || parsed.isSuccess) return parsed
         // Smaller and "free" routed models sometimes answer in prose. Ask once more, showing them
         // their own reply, before giving up on the step.
         val retry = first.copy(
@@ -282,13 +330,48 @@ class ChatDecider(
                         "and including the \"irreversible\" key.",
                 ),
         )
-        val second = api.complete(retry).getOrElse { return Result.failure(it) }
-        return runCatching { parseReply(second.text, ctx) }.recoverCatching { e ->
+        val (second, again) = call(api, CallKind.DECIDE, retry, { parseReply(it, ctx) }, ::outcome)
+        if (second == null) return again
+        return again.recoverCatching { e ->
             // Quote the reply: "did not reply with JSON" alone left nothing to act on, and an empty
             // reply (a reasoning model spending its budget thinking) looks different from prose.
             val said = second.text.trim().replace(Regex("\\s+"), " ").take(160)
             throw IllegalStateException("${e.message}. It replied: ${if (said.isEmpty()) "(nothing)" else "\"$said\""}")
         }
+    }
+
+    /**
+     * One gateway request, recorded with its prompt, the reply and what it parsed to. The reply is
+     * null when the request itself failed; a throw is recorded, then rethrown for the caller's guard.
+     */
+    private suspend fun <T> call(
+        api: AiGatewayAPI,
+        kind: CallKind,
+        request: AiRequest,
+        parse: (String) -> T,
+        outcome: (T) -> CallOutcome,
+    ): Pair<AiReply?, Result<T>> {
+        val started = System.nanoTime()
+        fun record(reply: AiReply?, result: Result<T>) = ModelCall(
+            step = 0, kind = kind, tool = ModelCall.GATEWAY,
+            model = "${option.providerId}/${reply?.modelId?.takeIf { it.isNotBlank() } ?: option.modelId}",
+            request = CappedText(promptText(request)), response = reply?.let { CappedText(it.text) },
+            latencyMs = (System.nanoTime() - started) / 1_000_000,
+            inputTokens = reply?.usage?.inputTokens, outputTokens = reply?.usage?.outputTokens,
+            error = result.exceptionOrNull()?.let { it.message ?: it::class.simpleName },
+        ).let { c -> result.getOrNull()?.let(outcome)?.let { o -> c.copy(pick = o.pick, confidence = o.confidence, risk = o.risk) } ?: c }
+        val reply = try {
+            api.complete(request)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            recordCall(record(null, Result.failure(e)))
+            throw e
+        }
+        val text = reply.getOrElse { e -> recordCall(record(null, Result.failure(e))); return null to Result.failure(e) }
+        val result = runCatching { parse(text.text) }
+        recordCall(record(text, result))
+        return text to result
     }
 
     // The chat decision already carries the irreversible flag, so no second call.
@@ -306,29 +389,26 @@ class ChatDecider(
             appendLine("The browser is now on: ${quote(ctx.page.title)} (${quote(ctx.page.url)})")
             append("Judging only by that page, is the instruction fully complete? Reply with only JSON: {\"complete\": true|false, \"confidence\": 0..1}")
         }
-        val reply = api.complete(
-            AiRequest(system = "You check whether a browser task is finished. Be strict: a search or results page is not an opened article.",
-                messages = listOf(AiMessage.user(user)), temperature = 0f, maxTokens = 2_000, timeoutMs = 90_000, extras = routingExtras(option)),
-        ).getOrElse { return Result.failure(it) }
-        return runCatching {
-            val obj = Json.parseToJsonElement(LlmApiClient.firstJsonObject(reply.text) ?: error("The model did not reply with JSON")).jsonObject
+        val request = AiRequest(system = "You check whether a browser task is finished. Be strict: a search or results page is not an opened article.",
+            messages = listOf(AiMessage.user(user)), temperature = 0f, maxTokens = 2_000, timeoutMs = 90_000, extras = routingExtras(option))
+        return call(api, CallKind.VERIFY_DONE, request, { text ->
+            val obj = Json.parseToJsonElement(LlmApiClient.firstJsonObject(text) ?: error("The model did not reply with JSON")).jsonObject
             val complete = (obj["complete"] as? JsonPrimitive)?.booleanOrNull ?: false
             val confidence = (obj["confidence"] as? JsonPrimitive)?.doubleOrNull?.coerceIn(0.0, 1.0)
             // A bare "complete: true" is the model's word alone, which this check exists to doubt.
             val p = if (complete) confidence ?: error("The model said the task is complete without saying how sure") else 1 - (confidence ?: 1.0)
             p to 0.0
-        }
+        }) { (p, _) -> CallOutcome(confidence = p) }.second
     }
 
     override suspend fun startUrl(instruction: String): Result<StartUrlReply> = guarded {
         val api = runCatching { gateway() }.getOrNull() ?: return@guarded Result.failure(IllegalStateException("The AI Gateway plugin is not available"))
         routingProblem(api, option)?.let { return@guarded Result.failure(IllegalStateException(it)) }
-        val reply = api.complete(
-            // 2 000 tokens for one field: room for reasoning models, as in decide.
-            AiRequest(system = START_SYSTEM, messages = listOf(AiMessage.user("Instruction: ${quote(instruction, 1_000)}")),
-                temperature = 0f, maxTokens = 2_000, timeoutMs = 90_000, extras = routingExtras(option)),
-        ).getOrElse { return@guarded Result.failure(StartUrlCallFailed(it)) }
-        Result.success(StartUrlReply(parseStartUrl(reply.text)))
+        // 2 000 tokens for one field: room for reasoning models, as in decide.
+        val request = AiRequest(system = START_SYSTEM, messages = listOf(AiMessage.user("Instruction: ${quote(instruction, 1_000)}")),
+            temperature = 0f, maxTokens = 2_000, timeoutMs = 90_000, extras = routingExtras(option))
+        val (reply, parsed) = call(api, CallKind.START_URL, request, { StartUrlReply(parseStartUrl(it)) }) { CallOutcome(it.url ?: "no address") }
+        if (reply == null) Result.failure(StartUrlCallFailed(parsed.exceptionOrNull()!!)) else parsed
     }
 
     private fun request(user: String) = AiRequest(
@@ -387,6 +467,12 @@ If you do not know a fitting site, reply {"url": null}.
         """.trimIndent()
 
         /** The "url" string in a start-page reply, or null. Validation is the caller's. */
+        /** A request as the model reads it: the system prompt, then each turn. */
+        internal fun promptText(request: AiRequest): String = buildString {
+            append("[system]\n").append(request.system)
+            request.messages.forEach { append("\n\n[").append(it.role).append("]\n").append(it.text) }
+        }
+
         internal fun parseStartUrl(text: String): String? = runCatching {
             val obj = Json.parseToJsonElement(LlmApiClient.firstJsonObject(text) ?: return null).jsonObject
             (obj["url"] as? JsonPrimitive)?.takeIf { it.isString }?.content

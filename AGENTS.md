@@ -494,3 +494,27 @@ emails and addresses only, and Jev cannot write.
   hunter2").
 - **Text the person picks (`USER`) does not make Enter commit.** The card names the field ("Pick the
   text to type into '<field>'"), so the person chose both; this is deliberate, like quoted text.
+
+## Model calls and export (1.5)
+
+- **Every decider call is a `ModelCall` in `RunState.modelCalls`**, linked to its step (0 = the start
+  page). Deciders report through `CallRecorder`, a coroutine-context element the runner installs
+  around each call, so they hold no run state and a decider used outside a run records nothing.
+  `RunState.calls` and `costUsd` are derived from the list, so the header cannot disagree with it.
+  A chat retry is two calls, and a failed `jev_decide` is recorded with its error.
+- **Masked, then capped.** Stored text is masked (keyword secrets from the start, a value typed into a
+  private field from then on, re-masking earlier calls) and only then cut to 8 KB, and the cut never
+  splits an instruction value, so a mask added later still finds all of it. Masking is whole-word:
+  the keyword regex over-cuts ("pin the tab"), and substring masking would blank every "there".
+- Calls with no step of their own (the decision and done check that ended the run) show as "Last
+  decision" and as `other_model_calls` in the transcript. `include_calls`/`verbose` adds them in full.
+- **Export reuses `RpaEngineHandoff`'s envelope and writer.** A navigate to `RunState.startUrl`, then
+  each OK step's recorded `StepAction`. `download` is `rpa_step`-only in the engine and is left out
+  with a note. The engine has no variables, so a private field is written with `value: ""`,
+  `meta.private = "true"` and a note in the description. Names come from `shareableInstruction`.
+- **An export never replaces a file.** The name is reserved with `Files.createFile` and the content
+  moved over it: an atomic rename replaces silently on Unix. A scan in between reads an empty file,
+  which the engine skips as unparseable.
+- "Open in RPA Engine" is `rpa_load` by the configuration's name, which needs the engine's panel open;
+  its answer is shown as is. `RunHistory` is shared like `TabLocks` so `llmrpa_export` reaches panel
+  and headless runs.
