@@ -4,6 +4,8 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
@@ -158,6 +160,8 @@ class TaskRunner(
             }
         } ?: return stop(RunStatus.FAILED, "Could not open a new tab for $url: BOSS did not create one. Open the page yourself and pick its tab.")
         refusal?.let { return stop(RunStatus.FAILED, "Opened $id, but: $it") }
+        // A Stop that arrived mid-create ends the run here, with the tab recorded for release.
+        currentCoroutineContext().ensureActive()
         val page = awaitPage(id).getOrElse {
             return stop(RunStatus.FAILED, "Opened $url, but the page could not be read: ${it.message}. Check the new tab and run again on it.")
         }
@@ -175,15 +179,18 @@ class TaskRunner(
     private suspend fun awaitPage(id: String): Result<PageSnapshot> {
         var last = "it did not load after ${limits.openWaitsMs.sum() / 1000} s"
         var empty: PageSnapshot? = null
+        var waited = 0L
         for (wait in limits.openWaitsMs) {
             delay(wait)
+            waited += wait
             val page = read(id)
             if (page == null) continue
             lastReadError = null
             if (page.url.isBlank() || page.url == "about:blank") { last = "it is still blank"; continue }
-            // A page with nothing to act on (plain text, a PDF) is taken once it reads the same twice.
+            // A page with nothing to act on (plain text, a PDF) is taken once it reads the same twice
+            // past half the budget: an app shows a spinner under its final title for a while first.
             if (page.elements.isEmpty()) {
-                if (empty?.url == page.url && empty.title == page.title) return Result.success(page)
+                if (waited * 2 >= limits.openWaitsMs.sum() && empty?.url == page.url && empty.title == page.title) return Result.success(page)
                 empty = page
                 continue
             }

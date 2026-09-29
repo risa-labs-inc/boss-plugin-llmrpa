@@ -419,7 +419,10 @@ Found by running, not reviewing:
   runs on Main (it edits split view state) and opens in the active space. The runner waits with
   bounded backoff (`RunLimits.openWaitsMs`, about 13 s), errors included (a script can fail
   mid-navigation). A page counts once it has an address and elements; it then gets `navSettleMs`
-  and a fresh look, which is the first step's page.
+  and a fresh look, which is the first step's page. A page with no elements is taken only after half
+  the budget and two identical reads: Gmail, Jira and dashboards spin under a final title for seconds.
+- The probe gate is the lock, which a new-tab run takes only once its tab exists: during the
+  start-address call nothing is observed, so a probe then is harmless.
 - **Focus on a pane with no browser keeps a drivable pick.** Clicking into a terminal and pressing
   Run acts on the page just looked at; New tab is the target only when no drivable pick is left.
 - The periodic probe runs only while the panel is composed (`Content` counts itself in and out);

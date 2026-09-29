@@ -26,7 +26,9 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import androidx.compose.runtime.DisposableEffect
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 private const val AI_PROVIDERS_SETTINGS_SECTION = "LLM_PROVIDERS"
 
@@ -141,6 +143,8 @@ class LlmrpaComponent(
     /** A probe was asked for while one ran; it runs again when that one ends. */
     private val probeAgain = AtomicBoolean(false)
     @Volatile private var lastProbeAt = 0L
+    /** Compositions showing the panel; the periodic probe runs only while there is one. */
+    private val shown = AtomicInteger(0)
 
     private val _errorMessage = MutableStateFlow<String?>(null)
     val errorMessage: StateFlow<String?> = _errorMessage
@@ -190,14 +194,12 @@ class LlmrpaComponent(
     @Composable
     override fun Content() {
         // The periodic probe runs only while the panel is on screen.
-        androidx.compose.runtime.DisposableEffect(Unit) {
+        DisposableEffect(Unit) {
             shown.incrementAndGet()
             onDispose { shown.decrementAndGet() }
         }
         LlmrpaContent(this)
     }
-
-    private val shown = java.util.concurrent.atomic.AtomicInteger(0)
 
     fun updateInstruction(instruction: String) {
         _currentInstruction.value = instruction
@@ -597,8 +599,6 @@ class LlmrpaComponent(
         if (isRunning) return "A task is already running"
         val tab = _selectedTab.value.takeIf { !_newTab.value }
         val model = _selectedModel.value!!
-        tab?.let { t -> tabLocks.tryAcquire(t.tabId, TabLocks.Owner.PANEL)?.let { return it } }
-        _errorMessage.value = null
         val decider = if (model.kind == ModelOption.Kind.DECISION) JevDecider(tools, model) else ChatDecider(aiGateway, model)
         val opener = when {
             tab != null -> null
@@ -609,6 +609,9 @@ class LlmrpaComponent(
             } ?: return Blocker.TAB.detail
         }
         val r = TaskRunner(tools, decider, tab?.tabId, instruction, baseLimits.copy(maxSteps = _maxSteps.value), newTab = opener) { asker.ask(it) }
+        // After the runner is built, as in HeadlessRunner, so nothing can throw between taking and handing over the lock.
+        tab?.let { t -> tabLocks.tryAcquire(t.tabId, TabLocks.Owner.PANEL)?.let { return it } }
+        _errorMessage.value = null
         runner = r
         runJob = scope.launch {
             val mirror = launch { r.state.collect { _run.value = it } }

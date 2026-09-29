@@ -24,6 +24,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emptyFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
@@ -372,11 +373,45 @@ class StartPageTest {
     }
 
     @Test
-    fun `a new tab with nothing to act on is used once it reads the same twice`() = runTest {
+    fun `a new tab with nothing to act on is used once it reads the same twice past half the wait`() = runTest {
+        val waits = RunLimits(navSettleMs = 0, stepSettleMs = 0, openWaitsMs = listOf(300, 500, 800, 1_200, 2_000, 2_000, 3_000, 3_000))
         val tools = FakeTools(decide = done).apply { observeHook = { ToolReply("""{"url":"https://orders.example/","title":"Orders","elements":[]}""", false) } }
-        val state = headless(tools, emptyList(), emptySet()).execute("Open https://orders.example/", null, 3, null, newTab = true).getOrThrow()
-        assertEquals(RunStatus.DONE, state.status)
-        assertEquals(2, tools.observedTabs.size)
+        val r = HeadlessRunner(tools, { null }, { null }, tabs = { emptyList() }, activeTabId = { null }, drivable = { true },
+            openTab = { _, _ -> "new1" }, locks = TabLocks(), limits = waits)
+        assertEquals(RunStatus.DONE, r.execute("Open https://orders.example/", null, 3, null, newTab = true).getOrThrow().status)
+        // 300+500+800+1200+2000 = 4800 < 6400; the sixth read (6800) is the first past half.
+        assertEquals(6, tools.observedTabs.size)
+    }
+
+    @Test
+    fun `an app that spins under its final title is waited for, not taken empty`() = runTest {
+        val waits = RunLimits(navSettleMs = 0, stepSettleMs = 0, openWaitsMs = listOf(300, 500, 800, 1_200, 2_000, 2_000, 3_000, 3_000))
+        val tools = FakeTools(decide = done)
+        var n = 0
+        tools.observeHook = { if (n++ < 4) ToolReply("""{"url":"https://mail.example/","title":"Inbox","elements":[]}""", false) else null }
+        val r = HeadlessRunner(tools, { null }, { null }, tabs = { emptyList() }, activeTabId = { null }, drivable = { true },
+            openTab = { _, _ -> "new1" }, locks = TabLocks(), limits = waits)
+        r.execute("Open https://mail.example/", null, 3, null, newTab = true).getOrThrow()
+        // Four empty reads, the rendered one, then the settled re-read the first step uses.
+        assertEquals(6, tools.observedTabs.size)
+        assertTrue(tools.decideCalls > 0, "the first step saw the rendered page")
+    }
+
+    @Test
+    fun `Stop while the new tab is being created still records it, so its lock is released`() = runTest {
+        val locks = TabLocks()
+        lateinit var job: kotlinx.coroutines.Job
+        val runner = TaskRunner(FakeTools(decide = done), JevDecider(FakeTools(decide = done), JEV), null, "Open https://orders.example/", fast,
+            newTab = NewTab(open = { _, _ -> job.cancel(); "new1" }, claim = { locks.tryAcquire(it, TabLocks.Owner.PANEL) })) { Answer.Stop }
+        job = launch { runner.run() }
+        job.join()
+        runner.markStopped()
+        val state = runner.state.value
+        assertEquals(RunStatus.STOPPED, state.status)
+        // What the panel's completion handler and HeadlessRunner's finally release.
+        assertEquals("new1", state.tabId)
+        state.tabId?.let(locks::release)
+        assertNull(locks.tryAcquire("new1", TabLocks.Owner.HEADLESS))
     }
 
     @Test
