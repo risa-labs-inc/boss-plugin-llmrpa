@@ -92,7 +92,7 @@ internal object StartPages {
         return "https://duckduckgo.com/?q=" + URLEncoder.encode(q, Charsets.UTF_8)
     }
 
-    /** The chosen start page, plus the cost and number of model calls it took. */
+    /** The chosen start page, plus the cost and number of model calls it took. Chat models report tokens, not money, so cost is 0 for them today. */
     data class Choice(val page: OpenedPage, val calls: Int, val costUsd: Double)
 
     /** Instruction first, then the model (https only), then a web search for the instruction. */

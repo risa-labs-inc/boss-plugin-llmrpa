@@ -82,7 +82,10 @@ class LlmrpaDynamicPlugin : DynamicPlugin {
                     },
                     drivable = { id -> activeTabsProvider?.let { StartPages.drivable(it, id) } == true },
                     // On Main: the host adds the tab to its split view state.
-                    openTab = { url, title -> activeTabsProvider?.let { p -> withContext(Dispatchers.Main) { p.createBrowserTab(url, title) } } },
+                    openTab = { url, title ->
+                        val p = activeTabsProvider ?: error("This BOSS build exposes no tabs to plugins, so no tab can be opened")
+                        withContext(Dispatchers.Main) { p.createBrowserTab(url, title) }
+                    },
                     locks = tabLocks,
                 ),
             ),

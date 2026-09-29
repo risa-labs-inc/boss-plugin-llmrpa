@@ -311,6 +311,8 @@ class LlmrpaComponent(
         }
 
         draftProblem()?.let { _errorMessage.value = it; return it }
+        // Refused here, not in the launched body: llmrpa_run would otherwise report a start.
+        if (_newTab.value || _selectedTab.value == null) { _errorMessage.value = DRAFT_NEEDS_TAB; return DRAFT_NEEDS_TAB }
 
         // Last, and with compareAndSet rather than a check then a set: llmrpa_run also calls this
         // and the MCP handler thread is not guaranteed to be the UI thread, so two calls could both
@@ -655,11 +657,12 @@ class LlmrpaComponent(
         _currentInstruction.value = example
     }
 
-    private companion object {
-        const val READINESS_POLL_MS = 2_000L
-        const val PROBE_EVERY_MS = 10_000L
+    companion object {
+        private const val READINESS_POLL_MS = 2_000L
+        private const val PROBE_EVERY_MS = 10_000L
+        const val DRAFT_NEEDS_TAB = "Draft steps needs an open page: pick a tab. New tab is only for Run."
 
         /** Statuses that carry something worth showing in the panel. */
-        val SHOWABLE_STATUSES = setOf("success", "error", LlmApiClient.STATUS_EXAMPLE)
+        private val SHOWABLE_STATUSES = setOf("success", "error", LlmApiClient.STATUS_EXAMPLE)
     }
 }

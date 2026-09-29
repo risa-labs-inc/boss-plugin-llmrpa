@@ -197,6 +197,8 @@ class TaskRunner(
             delay(limits.navSettleMs)
             return Result.success(read(id)?.takeIf { it.url.isNotBlank() } ?: page)
         }
+        // A NO_BROWSER last word beats an empty page seen earlier: the tab left the space on screen.
+        if (lastWasNoBrowser) return Result.failure(IllegalStateException(lastReadError ?: last))
         return empty?.let { Result.success(it) } ?: Result.failure(IllegalStateException(lastReadError ?: last))
     }
 
@@ -207,6 +209,7 @@ class TaskRunner(
     private suspend fun read(id: String): PageSnapshot? {
         val reply = tools.invoke(ToolNames.OBSERVE, buildJsonObject { put("tab_id", id) })
         val json = reply.json
+        lastWasNoBrowser = reply.errorCode == ToolNames.NO_BROWSER
         if (reply.isError || json == null) {
             lastReadError = when (reply.errorCode) {
                 ToolNames.NO_BROWSER -> NO_BROWSER_HINT.removeSuffix(".")
@@ -220,6 +223,7 @@ class TaskRunner(
     }
 
     private var lastReadError: String? = null
+    private var lastWasNoBrowser = false
 
     /** [first] is a page already read for this step, so the first look is not repeated. */
     private suspend fun loop(seed: List<String>, first: PageSnapshot?): RunState {

@@ -330,6 +330,9 @@ private fun Compose(
                     enabled = instruction.isNotBlank() && !drafting && component.aiAvailable() && hasTab && model?.kind != ModelOption.Kind.DECISION)
                 Box(center) { StepLimit(component, maxSteps, enabled = true) }
             }
+            if (newTab && !decision && instruction.isNotBlank()) {
+                Text("Draft steps needs an open page: pick a tab.", color = RpaTokens.TextMuted, fontSize = 11.sp)
+            }
         }
         if (!active && blocker != null && instruction.isNotBlank()) Notice(blocker.detail, Tone.WARNING)
         errorMessage?.let { Notice(it, Tone.ERROR, onDismiss = component::clearError) }

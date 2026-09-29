@@ -435,6 +435,8 @@ Found by running, not reviewing:
 - A NO_BROWSER that is still the last word when the new-tab wait runs out is reported with the hint.
 - Caller `start_url` and instruction addresses are deliberately not host-filtered (http, intranet
   allowed); only a model's pick is held to the public-host rules.
+- **Draft steps refuses New tab synchronously** (`DRAFT_NEEDS_TAB`): it drafts against a page, and a
+  refusal from the launched body let `llmrpa_run` report a start that never happened.
 - A probe that throws reads as drivable, like a skipped one. After a panel run the panel probes at
   once, since the tab it opened was skipped while locked.
 - The chosen address is used **only for that open**. "Go to" candidates still come from the

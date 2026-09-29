@@ -153,6 +153,17 @@ class StartPageTest {
     }
 
     @Test
+    fun `an empty page followed by NO_BROWSER reports the hint, not the stale page`() = runTest {
+        val tools = FakeTools(decide = done)
+        var n = 0
+        tools.observeHook = { if (n++ == 0) ToolReply("""{"url":"https://orders.example/","title":"Orders","elements":[]}""", false) else noBrowser(it) }
+        val state = headless(tools, emptyList(), emptySet()).execute("Open https://orders.example/", null, 3, null, newTab = true).getOrThrow()
+        assertEquals(RunStatus.FAILED, state.status)
+        assertTrue(state.summary!!.contains("another space"), state.summary)
+        assertEquals(0, tools.decideCalls)
+    }
+
+    @Test
     fun `a new tab that is not registered yet is waited for`() = runTest {
         val tools = FakeTools(decide = done)
         var n = 0
@@ -299,6 +310,29 @@ class StartPageTest {
         assertTrue(tools.observedTabs.all { it == "new1" })
         // The new tab's lock is given back.
         assertNull(locks.tryAcquire("new1", TabLocks.Owner.HEADLESS))
+    }
+
+    @Test
+    fun `llmrpa_run refuses at once while the target is New tab`() = withMain {
+        val api = object : AiGatewayAPI {
+            override suspend fun complete(request: AiRequest): Result<AiReply> = error("must not be called")
+            override fun stream(request: AiRequest): Flow<AiChunk> = emptyFlow()
+            override suspend fun runAgent(request: AiRequest, tools: List<AiToolSpec>, budget: AiBudget, invoke: suspend (AiToolCall) -> AiToolOutcome): Result<AiAgentResult> =
+                Result.failure(UnsupportedOperationException())
+            override fun capabilities(): Set<String> = setOf(AiGatewayAPI.CAPABILITY_PROVIDER_OVERRIDE)
+            override fun activeModel(): AiModelInfo? = AiModelInfo(chat.providerId, chat.providerName, chat.modelId)
+        }
+        val c = LlmrpaComponent(DefaultComponentContext(LifecycleRegistry()), LlmrpaInfo, FakeTabs(emptyList()), { api }, tools = FakeTools(decide = done),
+            llmProvider = { null }, tabLocks = TabLocks(), io = Dispatchers.Main, work = Dispatchers.Main, baseLimits = fast)
+        assertTrue(c.newTab.value)
+        c.selectModel(chat)
+        assertTrue(c.aiAvailable())
+        val tool = LlmrpaMcpToolProvider("p", component = { c }, headless = headless(FakeTools(decide = done), emptyList(), emptySet()))
+            .tools().first { it.name == "llmrpa_run" }.handler
+        val r = kotlinx.coroutines.runBlocking { tool.call(McpToolArgs(mapOf("instruction" to "Open the orders page"), """{"instruction":"Open the orders page"}""")) }
+        assertTrue(r.isError, r.text)
+        assertEquals(LlmrpaComponent.DRAFT_NEEDS_TAB, r.text)
+        assertTrue(c.executionHistory.value.isEmpty(), "nothing was started")
     }
 
     @Test
