@@ -21,6 +21,8 @@ internal sealed interface AgentAction {
     data class Navigate(val url: String) : AgentAction
     data class Find(val text: String) : AgentAction
     data class ClickPoint(val description: String, val irreversible: Boolean = false) : AgentAction
+    data class Hover(val element: String) : AgentAction
+    data class HoverPoint(val description: String) : AgentAction
     data class AnswerDialog(val ok: Boolean, val text: String?) : AgentAction
     data class Wait(val ms: Long) : AgentAction
     data class AskUser(val question: String, val options: List<String>) : AgentAction
@@ -60,6 +62,8 @@ Reply with only JSON: {"thought":"<one short sentence>","action":{...}} where ac
 {"type":"navigate","url":"https://..."}
 {"type":"find","text":"Item 87"}
 {"type":"click_point","description":"the element to click, described so it can be found on the screenshot"}
+{"type":"hover","element":"m12"}
+{"type":"hover_point","description":"the element to hover over, when it has no mark"}
 {"type":"answer_dialog","answer":"ok|cancel","text":"..."}
 {"type":"wait","ms":1000}
 {"type":"ask_user","question":"...","options":["...","..."]}
@@ -72,6 +76,7 @@ Rules:
 - Never guess credentials, codes or personal data. Type a named input as {{name}}; its value is filled in for you.
 - A one-time code split into several digit boxes: type the whole code into the first box in one go; the site spreads it across the boxes.
 - To find something, prefer a search: navigate to https://www.google.com/search?q=... rather than guessing deep links. navigate takes https only.
+- A menu that opens on mouse-over needs hover first; then click the item that appears.
 - find works like Ctrl+F: it looks for the text on the whole page and scrolls the nearest match into view. Use it to reach something not on screen instead of scrolling blindly.
 - Each step's result says what changed, including how far a scroll moved; "Visible now" says what the screen shows.
 - For information tasks, read and scroll as needed, then done with the answer taken from the page.
@@ -209,6 +214,8 @@ Rules:
             "navigate" -> AgentAction.Navigate(need("url"))
             "find" -> AgentAction.Find(need("text").take(200))
             "click_point" -> AgentAction.ClickPoint(need("description"), irreversible)
+            "hover" -> AgentAction.Hover(element())
+            "hover_point" -> AgentAction.HoverPoint(need("description"))
             "answer_dialog" -> AgentAction.AnswerDialog(!s("answer").equals("cancel", true), s("text"))
             "wait" -> AgentAction.Wait(((a["ms"] as? JsonPrimitive)?.intOrNull ?: 1000).toLong().coerceIn(500, 3_000))
             "ask_user" -> AgentAction.AskUser(need("question").take(400), (a["options"] as? JsonArray).orEmpty().mapNotNull { (it as? JsonPrimitive)?.contentOrNull?.trim()?.takeIf(String::isNotEmpty)?.take(120) }.take(8))
@@ -229,6 +236,8 @@ Rules:
         is AgentAction.Scroll -> buildJsonObject { put("type", "scroll"); put("direction", if (a.down) "down" else "up"); put("amount", a.amount) }
         is AgentAction.Navigate -> buildJsonObject { put("type", "navigate"); put("url", a.url) }
         is AgentAction.Find -> buildJsonObject { put("type", "find"); put("text", a.text) }
+        is AgentAction.Hover -> buildJsonObject { put("type", "hover"); put("element", a.element) }
+        is AgentAction.HoverPoint -> buildJsonObject { put("type", "hover_point"); put("description", a.description) }
         is AgentAction.ClickPoint -> buildJsonObject { put("type", "click_point"); put("description", a.description); if (a.irreversible) put("irreversible", true) }
         is AgentAction.AnswerDialog -> buildJsonObject { put("type", "answer_dialog"); put("answer", if (a.ok) "ok" else "cancel"); a.text?.let { put("text", it) } }
         is AgentAction.Wait -> buildJsonObject { put("type", "wait"); put("ms", a.ms) }

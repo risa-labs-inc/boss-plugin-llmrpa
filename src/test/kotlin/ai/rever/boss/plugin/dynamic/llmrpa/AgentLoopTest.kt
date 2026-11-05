@@ -97,8 +97,14 @@ class AgentLoopTest {
     private class Tabs : UseTabs {
         val opened = mutableListOf<String>()
         val released = mutableListOf<String>()
+        val claimed = mutableListOf<String>()
+        val revealed = mutableListOf<String>()
+        /** The browser tabs on screen, id to title, as the host lists them now. */
+        var now: () -> Map<String, String> = { emptyMap() }
+        override suspend fun snapshot(): Map<String, String> = now()
+        override suspend fun reveal(tabId: String) { revealed += tabId }
         override suspend fun open(url: String): String? { opened += url; return "t1" }
-        override fun claim(tabId: String): String? = null
+        override fun claim(tabId: String): String? { claimed += tabId; return null }
         override fun release(tabId: String) { released += tabId }
     }
 
@@ -575,5 +581,46 @@ class AgentLoopTest {
         assertEquals(2, requests.size)
         assertEquals("Added", AgentPrompt.parse("""{"action":{"type":"key","key":"Enter"},"then":"done","result":"Added"}""").getOrThrow().thenDone)
         assertNull(AgentPrompt.parse("""{"action":{"type":"key","key":"Enter"}}""").getOrThrow().thenDone)
+    }
+
+    // ---- hover, and new tabs from target=_blank links ----
+
+    @Test
+    fun `hover moves the pointer over an element or a described point with hover_at`() = runTest {
+        val b = Browser()
+        say("""{"type":"hover","element":"m2"}""", """{"type":"hover_point","description":"the Products menu"}""", """{"type":"done","result":"ok"}""")
+        val report = loop(b).run(AgentRequest("open the products menu", tabId = "t1", pointerLabel = "Max"))
+        assertEquals(UseStatus.DONE, report.status, report.error)
+        val hovers = b.actions("hover_at")
+        assertEquals(2, hovers.size)
+        assertEquals("m2", hovers[0]["action"]!!.jsonObject["element"]!!.jsonPrimitive.content)
+        assertEquals("140,115", b.value(hovers[0]))
+        assertEquals("168,117", b.value(hovers[1])) // the centre of Jev's box
+        assertEquals("Max", hovers[1]["pointer"]!!.jsonObject["label"]!!.jsonPrimitive.content)
+        assertTrue(b.actions("click_at").isEmpty())
+        assertEquals(listOf(VisionOp.HOVER, VisionOp.HOVER), report.steps.map { it.op })
+        assertEquals("Hover over button 'Add'", report.steps[0].description)
+        assertTrue(b.calls.single { it.first == ToolNames.JEV_DECIDE }.second["questions"]!!.jsonObject["target"]!!.jsonObject["instructions"]!!.jsonPrimitive.content.contains("the Products menu"))
+        assertTrue("A menu that opens on mouse-over needs hover first; then click the item that appears." in AgentPrompt.system("Jev"))
+        assertEquals(AgentAction.Hover("m4"), AgentPrompt.parse("""{"action":{"type":"hover","element":"4"}}""").getOrThrow().action)
+    }
+
+    @Test
+    fun `a link that opens a new tab is followed, and the step result says so`() = runTest {
+        val b = Browser()
+        val tabs = Tabs()
+        tabs.now = { if (b.actions("click_at").isEmpty()) mapOf("t1" to "Shop") else mapOf("t1" to "Shop", "t2" to "Terms of service") }
+        say("""{"type":"click","element":"m2"}""", """{"type":"done","result":"read the terms"}""")
+        val report = loop(b, tabs).run(AgentRequest("read the terms", tabId = "t1"))
+        assertEquals(UseStatus.DONE, report.status, report.error)
+        assertEquals("t1", b.actions("click_at").single()["tab_id"]!!.jsonPrimitive.content)
+        assertEquals("t2", b.actions("look").last()["tab_id"]!!.jsonPrimitive.content)
+        assertTrue("t2" in tabs.claimed && "t2" in tabs.revealed)
+        assertEquals("Switched to new tab 'Terms of service'", report.steps.single().popup)
+        assertTrue(report.steps.single().result!!.startsWith("Switched to new tab 'Terms of service'"), report.steps.single().result)
+        assertTrue("1. click on button 'Add' -> Switched to new tab 'Terms of service'" in requests.last().messages.single().text)
+        assertEquals("t2", report.tabId)
+        assertEquals(listOf("given", "popup"), report.tabs.map { it.kind })
+        assertEquals(listOf("t1", "t2"), tabs.released.sorted())
     }
 }
