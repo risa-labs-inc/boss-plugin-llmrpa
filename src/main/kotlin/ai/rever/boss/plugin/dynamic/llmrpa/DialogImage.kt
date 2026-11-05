@@ -17,24 +17,26 @@ import javax.imageio.ImageWriteParam
  * Jev can see what it is answering. The result is a new JPEG next to the screenshot.
  */
 internal object DialogImage {
-    private const val DEFAULT_W = 1120
-    private const val DEFAULT_H = 780
+    /** The dialog image has its own size, whatever the page shot is: the text stays large enough to read. */
+    const val WIDTH = 1100
+    const val HEIGHT = 700
 
     /**
-     * The dialog [d] drawn over the screenshot at [sourcePath] (or over a blank page of [fallbackW] x [fallbackH] when it cannot be
-     * read), saved as `<name>-dialog.jpg` beside it. Returns the new path, or null when nothing could be written.
+     * The dialog [d] drawn over the screenshot at [sourcePath] (or over a blank page when it cannot be read), on a [WIDTH] x [HEIGHT] canvas
+     * (the page scaled to fill it, dimmed; the box ~70% wide with 28 px+ text), saved as `<name>-dialog.jpg` beside it. Returns the new path, or
+     * null when nothing could be written. [fallbackW] and [fallbackH] are unused now and kept for callers.
      */
     fun render(sourcePath: String, d: Cu.DialogInfo, fallbackW: Int, fallbackH: Int): String? = runCatching {
         val src = runCatching { ImageIO.read(File(sourcePath)) }.getOrNull()
-        val w = src?.width ?: fallbackW.takeIf { it > 0 } ?: DEFAULT_W
-        val h = src?.height ?: fallbackH.takeIf { it > 0 } ?: DEFAULT_H
+        val w = WIDTH
+        val h = HEIGHT
         val img = BufferedImage(w, h, BufferedImage.TYPE_INT_RGB)
         val g = img.createGraphics()
         try {
             g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
             g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON)
             // The page, as it was, dimmed to 40% black.
-            if (src != null) g.drawImage(src, 0, 0, null) else { g.color = Color(0xF4, 0xF4, 0xF4); g.fillRect(0, 0, w, h) }
+            if (src != null) g.drawImage(src, 0, 0, w, h, null) else { g.color = Color(0xF4, 0xF4, 0xF4); g.fillRect(0, 0, w, h) }
             g.color = Color(0, 0, 0, 102)
             g.fillRect(0, 0, w, h)
             draw(g, d, w, h)
@@ -49,14 +51,14 @@ internal object DialogImage {
     }.getOrNull()
 
     private fun draw(g: java.awt.Graphics2D, d: Cu.DialogInfo, w: Int, h: Int) {
-        // Sizes follow the image, so a downscaled screenshot gets a proportionally smaller dialog.
-        val s = w / DEFAULT_W.toDouble()
+        // A fixed canvas: the text is at least 28 px, whatever size the page shot was.
+        val s = 2.0
         fun px(v: Double) = (v * s).toInt().coerceAtLeast(1)
-        val boxW = (w * 0.4).toInt().coerceAtLeast(px(300.0))
+        val boxW = (w * 0.7).toInt()
         val pad = px(20.0)
         val titleFont = Font(Font.SANS_SERIF, Font.BOLD, px(15.0))
         val bodyFont = Font(Font.SANS_SERIF, Font.PLAIN, px(14.0))
-        val btnFont = Font(Font.SANS_SERIF, Font.PLAIN, px(13.0))
+        val btnFont = Font(Font.SANS_SERIF, Font.PLAIN, px(14.0))
         val origin = (d.url?.let { host(it) }?.takeIf { it.isNotBlank() }?.let { u -> hostWithPort(d.url!!, u) } ?: "This page") + " says"
         val body = g.getFontMetrics(bodyFont)
         val lines = wrap(d.message.ifBlank { " " }, body, boxW - 2 * pad).take(8)

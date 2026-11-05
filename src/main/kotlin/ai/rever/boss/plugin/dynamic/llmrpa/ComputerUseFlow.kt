@@ -675,7 +675,7 @@ internal class ComputerUseFlow(
                 if (dlg != null) {
                     dd = dialogDecision(req, tools, plan, dlg, shotView, url, title, steps, run).getOrElse { return Outcome(UseStatus.ERROR, "Jev could not decide: ${it.message}") }
                     // Unsure by its probability, or by the confidence the answer itself reports (a split 0.4 / 0.6 with confidence 0.2 is a guess).
-                    if (dd.viaJev && (dd.confidence < req.consultBelow || (dd.choiceConfidence ?: 1.0) < Cu.DIALOG_MIN_CONFIDENCE)) stuck = "Jev is only ${TaskRunner.pct(minOf(dd.confidence, dd.choiceConfidence ?: 1.0))} sure how to answer the ${dlg.type} dialog"
+                    if (dd.viaJev && Cu.dialogUnsure(dd.confidence, dd.choiceConfidence, req.consultBelow)) stuck = "Jev is only ${TaskRunner.pct(minOf(dd.confidence, dd.choiceConfidence ?: 1.0))} sure how to answer the ${dlg.type} dialog"
                 } else {
                     targets = Cu.pruneTargets(
                         if (look != null) targetsFromLook(look, lookPhrases, steps) else locateTargets(tools, st, tab, lookPhrases, url, shot, h, steps),

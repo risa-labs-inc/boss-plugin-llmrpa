@@ -1204,7 +1204,7 @@ class ComputerUseTest {
         assertTrue(java.io.File(sent).isFile)
         assertTrue(run.log.entries.value.any { it.name == "render dialog" && it.image == sent })
         val rendered = javax.imageio.ImageIO.read(java.io.File(sent))
-        assertEquals(560 to 390, rendered.width to rendered.height) // the screenshot's own size
+        assertEquals(1100 to 700, rendered.width to rendered.height) // the dialog image's own size
         assertTrue(dialogArgs["state"]!!.jsonObject["dialog"]!!.jsonObject["note"]!!.jsonPrimitive.content.contains("on top of this page"))
         // After the answer, pages are read again.
         val after = browser.calls.map { it.first to (it.second["action"]?.jsonObject?.get("type")?.jsonPrimitive?.content) }
@@ -1675,7 +1675,7 @@ class ComputerUseTest {
     private val promptGoal = "Click Confirm delete and confirm it. Then click Prompt name and enter the name \"Grace\"."
 
     @Test
-    fun `the dialog is painted onto the screenshot like the browser shows it, at the screenshot's own size`() {
+    fun `the dialog is painted onto the screenshot like the browser shows it, on its own 1100 x 700 canvas with a wide box and large text`() {
         val dir = tmp()
         val src = java.io.File(dir, "page.jpg")
         val page = java.awt.image.BufferedImage(800, 600, java.awt.image.BufferedImage.TYPE_INT_RGB).also { img -> img.createGraphics().apply { color = java.awt.Color.WHITE; fillRect(0, 0, 800, 600); dispose() } }
@@ -1689,17 +1689,27 @@ class ComputerUseTest {
             ?.let { java.io.File(it).copyTo(java.io.File("build/reports/visual/llmrpa-dialog-confirm.jpg"), overwrite = true) }
         assertEquals(java.io.File(dir, "page-dialog.jpg").absolutePath, out)
         val img = javax.imageio.ImageIO.read(java.io.File(out))
-        assertEquals(800 to 600, img.width to img.height)
+        // Its own size, not the page shot's (800 x 600 here; the live look image is 1100 px wide).
+        assertEquals(1100 to 700, img.width to img.height)
+        assertEquals(1100 to 700, DialogImage.WIDTH to DialogImage.HEIGHT)
         // The page is dimmed (white to well under it) and the box is white in the middle area.
         fun lum(x: Int, y: Int) = java.awt.Color(img.getRGB(x, y)).let { (it.red + it.green + it.blue) / 3 }
         assertTrue(lum(5, 5) < 200, "page corner dimmed: ${lum(5, 5)}")
-        val boxLum = (0 until 40).map { lum(400 + it * 4 - 80, 200) }
+        val boxLum = (0 until 40).map { lum(550 + it * 4 - 80, 250) }
         assertTrue(boxLum.any { it > 230 }, "a white box in the middle")
+        // The box is about 70% of the width (770 px, from x=165): white just inside its edges, the dimmed page just outside.
+        val row = (150..650 step 2).first { y -> lum(550, y) > 230 } + 20
+        assertTrue(lum(175, row) > 230 && lum(925, row) > 230, "box reaches ${lum(175, row)} / ${lum(925, row)}")
+        assertTrue(lum(150, row) < 200 && lum(950, row) < 200, "page dimmed outside the box")
+        // Large text: dark glyph rows at least 20 px tall somewhere in the box's body (28 px font).
+        val dark = (0 until 700).filter { y -> (180..920).any { x -> lum(x, y) < 90 } }
+        val runs = dark.fold(mutableListOf<MutableList<Int>>()) { acc, y -> if (acc.isNotEmpty() && acc.last().last() == y - 1) acc.last() += y else acc += mutableListOf(y); acc }
+        assertTrue(runs.any { it.size >= 18 }, "text rows: ${runs.map { it.size }}")
         // An alert, a confirm and an unreadable source all draw something, the last on a blank page of the given size.
         assertNotNull(DialogImage.render(src.absolutePath, d.copy(type = "alert", message = "Heads up"), 0, 0))
         assertNotNull(DialogImage.render(src.absolutePath, d.copy(type = "confirm", message = "Delete this item? ".repeat(20), okText = "Delete", cancelText = "Keep"), 0, 0))
         val blank = DialogImage.render(java.io.File(dir, "not-an-image.jpg").also { it.writeText("x") }.absolutePath, d, 560, 390)!!
-        assertEquals(560 to 390, javax.imageio.ImageIO.read(java.io.File(blank)).let { it.width to it.height })
+        assertEquals(1100 to 700, javax.imageio.ImageIO.read(java.io.File(blank)).let { it.width to it.height })
     }
 
     @Test
@@ -1709,18 +1719,29 @@ class ComputerUseTest {
         val prompt = Cu.DialogInfo("prompt", "What is your name?", "", null, null, "http://127.0.0.1:8811/")
         val crit = Cu.dialogArgs("m", promptGoal, "u", "t", emptyList(), "/x.jpg", prompt, texts = texts.take(8), askLlm = true)["questions"]!!.jsonObject["dialog"]!!.jsonObject["criteria"]!!.jsonObject
         val labels = crit.values.map { it.jsonPrimitive.content }
-        assertTrue("OK, enter 'Grace'" in labels, labels.toString())
-        assertTrue("OK, enter text written by the writing model" in labels)
-        assertEquals("Cancel", labels.last())
+        assertTrue("OK, enter 'Grace' as the answer to 'What is your name?'" in labels, labels.toString())
+        assertTrue("OK, enter text written by the writing model as the answer to 'What is your name?'" in labels)
+        assertEquals("Cancel \u2014 don't answer 'What is your name?'", labels.last())
         assertEquals("OK_LLM", crit.keys.toList()[crit.size - 2])
         // Without typing by the model there is no such option.
         assertFalse(Cu.dialogArgs("m", "g", "u", "t", emptyList(), "/x.jpg", prompt, texts = listOf("Grace"), askLlm = false)["questions"]!!.jsonObject["dialog"]!!.jsonObject["criteria"]!!.jsonObject.keys.contains("OK_LLM"))
         // A confirm: OK and Cancel, named by the dialog's buttons.
         val confirm = Cu.dialogArgs("m", "g", "u", "t", emptyList(), "/x.jpg", Cu.DialogInfo("confirm", "Delete?", null, "Delete", "Keep", null))["questions"]!!.jsonObject["dialog"]!!.jsonObject
         assertEquals(listOf("OK", "CANCEL"), confirm["criteria"]!!.jsonObject.keys.toList())
-        assertEquals("OK: press Delete", confirm["criteria"]!!.jsonObject["OK"]!!.jsonPrimitive.content)
-        assertEquals("Cancel: press Keep", confirm["criteria"]!!.jsonObject["CANCEL"]!!.jsonPrimitive.content)
-        assertTrue(confirm["instructions"]!!.jsonPrimitive.content.contains("A browser dialog (confirm) is open on top of the page (shown in the image). Answer it to advance the goal"))
+        assertEquals("Delete \u2014 answer YES to 'Delete?'", confirm["criteria"]!!.jsonObject["OK"]!!.jsonPrimitive.content)
+        assertEquals("Keep \u2014 answer NO to 'Delete?'", confirm["criteria"]!!.jsonObject["CANCEL"]!!.jsonPrimitive.content)
+        assertTrue(confirm["instructions"]!!.jsonPrimitive.content.contains("A browser dialog (confirm) is open on top of the page (shown in the image)"))
+        // The goal and the message are in the question: "which answer advances the goal?".
+        assertTrue(confirm["instructions"]!!.jsonPrimitive.content.startsWith("Goal: g\nThe browser asks: 'Delete?'. Which answer advances the goal?"))
+        // The site's own button names are used when it gives them, OK and Cancel otherwise.
+        val plainConfirm = Cu.dialogArgs("m", "g", "u", "t", emptyList(), "/x.jpg", Cu.DialogInfo("confirm", "Delete this item?", null, null, null, null))["questions"]!!.jsonObject["dialog"]!!.jsonObject["criteria"]!!.jsonObject
+        assertEquals("OK \u2014 answer YES to 'Delete this item?'", plainConfirm["OK"]!!.jsonPrimitive.content)
+        assertEquals("Cancel \u2014 answer NO to 'Delete this item?'", plainConfirm["CANCEL"]!!.jsonPrimitive.content)
+        val leave = Cu.dialogArgs("m", "g", "u", "t", emptyList(), "/x.jpg", Cu.DialogInfo("beforeunload", "Changes may be lost", null, null, null, null))["questions"]!!.jsonObject["dialog"]!!.jsonObject["criteria"]!!.jsonObject
+        assertEquals(mapOf("OK" to "Leave this page", "CANCEL" to "Stay on this page"), leave.mapValues { it.value.jsonPrimitive.content })
+        // A prompt with no text to offer still says what is being answered.
+        val bare = Cu.dialogArgs("m", "g", "u", "t", emptyList(), "/x.jpg", prompt)["questions"]!!.jsonObject["dialog"]!!.jsonObject["criteria"]!!.jsonObject
+        assertTrue(bare["OK"]!!.jsonPrimitive.content.contains("'What is your name?'") && bare["CANCEL"]!!.jsonPrimitive.content.contains("don't answer"))
         // The choice maps back to the text, to the writing model, or to cancel.
         fun reply(choice: String) = json("""{"response":{"answers":{"dialog":{"choice":"$choice","probabilities":{"$choice":0.8},"confidence":0.7}},"usage":{"cost":0.001}}}""")
         assertEquals(Cu.DialogChoice(true, 1, false, 0.8, 0.7, 0.001), Cu.parseDialogChoice(reply("OK_2"), 3))
@@ -1738,7 +1759,7 @@ class ComputerUseTest {
         assertEquals(listOf("ok:Grace"), browser.dialogAnswers)
         assertEquals("Dialog 'What is your name?': OK 'Grace'", report.steps[1].description)
         val labels = browser.jevArgs.first { "dialog" in it["questions"]!!.jsonObject }["questions"]!!.jsonObject["dialog"]!!.jsonObject["criteria"]!!.jsonObject.values.map { it.jsonPrimitive.content }
-        assertTrue("OK, enter 'Grace'" in labels)
+        assertTrue("OK, enter 'Grace' as the answer to 'What is your name?'" in labels)
     }
 
     @Test
@@ -1797,6 +1818,19 @@ class ComputerUseTest {
         assertEquals(UseStatus.NEEDS_INPUT, r.status)
         assertTrue(r.blocker!!.reason.contains("20% sure how to answer the confirm dialog"), r.blocker!!.reason)
         assertEquals(0, unsure.dialogAnswers.size)
+        // The rule itself: a clear top choice (0.65+) is accepted whatever confidence it reports; below that, the confidence still counts.
+        assertFalse(Cu.dialogUnsure(0.7, 0.2, 0.5))
+        assertFalse(Cu.dialogUnsure(0.65, 0.0, 0.5))
+        assertTrue(Cu.dialogUnsure(0.6, 0.2, 0.5))
+        assertTrue(Cu.dialogUnsure(0.64, 0.29, 0.5))
+        assertFalse(Cu.dialogUnsure(0.6, 0.3, 0.5))
+        assertFalse(Cu.dialogUnsure(0.6, null, 0.5))
+        assertTrue(Cu.dialogUnsure(0.45, 0.9, 0.5)) // under consult_below whatever the confidence
+        assertTrue(Cu.dialogUnsure(0.8, 0.9, 0.9))
+        val clear = FakeBrowser(tmp(), listOf("CLICK", "DONE")).also { b -> b.strictDialogs = true; b.armedDialogOnClick = confirmDialog; b.dialogPick = "OK"; b.dialogP = 0.7; b.dialogConfidence = 0.2 }
+        val cr = flow(clear, FakeTabs(), mutableListOf()).runComputerUse(UseRequest("t"))
+        assertEquals(UseStatus.DONE, cr.status, cr.error)
+        assertEquals(listOf("ok"), clear.dialogAnswers)
         // Sure of itself: the same split is answered.
         val sure = FakeBrowser(tmp(), listOf("CLICK", "DONE")).also { b -> b.strictDialogs = true; b.armedDialogOnClick = confirmDialog; b.dialogPick = "CANCEL"; b.dialogP = 0.6; b.dialogConfidence = 0.9 }
         flow(sure, FakeTabs(), mutableListOf()).runComputerUse(UseRequest("t"))
