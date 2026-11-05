@@ -122,7 +122,7 @@ private fun Composer(component: LlmrpaComponent, input: String, active: Boolean,
         else {
             BossPrimaryButton("Send", onClick = { component.startUse()?.let { component.showError(it) } },
                 modifier = Modifier.height(34.dp), enabled = input.isNotBlank() && blocker == null, icon = Icons.Outlined.PlayArrow)
-            Text("Every step sends a screenshot of the page to OpenRouter (Jev), and the page text to the chat model.",
+            Text("Every step sends a screenshot of the page to the Jev model. The chat model sees your request, and the field and recent steps when it writes text.",
                 color = RpaTokens.TextMuted, fontSize = 11.sp)
         }
     }
