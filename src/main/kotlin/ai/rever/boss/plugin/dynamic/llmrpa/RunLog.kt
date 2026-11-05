@@ -114,6 +114,7 @@ class RunLogStore(private val dir: File, private val keep: Int = 50) {
                     putJsonArray("open") { p.open.forEach { add(JsonPrimitive(it)) } }
                     put("goal", p.goal)
                     putJsonArray("type_values") { p.typeValues.forEach { add(JsonPrimitive(it)) } }
+                    putJsonArray("milestones") { p.milestones.forEachIndexed { i, m -> add(buildJsonObject { put("text", m); put("done", i < run.doneMilestones.size) }) } }
                 }
             }
             put("steps_count", steps.size)

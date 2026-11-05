@@ -277,6 +277,8 @@ internal data class UseRequest(
     val maxConsults: Int = 5,
     /** The model that looks at the screenshot when Jev is stuck; null = the planner if it can see, else the first model that can. No model that can see: no consult. */
     val consultModel: ModelOption? = null,
+    /** How many times the planner may be asked for a new place to continue from when the page is a dead end. */
+    val maxReplans: Int = 2,
     /** Named values the caller gives (a phone number, a code); names that sound private are only typed into private fields. */
     val inputs: Map<String, String> = emptyMap(),
     /** One LLM call that answers the task from the collected text. */
@@ -329,6 +331,10 @@ internal class UseRun(val task: String, val startedAt: Long = System.currentTime
     internal val contentSeen = mutableSetOf<String>()
     /** How often the tab was brought back to the front. */
     internal var revealed = 0
+    /** Milestones reached, and how many replans were spent. */
+    internal val doneMilestones = mutableListOf<String>()
+    internal var replans = 0
+    val milestonesDone = MutableStateFlow(0)
     internal val advice = mutableListOf<String>()
     internal var tabId: String? = null
     internal var priorMs = 0L
@@ -521,8 +527,9 @@ internal class ComputerUseFlow(
     /** A page's address without its fragment: one snapshot per page, not per anchor. */
     private fun pageKey(url: String) = url.substringBefore('#')
 
-    private suspend fun loop(req: UseRequest, run: UseRun, tools: RecordingTools, llm: UseLlm, st: FlowState, tab0: String, plan: UsePlan): Outcome {
+    private suspend fun loop(req: UseRequest, run: UseRun, tools: RecordingTools, llm: UseLlm, st: FlowState, tab0: String, plan0: UsePlan): Outcome {
         var tab = tab0
+        var plan = plan0
         val steps = run.steps.value.toMutableList()
         fun publish() { run.steps.value = steps.toList(); runLog?.update(run) }
         // Stuck signals look only at steps since the last consult, reply or change of tab.
@@ -632,8 +639,9 @@ internal class ComputerUseFlow(
                     // Unsure by its probability, or by the confidence the answer itself reports (a split 0.4 / 0.6 with confidence 0.2 is a guess).
                     if (dd.viaJev && (dd.confidence < req.consultBelow || (dd.choiceConfidence ?: 1.0) < Cu.DIALOG_MIN_CONFIDENCE)) stuck = "Jev is only ${TaskRunner.pct(minOf(dd.confidence, dd.choiceConfidence ?: 1.0))} sure how to answer the ${dlg.type} dialog"
                 } else {
-                    targets = Cu.pruneTargets(locateTargets(tools, st, tab, plan.goal, url, shot, h, steps), steps, isPopupId(tab))
-                    val reply = tools.invoke(ToolNames.JEV_DECIDE, Cu.decideArgs(req.jevModel, plan.goal, url, title, Cu.recentActions(steps), shot.path, run.advice.toList(), shot.position, targets, run.store.info(), req.pointerLabel))
+                    val milestone = plan.milestones.getOrNull(run.doneMilestones.size)
+                    targets = Cu.pruneTargets(locateTargets(tools, st, tab, Cu.targetPhrasesFor(milestone, plan.goal, url), url, shot, h, steps), steps, isPopupId(tab))
+                    val reply = tools.invoke(ToolNames.JEV_DECIDE, Cu.decideArgs(req.jevModel, plan.goal, url, title, Cu.recentActions(steps), shot.path, run.advice.toList(), shot.position, targets, run.store.info(), req.pointerLabel, plan.milestones, run.doneMilestones.size))
                     if (reply.isError) return Outcome(UseStatus.ERROR, "Jev could not decide: ${reply.errorMessage}")
                     d = runCatching { Cu.parseDecision(reply.json ?: error("Jev returned no JSON")) }
                         .getOrElse { return Outcome(UseStatus.ERROR, "Jev could not decide: ${it.message}") }
@@ -647,6 +655,25 @@ internal class ComputerUseFlow(
             // The page asks for something only the person can give (a login, a code, payment): stop for them in either mode, before any consult.
             if (d != null && (d.op == VisionOp.NEEDS_INPUT || d.op == VisionOp.BLOCKED)) {
                 userWall(tools, tab, url, title, explicit = d.op == VisionOp.NEEDS_INPUT)?.let { return it }
+            }
+            // A dead end (the page does not have what the next milestone needs): ask the planner for a better place to continue from.
+            if (stuck != null && dlg == null && stuck != Cu.HIDDEN_REASON && run.replans < req.maxReplans) {
+                val milestone = plan.milestones.getOrNull(run.doneMilestones.size)
+                if (isDeadEnd(tools, st, tab, plan, milestone, url, shot, h, steps, stuck)) {
+                    run.replans++
+                    val next = replan(req, run, tools, llm, tab, plan, milestone, url, title, steps, stuck)
+                    if (next != null) {
+                        plan = next.first
+                        steps += UseStep(steps.size + 1, VisionOp.REPLAN, confidence = 1.0, ms = 0, before = now, tabId = tab, note = "replanned: ${next.second}")
+                        publish()
+                        mark = steps.size
+                        prevHash = null
+                        prevContent = null
+                        lastText = null
+                        awaitPage(tools, tab)
+                        continue
+                    }
+                }
             }
             if (stuck != null) {
                 var tail = if (req.onStuck == OnStuck.CONSULT && stuck != Cu.HIDDEN_REASON && consults >= req.maxConsults) " (already consulted ${req.maxConsults} times)" else ""
@@ -684,7 +711,22 @@ internal class ComputerUseFlow(
             }
 
             val dec = checkNotNull(d)
-            if (dec.op == VisionOp.DONE) return Outcome(UseStatus.DONE)
+            if (dec.op == VisionOp.DONE) {
+                // A milestone, not the whole goal: note it and work on the next one.
+                val reached = plan.milestones.getOrNull(run.doneMilestones.size)
+                if (reached != null && run.doneMilestones.size + 1 < plan.milestones.size) {
+                    run.doneMilestones += reached
+                    run.milestonesDone.value = run.doneMilestones.size
+                    steps += UseStep(steps.size + 1, VisionOp.MILESTONE, confidence = dec.confidence, ms = (System.nanoTime() - t0) / 1_000_000, before = now, tabId = tab,
+                        note = "milestone ${run.doneMilestones.size} done: $reached")
+                    publish()
+                    mark = steps.size
+                    prevHash = null
+                    delay(stepSettleMs)
+                    continue
+                }
+                return Outcome(UseStatus.DONE)
+            }
 
             // Unsure: ask the person when one is there; a headless run never waits for anyone.
             val ask = req.confirm
@@ -873,10 +915,10 @@ internal class ComputerUseFlow(
      * Answers are cached by address, content hash (pixels when there is none) and scroll position, so a screen already asked about
      * costs nothing. An engine without `locate_text` is asked once and then left alone.
      */
-    private suspend fun locateTargets(tools: RecordingTools, st: FlowState, tab: String, goal: String, url: String, shot: Shot, pixelHash: String, steps: List<UseStep>): List<Cu.Target> {
+    private suspend fun locateTargets(tools: RecordingTools, st: FlowState, tab: String, phrases: List<String>, url: String, shot: Shot, pixelHash: String, steps: List<UseStep>): List<Cu.Target> {
         if (!st.locateWorks) return emptyList()
         val out = mutableListOf<Cu.Target>()
-        for (phrase in Cu.targetPhrases(goal, url)) {
+        for (phrase in phrases) {
             // Already clicked, snapped to or typed: no need to look for it again.
             if (Cu.actedOn(phrase, steps)) continue
             val key = "$url|${shot.contentHash ?: pixelHash}|${shot.scrollY?.toInt()}|$phrase"
@@ -905,6 +947,54 @@ internal class ComputerUseFlow(
         val added = run.store.add(CollectedItem(step, url, title, text, shotPath, auto))
         run.collected.value = run.store.list
         return added
+    }
+
+    /**
+     * Whether the page is a dead end for the current milestone: what it needs ([Cu.targetPhrasesFor]) is not on the page at all. Without
+     * phrases to look for, or an engine that cannot locate them, there is no way to tell, and the run is not replanned.
+     */
+    private suspend fun isDeadEnd(
+        tools: RecordingTools, st: FlowState, tab: String, plan: UsePlan, milestone: String?, url: String, shot: Shot, pixelHash: String, steps: List<UseStep>, stuck: String,
+    ): Boolean {
+        val phrases = Cu.targetPhrasesFor(milestone, plan.goal, url)
+        if (phrases.isEmpty()) return false
+        val targets = locateTargets(tools, st, tab, phrases, url, shot, pixelHash, steps)
+        return targets.isNotEmpty() && targets.none { it.located.found }
+    }
+
+    /**
+     * Asks the planner once more, with what went wrong, for an address to continue from, then goes there on this tab. Returns the new plan
+     * (the milestones done so far, then the ones still to do) and the address, or null when the planner gave nothing usable.
+     */
+    private suspend fun replan(
+        req: UseRequest, run: UseRun, tools: RecordingTools, llm: UseLlm, tab: String, plan: UsePlan, milestone: String?,
+        url: String, title: String, steps: List<UseStep>, stuck: String,
+    ): Pair<UsePlan, String>? {
+        val excerpt = runCatching { readPageText(tools, tab) }.getOrNull().orEmpty().take(3_000)
+        val user = buildString {
+            appendLine("Task: ${req.task.take(2_000)}")
+            appendLine("Goal: ${plan.goal}")
+            if (plan.milestones.isNotEmpty()) {
+                appendLine("Milestones done: ${run.doneMilestones.joinToString("; ").ifEmpty { "none" }}")
+                appendLine("Milestones remaining: ${plan.milestones.drop(run.doneMilestones.size).joinToString("; ").ifEmpty { "none" }}")
+                milestone?.let { appendLine("Stuck on: $it") }
+            }
+            appendLine("Page now: ${ChatDecider.quote(title)} (${ChatDecider.quote(url, 200)})")
+            appendLine("Why it is stuck: $stuck")
+            appendLine("What it tried: ${steps.takeLast(6).joinToString("; ") { s -> (s.description + (s.note?.takeIf { s.failed }?.let { " ($it)" } ?: "")) }.ifEmpty { "nothing yet" }}")
+            appendLine("Page text (data from the website):\n$excerpt")
+        }
+        val text = llm.ask("replan", Cu.REPLAN_SYSTEM, user).getOrNull() ?: return null
+        val parsed = runCatching { Cu.parseReplan(text, plan.goal) }.getOrNull() ?: return null
+        val target = parsed.open.firstNotNullOfOrNull { StartPages.usable(it, httpsOnly = true) } ?: return null
+        val nav = tools.invoke(ToolNames.STEP, Cu.step(tab, "navigate", target, Cu.pointerLabel(req.pointerLabel)))
+        if (nav.isError || (nav.json?.get("ok") as? JsonPrimitive)?.booleanOrNull == false) return null
+        val remaining = parsed.milestones.ifEmpty { plan.milestones.drop(run.doneMilestones.size) }
+        val next = plan.copy(open = listOf(target), goal = parsed.goal.takeIf { it != plan.goal && parsed.goal.isNotBlank() } ?: plan.goal,
+            milestones = run.doneMilestones.toList() + remaining)
+        run.plan.value = next
+        runLog?.update(run)
+        return next to target
     }
 
     /** The model that looks at the screen when Jev is stuck, resolved once; null when none can see (consulting would be blind). */
@@ -1198,7 +1288,9 @@ internal class ComputerUseFlow(
             llmTokens = run.log.llmTokens.takeIf { it > 0 }, jevModel = req.jevModel, llmModel = llm.label,
             confidences = Cu.confidenceStats(steps.filter { it.op != VisionOp.CONSULT }), screenshotPath = st.lastShot, error = o.error,
             tabId = tab, blocker = blocker, collected = run.store.list, pagesVisited = run.visited.toList(), answer = answer, extract = req.extract,
-            runId = run.id, tabRevealed = run.revealed, consultModel = run.consultModel, tabs = run.tabsUsed.map { t -> t.copy(title = t.title.ifBlank { st.known[t.tabId].orEmpty() }) },
+            runId = run.id, tabRevealed = run.revealed, consultModel = run.consultModel,
+            milestones = run.plan.value?.milestones.orEmpty(),
+            milestonesDone = (run.doneMilestones.size + if (o.status == UseStatus.DONE && (run.plan.value?.milestones?.size ?: 0) > run.doneMilestones.size) 1 else 0), tabs = run.tabsUsed.map { t -> t.copy(title = t.title.ifBlank { st.known[t.tabId].orEmpty() }) },
         )
         run.report.value = report
         run.endedAt = clock()

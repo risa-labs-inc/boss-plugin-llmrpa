@@ -212,6 +212,7 @@ private fun JevRunView(component: LlmrpaComponent, run: UseRun, active: Boolean)
     val question by run.question.collectAsState()
     val report by run.report.collectAsState()
     val activity by run.log.entries.collectAsState()
+    val milestonesDone by run.milestonesDone.collectAsState()
 
     Text(run.task, color = RpaTokens.Text, fontSize = 13.sp, fontWeight = FontWeight.Medium,
         modifier = Modifier.fillMaxWidth().clip(RpaTokens.Shape).background(RpaTokens.Panel).border(1.dp, RpaTokens.Border, RpaTokens.Shape).padding(10.dp))
@@ -229,6 +230,11 @@ private fun JevRunView(component: LlmrpaComponent, run: UseRun, active: Boolean)
             SectionLabel("Plan")
             Text(p.goal, color = RpaTokens.Text, fontSize = 13.sp)
             p.open.firstOrNull()?.let { Text("Opens $it", color = RpaTokens.TextSecondary, fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis) }
+            // The steps toward it, the ones reached marked.
+            p.milestones.forEachIndexed { i, m ->
+                val reached = i < milestonesDone || (!active && report?.status == UseStatus.DONE)
+                Text("${if (reached) "✓" else "${i + 1}."} $m", color = if (reached) RpaTokens.Success else if (i == milestonesDone) RpaTokens.Text else RpaTokens.TextSecondary, fontSize = 12.sp)
+            }
         }
     }
     steps.forEach { s -> key(s.index) { UseStepRow(s) } }

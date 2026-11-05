@@ -234,7 +234,7 @@ class ComputerUseTest {
     fun `the browser_use schema is closed and lists every argument`() {
         val schema = json(LlmrpaMcpToolProvider.BROWSER_USE_SCHEMA)
         assertEquals(false, (schema["additionalProperties"] as JsonPrimitive).content.toBoolean())
-        assertEquals(setOf("task", "url", "tab_id", "new_tab", "mode", "model", "planner_model", "display_name", "max_steps", "timeout_s", "include_text", "llm_typing", "on_stuck", "consult_below", "max_consults", "inputs", "extract", "plan", "wait_s", "consult_model"),
+        assertEquals(setOf("task", "url", "tab_id", "new_tab", "mode", "model", "planner_model", "display_name", "max_steps", "timeout_s", "include_text", "llm_typing", "on_stuck", "consult_below", "max_consults", "inputs", "extract", "plan", "wait_s", "consult_model", "max_replans"),
             schema["properties"]!!.jsonObject.keys)
         assertEquals("task", schema["required"]!!.jsonArray.single().jsonPrimitive.content)
     }
@@ -397,6 +397,7 @@ class ComputerUseTest {
     }
 
     private var consultReplies = ArrayDeque<String>()
+    private var replanReplies = ArrayDeque<String>()
     private var extractReply = """{"answer":"A, B and C"}"""
     private val defaultCaps = setOf(AiGatewayAPI.CAPABILITY_VISION, AiGatewayAPI.CAPABILITY_PROVIDER_OVERRIDE)
     private var gatewayCaps = defaultCaps
@@ -409,6 +410,7 @@ class ComputerUseTest {
             return Result.success(AiReply(when {
                 request.system.startsWith("You plan") -> planner
                 request.system.startsWith("You help a browser agent") -> consultReplies.removeFirstOrNull() ?: """{"give_up":"nothing left"}"""
+                request.system.startsWith("A browser agent, Jev, is stuck") -> replanReplies.removeFirstOrNull() ?: "no idea"
                 request.system.startsWith("You answer a user's") -> extractReply
                 else -> typed
             }))
@@ -671,7 +673,7 @@ class ComputerUseTest {
         val browser = FakeBrowser(tmp(), listOf("BLOCKED", "DONE"))
         val requests = mutableListOf<AiRequest>()
         val run = UseRun("t")
-        val report = flow(browser, FakeTabs(), requests).runComputerUse(UseRequest("log in", onStuck = OnStuck.CONSULT, pointerLabel = "Max"), run)
+        val report = flow(browser, FakeTabs(), requests).runComputerUse(UseRequest("log in", onStuck = OnStuck.CONSULT, pointerLabel = "Max", maxReplans = 0), run)
         assertEquals(UseStatus.DONE, report.status)
         val ask = requests.single { it.system.startsWith("You help a browser agent") }
         assertTrue(ask.messages.single().text.contains("e1 | button | \"Sign in\""))
@@ -2123,6 +2125,172 @@ class ComputerUseTest {
         assertFalse(prompt.contains("Add to cart"))
         assertTrue(prompt.contains("e2 | textbox | \"Phone number\""))
         assertTrue(prompt.contains("A dialog \"Cookie banner\" is open over the page; the elements it covers are left out."))
+    }
+
+    // ---- planning: search first, milestones, replans ----
+
+    @Test
+    fun `the planning prompt prefers a search page, forbids guessed site URLs, corrects typos and asks for milestones`() {
+        val p = Cu.PLAN_SYSTEM
+        assertTrue(p.contains("Prefer a web search results page: https://www.google.com/search?q=<name + site + intent, typos corrected>"))
+        assertTrue(p.contains("Magnolia+Bakery+Gurgaon+zomato+order+online"))
+        assertTrue(p.contains("When the user names a site, search \"<query> <site>\" on Google instead of guessing that site's own search or a deep link"))
+        assertTrue(p.contains("Never guess a site's internal search or deep URL"))
+        assertTrue(p.contains("Wikipedia /wiki/Title, a site's homepage, a Yelp or Google Maps search"))
+        assertTrue(p.contains("Correct obvious typos"))
+        assertTrue(p.contains("\"milestones\":[\"...\",\"...\"]"))
+        assertTrue(p.contains("2 to 6 steps in order, each at most 12 words and checkable from a screenshot"))
+        assertTrue(p.contains("Tres Leches is in the cart"))
+        assertTrue(p.contains("the overall aim in at most 25 words"))
+        assertTrue(p.contains("the LAST milestone says it: \"stop at the login or payment step\""))
+        assertTrue(p.contains("Reply with only JSON"))
+        assertTrue(p.contains("short and literal"))
+        val r = Cu.REPLAN_SYSTEM
+        assertTrue(r.contains("\"open\":[{\"url\":\"https://...\"}],\"milestones\":[\"...\"],\"jev_goal\":\"...\""))
+        assertTrue(r.contains("only the milestones still to do"))
+        assertTrue(r.contains("Never guess a site's internal search or deep URL"))
+    }
+
+    @Test
+    fun `a plan carries short milestones and a clipped goal, and Jev's state names the current one`() {
+        val long = (1..40).joinToString(" ") { "w$it" }
+        val plan = Cu.parsePlan("""{"open":[{"url":"https://www.google.com/search?q=x"}],"jev_goal":"$long","milestones":["Page open","Tres Leches is in the cart","${(1..20).joinToString(" ") { "m$it" }}","a","b","c","d","e"],"type_values":[]}""", "task")
+        assertEquals(30, plan.goal.split(" ").size)
+        assertEquals(6, plan.milestones.size)
+        assertEquals(12, plan.milestones[2].split(" ").size)
+        assertTrue(Cu.parsePlan("""{"open":[],"jev_goal":"g"}""", "t").milestones.isEmpty())
+        val ms = listOf("Magnolia Bakery's Zomato page is open", "Tres Leches is in the cart", "the login or checkout step is shown")
+        val state = Cu.decideArgs("m", "Order tres leches", "u", "t", emptyList(), "/x.jpg", milestones = ms, doneMilestones = 1)["state"]!!.jsonObject
+        assertEquals("Order tres leches", state["goal"]!!.jsonPrimitive.content)
+        assertEquals("2 of 3: Tres Leches is in the cart", state["milestone"]!!.jsonPrimitive.content)
+        assertEquals(listOf(ms[0]), state["done_milestones"]!!.jsonArray.map { it.jsonPrimitive.content })
+        val q = Cu.decideArgs("m", "Order", "u", "t", emptyList(), "/x.jpg", milestones = ms, doneMilestones = 1)["questions"]!!.jsonObject["operation"]!!.jsonObject["instructions"]!!.jsonPrimitive.content
+        assertTrue(q.contains("Current milestone (2 of 3): Tres Leches is in the cart"))
+        assertTrue(q.contains("pick DONE as soon as the screenshot shows it is reached"))
+        // No milestones: no such fields.
+        val plain = Cu.decideArgs("m", "g", "u", "t", emptyList(), "/x.jpg")["state"]!!.jsonObject
+        assertNull(plain["milestone"]); assertNull(plain["done_milestones"])
+    }
+
+    private val milestonePlan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"Order Tres Leches from Magnolia Bakery","milestones":["Magnolia Bakery's page is open","Tres Leches is in the cart","the login or checkout step is shown"],"type_values":[]}"""
+
+    @Test
+    fun `DONE moves to the next milestone and only the last one ends the run`() = runTest {
+        val browser = FakeBrowser(tmp(), listOf("DONE", "DONE", "DONE"))
+        val report = flow(browser, FakeTabs(), mutableListOf(), plan = milestonePlan).runComputerUse(UseRequest("order a cake", maxSteps = 10))
+        assertEquals(UseStatus.DONE, report.status)
+        assertEquals(3, browser.jevCalls)
+        assertEquals(listOf(VisionOp.MILESTONE, VisionOp.MILESTONE), report.steps.map { it.op })
+        assertEquals("milestone 1 done: Magnolia Bakery's page is open", report.steps[0].note)
+        assertEquals("milestone 2 done: Tres Leches is in the cart", report.steps[1].note)
+        // Jev saw each one in turn, with those done so far.
+        val states = browser.jevArgs.map { it["state"]!!.jsonObject }
+        assertEquals(listOf("1 of 3: Magnolia Bakery's page is open", "2 of 3: Tres Leches is in the cart", "3 of 3: the login or checkout step is shown"), states.map { it["milestone"]!!.jsonPrimitive.content })
+        assertEquals(listOf(0, 1, 2), states.map { it["done_milestones"]!!.jsonArray.size })
+        assertEquals("milestone 1 done: Magnolia Bakery's page is open", states[1]["recent_actions"]!!.jsonArray.single().jsonObject["result"]!!.jsonPrimitive.content)
+        // The report lists them, all reached.
+        val ms = report.toJson()["milestones"]!!.jsonArray.map { it.jsonObject["text"]!!.jsonPrimitive.content to it.jsonObject["done"]!!.jsonPrimitive.content.toBoolean() }
+        assertEquals(listOf("Magnolia Bakery's page is open" to true, "Tres Leches is in the cart" to true, "the login or checkout step is shown" to true), ms)
+        // A run that stops early reports how far it got.
+        val partial = flow(FakeBrowser(tmp(), listOf("DONE", "BLOCKED")), FakeTabs(), mutableListOf(), plan = milestonePlan).runComputerUse(UseRequest("t", maxSteps = 10))
+        assertEquals(listOf(true, false, false), partial.toJson()["milestones"]!!.jsonArray.map { it.jsonObject["done"]!!.jsonPrimitive.content.toBoolean() })
+    }
+
+    @Test
+    fun `targets come from the current milestone first, then the goal`() {
+        val t = Cu.targetPhrasesFor("Tres Leches is in the cart", "Order from Magnolia Bakery", "https://zomato.com/")
+        assertTrue(t.first().contains("Tres Leches"), t.toString())
+        assertTrue(t.any { it.contains("Magnolia") })
+        assertTrue(t.size <= 3)
+        assertEquals(Cu.targetPhrases("Order from Magnolia Bakery", "https://zomato.com/"), Cu.targetPhrasesFor(null, "Order from Magnolia Bakery", "https://zomato.com/"))
+    }
+
+    private val googleUrl = "https://www.google.com/search?q=Magnolia+Bakery+Gurgaon+zomato+order+online"
+    private fun replanReply() = """{"open":[{"url":"$googleUrl"}],"milestones":["Magnolia Bakery's Zomato page is open","Tres Leches is in the cart"],"jev_goal":"Order Tres Leches from Magnolia Bakery"}"""
+
+    @Test
+    fun `a dead end asks the planner for a better start, navigates there, and goes on with the new milestones`() = runTest {
+        replanReplies = ArrayDeque(listOf(replanReply()))
+        val browser = FakeBrowser(tmp(), listOf("BLOCKED", "DONE", "DONE")).also { it.pageTextFn = { "Bharat Baker's\nKesari Nandan" } }
+        val requests = mutableListOf<AiRequest>()
+        val run = UseRun("Order tres leches from Magolia bakery on zomato")
+        val report = flow(browser, FakeTabs(), requests, plan = milestonePlan).runComputerUse(UseRequest("Order tres leches from Magolia bakery on zomato", maxSteps = 10), run)
+        assertEquals(UseStatus.DONE, report.status, report.error)
+        val ask = requests.single { it.system.startsWith("A browser agent, Jev, is stuck") }.messages.single().text
+        assertTrue(ask.contains("Task: Order tres leches from Magolia bakery on zomato"))
+        assertTrue(ask.contains("Milestones remaining: Magnolia Bakery's page is open; Tres Leches is in the cart; the login or checkout step is shown"))
+        assertTrue(ask.contains("Page now:") && ask.contains("sample.com"))
+        assertTrue(ask.contains("What it tried:"))
+        assertTrue(ask.contains("Bharat Baker's")) // the page text excerpt
+        assertTrue(ask.contains("Why it is stuck: Jev found no operation"))
+        // It went there on the same tab, noted the step, counted the call, and took the new milestones.
+        assertEquals(googleUrl, browser.stepArgs("navigate").single()["action"]!!.jsonObject["value"]!!.jsonPrimitive.content)
+        assertEquals("t1", browser.stepArgs("navigate").single()["tab_id"]!!.jsonPrimitive.content)
+        val step = report.steps.first { it.op == VisionOp.REPLAN }
+        assertEquals("replanned: $googleUrl", step.note)
+        assertEquals(2, report.llmCalls) // plan + replan
+        assertEquals(1, run.replans)
+        assertEquals(listOf("Magnolia Bakery's Zomato page is open", "Tres Leches is in the cart"), run.plan.value!!.milestones)
+        assertEquals(googleUrl, run.plan.value!!.open.single())
+    }
+
+    @Test
+    fun `replans are capped by max_replans`() = runTest {
+        replanReplies = ArrayDeque(listOf(replanReply(), replanReply(), replanReply()))
+        val requests = mutableListOf<AiRequest>()
+        val browser = FakeBrowser(tmp(), listOf("BLOCKED")).also { it.pageTextFn = { "wrong page" } }
+        val report = flow(browser, FakeTabs(), requests, plan = milestonePlan).runComputerUse(UseRequest("t", maxSteps = 20))
+        assertEquals(2, requests.count { it.system.startsWith("A browser agent, Jev, is stuck") }) // the default of 2
+        assertEquals(UseStatus.NEEDS_INPUT, report.status)
+        assertEquals(2, report.steps.count { it.op == VisionOp.REPLAN })
+        replanReplies = ArrayDeque(listOf(replanReply()))
+        val none = mutableListOf<AiRequest>()
+        flow(FakeBrowser(tmp(), listOf("BLOCKED")), FakeTabs(), none, plan = milestonePlan).runComputerUse(UseRequest("t", maxReplans = 0))
+        assertEquals(0, none.count { it.system.startsWith("A browser agent, Jev, is stuck") })
+        val one = mutableListOf<AiRequest>()
+        replanReplies = ArrayDeque(listOf(replanReply(), replanReply()))
+        flow(FakeBrowser(tmp(), listOf("BLOCKED")), FakeTabs(), one, plan = milestonePlan).runComputerUse(UseRequest("t", maxReplans = 1, maxSteps = 20))
+        assertEquals(1, one.count { it.system.startsWith("A browser agent, Jev, is stuck") })
+        assertEquals(2, BrowserUseArgs.parse("""{"task":"t"}""").getOrThrow().maxReplans)
+        assertEquals(5, BrowserUseArgs.parse("""{"task":"t","max_replans":99}""").getOrThrow().maxReplans)
+    }
+
+    @Test
+    fun `no replan for a login or a request for the person or when the page has what the milestone needs, or for an unusable plan`() = runTest {
+        replanReplies = ArrayDeque(listOf(replanReply(), replanReply()))
+        // A login modal: the person's, never the planner's.
+        val login = FakeBrowser(tmp(), listOf("BLOCKED")).also { it.modalLabel = "Login"; it.pageTextFn = { "Login\nEnter your phone number\nSend one time password" } }
+        val r1 = mutableListOf<AiRequest>()
+        val report = flow(login, FakeTabs(), r1, plan = milestonePlan).runComputerUse(UseRequest("t"))
+        assertEquals(UseStatus.NEEDS_INPUT, report.status)
+        assertEquals(0, r1.count { it.system.startsWith("A browser agent, Jev, is stuck") })
+        val ask = FakeBrowser(tmp(), listOf("NEEDS_INPUT"))
+        val r2 = mutableListOf<AiRequest>()
+        flow(ask, FakeTabs(), r2, plan = milestonePlan).runComputerUse(UseRequest("t"))
+        assertEquals(0, r2.count { it.system.startsWith("A browser agent, Jev, is stuck") })
+        // The milestone's phrases are on the page: this is not a dead end.
+        val here = FakeBrowser(tmp(), listOf("BLOCKED")).also { it.locateReply = { """{"ok":true,"located":{"found":true,"count":1,"in_view":true}}""" } }
+        val r3 = mutableListOf<AiRequest>()
+        flow(here, FakeTabs(), r3, plan = milestonePlan).runComputerUse(UseRequest("t"))
+        assertEquals(0, r3.count { it.system.startsWith("A browser agent, Jev, is stuck") })
+        // A planner that gives nothing usable leaves the run to stop as before (and still spent the call).
+        replanReplies = ArrayDeque(listOf("sorry", "{\"open\":[{\"url\":\"http://insecure.com/\"}]}"))
+        val bad = FakeBrowser(tmp(), listOf("BLOCKED"))
+        val r4 = mutableListOf<AiRequest>()
+        val stopped = flow(bad, FakeTabs(), r4, plan = milestonePlan).runComputerUse(UseRequest("t", maxSteps = 20))
+        assertEquals(UseStatus.NEEDS_INPUT, stopped.status)
+        assertEquals(0, bad.stepArgs("navigate").size)
+        assertEquals(1, r4.count { it.system.startsWith("A browser agent, Jev, is stuck") }) // one unusable answer, and the run stops as it would have
+        // An address that is not https is refused too.
+        val insecure = FakeBrowser(tmp(), listOf("BLOCKED"))
+        replanReplies = ArrayDeque(listOf("{\"open\":[{\"url\":\"http://insecure.com/\"}]}"))
+        flow(insecure, FakeTabs(), mutableListOf(), plan = milestonePlan).runComputerUse(UseRequest("t", maxReplans = 1))
+        assertEquals(0, insecure.stepArgs("navigate").size)
+        // Without any target to look for, nothing says the page is wrong.
+        val nothing = FakeBrowser(tmp(), listOf("BLOCKED"))
+        val r5 = mutableListOf<AiRequest>()
+        flow(nothing, FakeTabs(), r5, plan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"find the thing","type_values":[]}""").runComputerUse(UseRequest("t"))
+        assertEquals(0, r5.count { it.system.startsWith("A browser agent, Jev, is stuck") })
     }
 
     // ---- popup windows that are not tabs ----

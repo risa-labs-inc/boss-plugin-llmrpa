@@ -196,7 +196,7 @@ class HeadlessRunner(
         val request = UseRequest(
             task = a.task, url = page, tabId = tab?.tabId, jevModel = a.model ?: Cu.VISION_DEFAULT_MODEL, llm = llm,
             pointerLabel = Cu.pointerLabel(a.displayName), llmTyping = a.llmTyping,
-            onStuck = a.onStuck, consultBelow = a.consultBelow, maxConsults = a.maxConsults, consultModel = consultModel, inputs = a.inputs, extract = a.extract,
+            onStuck = a.onStuck, consultBelow = a.consultBelow, maxConsults = a.maxConsults, consultModel = consultModel, maxReplans = a.maxReplans, inputs = a.inputs, extract = a.extract,
             maxSteps = a.maxSteps, timeoutMs = a.timeoutS * 1000L, confirm = null,
             // A caller that names the page needs no plan; `plan` forces one either way.
             planWithLlm = a.plan ?: (page == null && tab == null),
