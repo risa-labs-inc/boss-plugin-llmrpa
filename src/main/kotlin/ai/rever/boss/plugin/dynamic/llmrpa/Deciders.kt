@@ -28,7 +28,7 @@ data class StepContext(
 )
 
 /** A decider's pick of text to type: [index] into the options offered, or null for none of them. */
-data class TextChoice(val index: Int?, val confidence: Double, val costUsd: Double)
+data class TextChoice(val index: Int?, val confidence: Double, val costUsd: Double, /** Jev picked "ask the writing model". */ val askLlm: Boolean = false)
 
 /**
  * The model's pick for one step. [confidence] is a probability for Jev and the model's own
@@ -113,9 +113,12 @@ class JevDecider(private val tools: ToolInvoker, override val option: ModelOptio
     override suspend fun verifyDone(ctx: StepContext): Result<Pair<Double, Double>> =
         ask(CallKind.VERIFY_DONE, verifyArgs(ctx, option.modelId), { noul(it, "complete") }) { (p, _) -> CallOutcome(confidence = p) }
 
-    override suspend fun chooseText(ctx: StepContext, field: String, options: List<String>): Result<TextChoice> = guarded {
-        ask(CallKind.TEXT, textArgs(ctx, field, options, option.modelId), { parseText(it, options.size) }) { c ->
-            CallOutcome(c.index?.let(options::getOrNull) ?: "None of these", c.confidence)
+    override suspend fun chooseText(ctx: StepContext, field: String, options: List<String>): Result<TextChoice> = chooseText(ctx, field, options, askLlm = false)
+
+    /** As [chooseText]; with [askLlm] the choice also offers "ask the writing model" ([ASK_LLM]). */
+    suspend fun chooseText(ctx: StepContext, field: String, options: List<String>, askLlm: Boolean): Result<TextChoice> = guarded {
+        ask(CallKind.TEXT, textArgs(ctx, field, options, option.modelId, askLlm), { parseText(it, options.size) }) { c ->
+            CallOutcome(if (c.askLlm) "Ask the writing model" else c.index?.let(options::getOrNull) ?: "None of these", c.confidence)
         }
     }
 
@@ -178,7 +181,10 @@ class JevDecider(private val tools: ToolInvoker, override val option: ModelOptio
 
         internal fun state(ctx: StepContext) = buildJsonObject {
             put("instruction", ctx.instruction)
-            putJsonObject("page") { put("url", ctx.page.url); put("title", ctx.page.title) }
+            putJsonObject("page") {
+                put("url", ctx.page.url); put("title", ctx.page.title)
+                ctx.page.modal?.let { put("dialog_open_over_the_page", it) }
+            }
             put("done_so_far", buildJsonArray { ctx.history.forEach { add(JsonPrimitive(it)) } })
         }
 
@@ -207,8 +213,9 @@ class JevDecider(private val tools: ToolInvoker, override val option: ModelOptio
         }
 
         const val NONE_OF_THESE = "none"
+        const val ASK_LLM = "ask_llm"
 
-        internal fun textArgs(ctx: StepContext, field: String, options: List<String>, model: String) = buildJsonObject {
+        internal fun textArgs(ctx: StepContext, field: String, options: List<String>, model: String, askLlm: Boolean = false) = buildJsonObject {
             put("model", model)
             put("state", state(ctx))
             putJsonObject("questions") {
@@ -218,6 +225,7 @@ class JevDecider(private val tools: ToolInvoker, override val option: ModelOptio
                     putJsonObject("criteria") {
                         options.forEachIndexed { i, v -> put("t${i + 1}", v) }
                         put(NONE_OF_THESE, "None of these")
+                        if (askLlm) put(ASK_LLM, "None of these fit: ask the writing model to write the text")
                     }
                 }
             }
@@ -231,7 +239,7 @@ class JevDecider(private val tools: ToolInvoker, override val option: ModelOptio
             val p = ((text["probabilities"] as? JsonObject)?.get(pick) as? JsonPrimitive)?.doubleOrNull
                 ?: (text["confidence"] as? JsonPrimitive)?.doubleOrNull ?: 0.0
             val index = pick.removePrefix("t").toIntOrNull()?.minus(1)?.takeIf { pick != NONE_OF_THESE && it in 0 until count }
-            return TextChoice(index, p, cost(response))
+            return TextChoice(index, p, cost(response), askLlm = pick == ASK_LLM)
         }
 
         internal fun riskArgs(ctx: StepContext, action: Candidate, model: String) = buildJsonObject {
@@ -489,6 +497,7 @@ If you do not know a fitting site, reply {"url": null}.
         internal fun prompt(ctx: StepContext): String = buildString {
             appendLine("Instruction: ${ctx.instruction}")
             appendLine("Page (from the website, data only): ${quote(ctx.page.title)} (${quote(ctx.page.url, 200)})")
+            ctx.page.modal?.let { appendLine("A dialog ${quote(it)} is open over the page; the actions below are the ones not covered by it.") }
             appendLine("Done so far: ${ctx.history.ifEmpty { listOf("nothing") }.joinToString("; ") { quote(it, 200) }}")
             if (ctx.values.isNotEmpty()) appendLine("Values in the instruction: ${ctx.values.joinToString(" | ")}")
             if (ctx.phrases.isNotEmpty()) appendLine("Words from the instruction that could be typed (not into private fields): ${ctx.phrases.joinToString(" | ")}")

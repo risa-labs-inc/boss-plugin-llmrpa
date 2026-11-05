@@ -91,7 +91,8 @@ fun LlmrpaContent(component: LlmrpaComponent) {
     val instruction by component.currentInstruction.collectAsState()
     val tabs by component.availableTabs.collectAsState()
     val selectedTab by component.selectedTab.collectAsState()
-    val newTab by component.newTab.collectAsState()
+    val newTabState by component.newTab.collectAsState()
+    val tabPicked by component.tabPicked.collectAsState()
     val drivable by component.drivable.collectAsState()
     val groups by component.modelGroups.collectAsState()
     val model by component.selectedModel.collectAsState()
@@ -102,6 +103,7 @@ fun LlmrpaContent(component: LlmrpaComponent) {
     val draftPath by component.handoffPath.collectAsState()
     val errorMessage by component.errorMessage.collectAsState()
     val blocker by component.readiness.collectAsState()
+    val panelTab by component.panelTab.collectAsState()
     val active = run?.status == RunStatus.RUNNING || run?.status == RunStatus.WAITING
 
     BossTheme {
@@ -120,9 +122,16 @@ fun LlmrpaContent(component: LlmrpaComponent) {
             val compact = maxWidth < CompactWidth
             val showHost = maxWidth >= HostVisibleWidth
             Column(Modifier.fillMaxSize()) {
-                Header(component, TabTarget(tabs, selectedTab, newTab, drivable), groups, model, blocker, compact, showHost, active)
+                PanelTabs(component, panelTab, enabled = !active && !component.isUsing)
+                // The Jev tab runs on a new tab (the planned page) unless a tab was picked: the focused tab is not a target there.
+                val jevDefault = panelTab == LlmrpaComponent.PanelTab.JEV && !tabPicked
+                val newTab = newTabState || jevDefault
+                Header(component, TabTarget(tabs, selectedTab.takeIf { !jevDefault }, newTab, drivable), groups, model, blocker, compact, showHost, active || component.isUsing,
+                    showModel = panelTab == LlmrpaComponent.PanelTab.TASK)
                 Box(Modifier.fillMaxWidth().height(1.dp).background(RpaTokens.Border))
-                if (twoPane) {
+                if (panelTab == LlmrpaComponent.PanelTab.JEV) {
+                    JevTab(component)
+                } else if (twoPane) {
                     Row(Modifier.fillMaxSize()) {
                         Box(Modifier.weight(1f).fillMaxHeight().verticalScroll(rememberScrollState())) {
                             Compose(component, instruction, model, blocker, active, drafting, draftPath, errorMessage, maxSteps, collapsed = false)
@@ -154,6 +163,7 @@ private fun Header(
     compact: Boolean,
     showHost: Boolean,
     active: Boolean,
+    showModel: Boolean = true,
 ) {
     Row(
         Modifier.fillMaxWidth().height(42.dp).padding(horizontal = 8.dp),
@@ -161,7 +171,7 @@ private fun Header(
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         Box(Modifier.weight(1f)) { TabPicker(component, target, showHost, enabled = !active) }
-        ModelPicker(component, groups, model, blocker, compact, enabled = !active)
+        if (showModel) ModelPicker(component, groups, model, blocker, compact, enabled = !active)
     }
 }
 
@@ -170,7 +180,7 @@ private data class TabTarget(val tabs: List<ActiveTabData>, val selected: Active
     fun canDrive(tabId: String) = StartPages.drivableIn(drivable, tabId)
 }
 
-private const val NEW_TAB_LABEL = "New tab (pick the page for me)"
+private const val NEW_TAB_LABEL = "New tab (planned page)"
 
 /** The tab every action lands on. Always visible, because it is where clicks will happen. */
 @Composable
@@ -371,7 +381,7 @@ private fun StepLimit(component: LlmrpaComponent, maxSteps: Int, enabled: Boolea
 }
 
 @Composable
-private fun Notice(text: String, tone: Tone, onDismiss: (() -> Unit)? = null) {
+internal fun Notice(text: String, tone: Tone, onDismiss: (() -> Unit)? = null) {
     Row(
         Modifier.fillMaxWidth().clip(RpaTokens.Shape).background(RpaTokens.Content)
             .border(1.dp, tone.color().copy(alpha = 0.55f), RpaTokens.Shape).padding(horizontal = 10.dp, vertical = 7.dp),

@@ -14,6 +14,7 @@ import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.doubleOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.put
 
@@ -29,6 +30,7 @@ internal class LlmrpaMcpToolProvider(
     private val component: () -> LlmrpaComponent?,
     private val headless: HeadlessRunner,
     private val runs: RunHistory,
+    private val runLog: RunLogStore,
     /** Where `llmrpa_export` writes; tests pass a temp directory. */
     private val exportDir: java.io.File = RpaEngineHandoff.defaultConfigDir,
 ) : McpToolProvider {
@@ -80,6 +82,88 @@ internal class LlmrpaMcpToolProvider(
             },
         ),
         McpToolDefinition(
+            name = BROWSER_USE,
+            description =
+                "Do a task in the user's real, logged-in browser by looking at the page, like a person. In the default agent mode one vision chat model " +
+                    "(agent_model; Claude Haiku by default) decides each step from a marked screenshot and the element list, and RPA Engine clicks, types and scrolls " +
+                    "with a visible pointer; it asks (status needs_input, blocker.question and blocker.options) for logins, codes, choices and before paying. To answer, call again " +
+                    "with the same tab_id and inputs {\"reply\":\"...\"} (or a new named input, or {\"continue\":\"yes\"}): the same run resumes with its history. Secret inputs are typed as {{name}} and never sent to the model. " +
+                    "mode fast is legacy (the older Jev loop with milestones), used only when asked for explicitly. " +
+                    "The result reports what happened plus the final page text. Use it to research or operate a website. " +
+                    "The user sees the run: the tab is opened or brought to the front in the space on screen and a labelled pointer moves over it. " +
+                    "It opens a new tab at the planned page (or url), or acts on tab_id; only tabs in the space on screen can be driven. " +
+                    "The run keeps its tab in front while it works: if the tab is hidden the screenshot brings it back first (a hidden tab's screen is stale), so the user should not switch away. " +
+                    "It never waits for a person. When it is stuck (no progress, Jev blocked or unsure) it stops with status needs_input and a blocker, leaving the tab open: " +
+                    "call it again with the same tab_id, task and inputs (named values such as phone or code) to continue where it stopped; when the page asks for a login, a code or payment (status needs_input, nothing is consulted) the person does it in the tab and you call again with inputs {\"continue\":\"yes\"} to resume without replanning; with on_stuck consult it asks the planner chat model what to do first. " +
+                    "Information on the pages it passes is saved in collected[]. " +
+                    "Long runs return status running; poll browser_use_status: after wait_s (default 45 s, at most 50, under the client's ~60 s timeout) the call returns {ok:false, status:\"running\", run_id, tab_id, steps so far} and the run goes on in the background; poll browser_use_status with run_id until it returns the final report. " +
+                    "Returns JSON {ok, status (done|needs_input|blocked|budget|error|running), run_id, summary (built from the steps, not a model's opinion), url, title, tab_id, page_text, collected[] (text saved from pages), pages_visited[], blocker {reason, question, url, title, tab_id, screenshot_path, step} when it stopped, answer (only with extract), steps, seconds, jev_calls, " +
+                    "llm_calls, tool_calls, cost_usd, confidences, screenshot_path}; ok only means Jev reached its goal, so read the answer from page_text yourself.",
+            inputSchema = BROWSER_USE_SCHEMA,
+            readOnly = false,
+            handler = McpToolHandler { args ->
+                val a = BrowserUseArgs.parse(args.raw).getOrElse { return@McpToolHandler McpToolResult(it.message ?: "Invalid arguments", isError = true) }
+                val result = if (a.mode == "dom") {
+                    headless.browserUseDomWaiting(a).map { it.toString() }
+                } else {
+                    headless.browserUse(a).map { o ->
+                        when (o) {
+                            is HeadlessRunner.UseOutcome.Finished -> o.report.toJson(a.includeText).toString()
+                            is HeadlessRunner.UseOutcome.Running -> UseReport.running(o.run).toString()
+                        }
+                    }
+                }
+                result.fold(
+                    onSuccess = { McpToolResult(it) },
+                    onFailure = { McpToolResult(it.message ?: "Could not run the task", isError = true) },
+                )
+            },
+        ),
+        McpToolDefinition(
+            name = BROWSER_USE_STATUS,
+            description =
+                "Read the log of browser_use and Jev-tab runs (they are kept in ~/.boss/cache/llmrpa/runs, the newest 50). A browser_use call that returned status running is read here: " +
+                    "with its run_id you get a compact {run_id, status, steps_count, seconds, last_step {op, target, result}, answer or blocker {question, options}, error, cost}; " +
+                    "full: true returns the final report in browser_use's shape plus the detailed log under \"record\" " +
+                    "(task, plan, input names, status, every step with its tab, screenshot, consult, popup and dialog notes, the report, tool-call counts and cost). " +
+                    "Without: the live run, if any, and a list of the last runs. Use it to see where a run stopped or went wrong. Private text is masked; no image data is stored, only screenshot paths.",
+            inputSchema = BROWSER_USE_STATUS_SCHEMA,
+            readOnly = true,
+            handler = McpToolHandler { args ->
+                val root = runCatching { Json.parseToJsonElement(args.raw.ifBlank { "{}" }) as JsonObject }.getOrNull()
+                    ?: return@McpToolHandler McpToolResult("Arguments must be a JSON object", isError = true)
+                val unknown = root.keys - setOf("run_id", "limit", "include_activity", "full")
+                if (unknown.isNotEmpty()) return@McpToolHandler McpToolResult("Unknown argument ${unknown.sorted().joinToString()}. Allowed: run_id, limit, include_activity, full", isError = true)
+                val full = (root["full"] as? JsonPrimitive)?.booleanOrNull ?: false
+                val limit = ((root["limit"] as? JsonPrimitive)?.intOrNull ?: 5).coerceIn(1, 50)
+                val withActivity = (root["include_activity"] as? JsonPrimitive)?.booleanOrNull ?: false
+                val id = (root["run_id"] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }
+                if (id != null) {
+                    val rec = runLog.read(id) ?: return@McpToolHandler McpToolResult(
+                        "No run '$id'. Recent runs: ${runLog.list(10).joinToString { (it["run_id"] as? JsonPrimitive)?.content.orEmpty() }.ifEmpty { "none" }}", isError = true)
+                    // By default a few hundred bytes: where the run is and what it needs. full: the report and the whole record.
+                    val liveRun = runLog.liveRuns().firstOrNull { it.id == id }
+                    if (!full) return@McpToolHandler McpToolResult(compactStatus(rec, liveRun != null).toString())
+                    val report = (rec["report"] as? JsonObject)
+                    val head = when {
+                        liveRun != null -> UseReport.running(liveRun)
+                        report != null -> report
+                        else -> null
+                    }
+                    McpToolResult(if (head == null) statusRecord(rec, withActivity).toString() else buildJsonObject {
+                        head.forEach { (k, v) -> put(k, v) }
+                        put("record", statusRecord(JsonObject(rec.filterKeys { it != "report" }), withActivity))
+                    }.toString())
+                } else {
+                    val live = runLog.liveRuns().lastOrNull()?.let { runLog.record(it) }
+                    McpToolResult(buildJsonObject {
+                        if (live != null) put("live", if (full) statusRecord(live, withActivity) else compactStatus(live, true)) else put("live", kotlinx.serialization.json.JsonNull)
+                        put("runs", buildJsonArray { runLog.list(limit).forEach { add(it) } })
+                    }.toString())
+                }
+            },
+        ),
+        McpToolDefinition(
             name = "llmrpa_status",
             description =
                 "Report the LLM RPA panel's state: the live run (status, steps, summary, model calls per step) and the last drafted plan. " +
@@ -103,6 +187,7 @@ internal class LlmrpaMcpToolProvider(
                         "draft: generating=${c.isGenerating.value} history=${c.executionHistory.value.size} " +
                         "last=${last?.status?.name ?: "none"} " +
                         "actions=${last?.generatedActions?.size ?: 0}\n" +
+                        "jev_run=${runLog.liveRuns().lastOrNull()?.let { "${it.id} (running)" } ?: runLog.list(1).firstOrNull()?.let { r -> "${(r["run_id"] as? JsonPrimitive)?.content} (${(r["status"] as? JsonPrimitive)?.content})" } ?: "none"} (see browser_use_status)\n" +
                         "plan=${c.handoffPath.value ?: "not written"}\n" +
                         "message=${last?.message ?: "none"}\n" +
                         "error=${last?.error ?: c.errorMessage.value ?: "none"}\n" +
@@ -176,6 +261,75 @@ internal class LlmrpaMcpToolProvider(
         McpToolResult("Open the LLM RPA panel first (no active instance).", isError = true)
 
     companion object {
+        internal const val BROWSER_USE = "browser_use"
+        internal const val BROWSER_USE_STATUS = "browser_use_status"
+
+        internal const val BROWSER_USE_STATUS_SCHEMA = """{"type":"object","additionalProperties":false,"properties":{""" +
+            """"run_id":{"type":"string","description":"The run_id browser_use returned; omit to see the live run and the latest runs"},""" +
+            """"limit":{"type":"integer","minimum":1,"maximum":50,"default":5,"description":"How many recent runs to list"},""" +
+            """"full":{"type":"boolean","default":false,"description":"Return the whole report and record. Default: compact {run_id, status, steps_count, seconds, last_step, answer or blocker, cost}"},""" +
+            """"include_activity":{"type":"boolean","default":false,"description":"With full: add every tool call (rpa_step, jev_decide, gateway chat) with timing, result and cost"}}}"""
+
+        /** A poll's answer: where the run is and what it needs, without the steps, page text and activity. */
+        internal fun compactStatus(rec: JsonObject, running: Boolean): JsonObject = buildJsonObject {
+            fun f(o: JsonObject?, k: String) = o?.get(k)?.takeIf { it !is kotlinx.serialization.json.JsonNull }
+            val report = rec["report"] as? JsonObject
+            put("run_id", rec["run_id"] ?: JsonPrimitive(""))
+            put("status", if (running) JsonPrimitive((rec["status"] as? JsonPrimitive)?.content?.takeIf { it == "waiting" } ?: "running") else rec["status"] ?: JsonPrimitive("unknown"))
+            put("steps_count", rec["steps_count"] ?: JsonPrimitive(0))
+            put("seconds", rec["seconds"] ?: JsonPrimitive(0))
+            ((rec["steps"] as? kotlinx.serialization.json.JsonArray)?.lastOrNull() as? JsonObject)?.let { s ->
+                put("last_step", buildJsonObject { listOf("op", "target", "result").forEach { k -> f(s, k)?.let { put(k, it) } } })
+            }
+            f(report, "answer")?.let { put("answer", it) }
+            (report?.get("blocker") as? JsonObject)?.let { b ->
+                put("blocker", buildJsonObject {
+                    (f(b, "question") ?: f(b, "reason"))?.let { put("question", it) }
+                    f(b, "options")?.let { put("options", it) }
+                })
+            }
+            f(report, "error")?.let { put("error", it) }
+            put("cost", buildJsonObject {
+                f(rec, "cost_usd")?.let { put("usd", it) }
+                f(report, "llm_tokens")?.let { put("llm_tokens", it) }
+                f(rec, "llm_calls")?.let { put("llm_calls", it) }
+            })
+        }
+
+        /** A run's record with the activity list cut to its count unless [withActivity]. */
+        internal fun statusRecord(rec: JsonObject, withActivity: Boolean): JsonObject = buildJsonObject {
+            rec.forEach { (k, v) ->
+                if (k == "activity" && !withActivity) put("activity_count", (v as? kotlinx.serialization.json.JsonArray)?.size ?: 0) else put(k, v)
+            }
+        }
+
+        internal const val BROWSER_USE_SCHEMA = """{"type":"object","additionalProperties":false,"properties":{""" +
+            """"task":{"type":"string","description":"What to do or find, in plain language, e.g. find the top 10 restaurants in Palo Alto"},""" +
+            """"url":{"type":"string","description":"http(s) address to open in a new tab; replaces the page the planner would choose (the goal is still planned)"},""" +
+            """"tab_id":{"type":"string","description":"Browser tab to act on (explicit; giving it skips planning). Without tab_id the run plans and opens a new tab (as with new_tab: true); the focused tab is never used"},""" +
+            """"new_tab":{"type":"boolean","default":false,"description":"Open the planned page in a new tab. The default whenever tab_id is not given"},""" +
+            """"mode":{"type":"string","enum":["agent","fast","dom"],"default":"agent","description":"agent (use this): one vision chat model decides each step from a marked screenshot and the element list. fast and dom are legacy, only when asked for explicitly: fast is the old Jev loop with milestones (done only when every milestone is reached), dom the text-list runner of llmrpa_execute"},""" +
+            """"agent_model":{"type":"string","description":"agent mode: the chat model that decides each step; it must see images. Default: the newest Claude Haiku the AI Gateway lists, else the planner"},""" +
+            """"model":{"type":"string","description":"Jev model; vision needs one that takes images and boxes (default typesafe/jev-1.14). In dom mode, any model id of llmrpa_execute"},""" +
+            """"planner_model":{"type":"string","description":"Chat model id (from Settings → AI Providers) that plans the task and writes text for fields; defaults to the selected one"},""" +
+            """"navigator_model":{"type":"string","description":"Fast chat model that plans each new page and advises (Claude Haiku via the AI Gateway by default; falls back to the planner when unavailable). It sees the marked screenshot when the gateway has vision"},""" +
+            """"page_plan":{"type":"boolean","default":true,"description":"The navigator plans each new page once (up to 5 steps, which Jev then grounds one by one); also splits a multi-part goal when no plan was made"},""" +
+            """"display_name":{"type":"string","default":"Jev","description":"Label on the on-page pointer (always shown)"},""" +
+            """"on_stuck":{"type":"string","enum":["return","consult"],"default":"return","description":"When stuck: return stops with status needs_input and a blocker (the tab stays open; call again with the same tab_id, task and inputs to continue); consult asks the planner chat model what to do, up to max_consults times"},""" +
+            """"consult_below":{"type":"number","minimum":0,"maximum":1,"default":0.5,"description":"Jev operation confidence below this counts as stuck"},""" +
+            """"max_consults":{"type":"integer","minimum":0,"maximum":10,"default":5},""" +
+            """"max_replans":{"type":"integer","minimum":0,"maximum":5,"default":2,"description":"How many times the planner may choose a new place to continue from when the page is a dead end for the next milestone"},""" +
+            """"consult_model":{"type":"string","description":"Chat model that looks at the screenshot when Jev is stuck (a model that can see images). Default: the planner if it can, else the first available that can; with none, the run returns instead of consulting a model that cannot see"},""" +
+            """"inputs":{"type":"object","additionalProperties":{"type":"string"},"description":"Named values for Jev to type when asked, e.g. {\"phone\":\"...\"}; names that sound private (password, code, otp, card) are only typed into private fields and masked in the record"},""" +
+            """"extract":{"type":"boolean","default":false,"description":"One LLM call answers the task only from the collected and final page text and returns it as answer"},""" +
+            """"plan":{"type":"boolean","description":"Ask the planner chat model for the goal and page first. Default: false when url or tab_id is given (the task is the goal), true otherwise"},""" +
+            """"llm_typing":{"type":"boolean","default":true,"description":"Let the planner chat model write text for a field when nothing from the task fits (never for password, PIN or card fields)"},""" +
+            """"max_steps":{"type":"integer","minimum":1,"maximum":60,"default":25},""" +
+            """"timeout_s":{"type":"integer","minimum":10,"maximum":600,"default":180,"description":"The run's own time limit"},""" +
+            """"wait_s":{"type":"integer","minimum":5,"maximum":50,"default":45,"description":"How long this call waits (at most 50 s, under the MCP client's ~60 s timeout). Long runs return status running; poll browser_use_status with run_id"},""" +
+            """"include_text":{"type":"boolean","default":true,"description":"Include the final page's text (up to 20000 characters) as page_text"}""" +
+            """},"required":["task"]}"""
+
         private fun parse(raw: String): JsonObject? = runCatching { Json.parseToJsonElement(raw.ifBlank { "{}" }) as JsonObject }.getOrNull()
 
         private fun includeCalls(root: JsonObject?): Boolean =
@@ -284,6 +438,80 @@ internal class LlmrpaMcpToolProvider(
             val stepless = state.modelCalls.filter { c -> state.steps.none { it.index == c.step } }
             if (stepless.isNotEmpty()) put("other_model_calls", buildJsonArray { stepless.forEach { c -> add(buildJsonObject { put("step", c.step); callSummary(c).forEach { (k, v) -> put(k, v) } }) } })
             if (includeCalls) put("calls", buildJsonArray { state.modelCalls.forEach { add(callDetail(it)) } })
+        }
+    }
+}
+
+/** `browser_use` arguments, validated: an unknown key or a wrong type is refused, ranges are clamped. */
+internal data class BrowserUseArgs(
+    val task: String,
+    val url: String?,
+    val tabId: String?,
+    val newTab: Boolean,
+    val mode: String,
+    val model: String?,
+    val plannerModel: String?,
+    val displayName: String,
+    val llmTyping: Boolean,
+    val onStuck: OnStuck,
+    val consultBelow: Double,
+    val maxConsults: Int,
+    val consultModel: String?,
+    val navigatorModel: String?,
+    val agentModel: String?,
+    val pagePlan: Boolean,
+    val maxReplans: Int,
+    val inputs: Map<String, String>,
+    val extract: Boolean,
+    /** Plan with the chat model; null = only when no url or tab_id was given. */
+    val plan: Boolean?,
+    val maxSteps: Int,
+    val timeoutS: Int,
+    /** How long the call waits for the run before returning status running. */
+    val waitS: Int,
+    val includeText: Boolean,
+) {
+    companion object {
+        private val KEYS = setOf("task", "url", "tab_id", "new_tab", "mode", "model", "planner_model", "display_name", "llm_typing", "on_stuck", "consult_below", "max_consults", "consult_model", "navigator_model", "agent_model", "page_plan", "max_replans", "inputs", "extract", "plan", "max_steps", "timeout_s", "wait_s", "include_text")
+
+        fun parse(raw: String): Result<BrowserUseArgs> = runCatching {
+            val root = Json.parseToJsonElement(raw.ifBlank { "{}" }) as? JsonObject ?: error("Arguments must be a JSON object")
+            val unknown = root.keys - KEYS
+            require(unknown.isEmpty()) { "Unknown argument ${unknown.sorted().joinToString()}. Allowed: ${KEYS.sorted().joinToString()}" }
+            fun str(k: String): String? {
+                val v = root[k] ?: return null
+                val p = v as? JsonPrimitive
+                require(p != null && p.isString) { "'$k' must be a string" }
+                return p.content.takeIf { it.isNotBlank() }
+            }
+            fun bool(k: String, default: Boolean): Boolean {
+                val v = root[k] ?: return default
+                return (v as? JsonPrimitive)?.booleanOrNull ?: error("'$k' must be a boolean")
+            }
+            fun int(k: String, default: Int, min: Int, max: Int): Int {
+                val v = root[k] ?: return default
+                return ((v as? JsonPrimitive)?.intOrNull ?: error("'$k' must be an integer")).coerceIn(min, max)
+            }
+            fun dbl(k: String, default: Double, min: Double, max: Double): Double {
+                val v = root[k] ?: return default
+                return ((v as? JsonPrimitive)?.doubleOrNull ?: error("'$k' must be a number")).coerceIn(min, max)
+            }
+            val stuck = str("on_stuck") ?: "return"
+            require(stuck == "return" || stuck == "consult") { "'on_stuck' must be return or consult" }
+            val inputs = (root["inputs"] as? JsonObject)?.let { o ->
+                o.mapValues { (k, v) -> (v as? JsonPrimitive)?.takeIf { it.isString }?.content ?: error("inputs.$k must be a string") }
+            } ?: if (root["inputs"] != null) error("'inputs' must be an object of strings") else emptyMap()
+            val mode = (str("mode") ?: "agent").let { if (it == "vision") "fast" else it }
+            require(mode == "agent" || mode == "fast" || mode == "dom") { "'mode' must be agent, fast or dom" }
+            BrowserUseArgs(
+                task = str("task") ?: error("Missing required argument: task"),
+                url = str("url"), tabId = str("tab_id"), newTab = bool("new_tab", false), mode = mode,
+                model = str("model"), plannerModel = str("planner_model"), displayName = str("display_name") ?: "Jev", llmTyping = bool("llm_typing", true),
+                onStuck = if (stuck == "consult") OnStuck.CONSULT else OnStuck.RETURN, consultBelow = dbl("consult_below", 0.5, 0.0, 1.0),
+                maxConsults = int("max_consults", 5, 0, 10), consultModel = str("consult_model"), navigatorModel = str("navigator_model"), agentModel = str("agent_model"), pagePlan = bool("page_plan", true), maxReplans = int("max_replans", 2, 0, 5), inputs = inputs, extract = bool("extract", false),
+                plan = if (root["plan"] == null) null else bool("plan", false),
+                maxSteps = int("max_steps", 25, 1, 60), timeoutS = int("timeout_s", 180, 10, 600), waitS = int("wait_s", 45, 5, 50), includeText = bool("include_text", true),
+            )
         }
     }
 }

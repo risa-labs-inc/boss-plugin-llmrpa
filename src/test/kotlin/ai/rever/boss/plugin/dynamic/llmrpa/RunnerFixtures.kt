@@ -180,3 +180,6 @@ internal object FakeBrowser : BrowserIntegration {
 
 internal fun noBrowser(tab: String) =
     ToolReply("""{"error":{"code":"NO_BROWSER","message":"Tab '$tab' is not a browser tab"}}""", isError = true)
+
+/** A run log in a temp directory, so no test writes into the real ~/.boss. */
+internal fun testRunLog(keep: Int = 50) = RunLogStore(java.nio.file.Files.createTempDirectory("runlog").toFile().also { it.deleteOnExit() }, keep)
