@@ -19,9 +19,12 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.test.resetMain
+import kotlinx.coroutines.test.setMain
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -4008,5 +4011,97 @@ class ComputerUseTest {
         // At the start of each look: none yet, then the first plan, then still the first (look 2 was stale but one step on), then the second only at look 3's own planning.
         assertEquals(listOf(0, 1, 1), seen)
         assertEquals(2, r3.count { it.system.startsWith("You navigate") })
+    }
+
+    // ---- the target of a run: only an explicit choice acts on an open tab ----
+
+    private val focusedDocs = ai.rever.boss.plugin.api.ActiveTabData("t9", "fluck", "Photon WhatsApp docs", "w", "Work", "p", "win", url = "https://docs.example/")
+
+    private fun jevPanel(browser: FakeBrowser, provider: ai.rever.boss.plugin.dynamic.llmrpa.FakeTabs, requests: MutableList<AiRequest>) = LlmrpaComponent(
+        com.arkivanov.decompose.DefaultComponentContext(com.arkivanov.essenty.lifecycle.LifecycleRegistry()), LlmrpaInfo, provider, { gateway(requests, plan, typedJson) },
+        tools = browser, llmProvider = { null }, tabLocks = TabLocks(), runHistory = RunHistory(), runLog = testRunLog(),
+        io = kotlinx.coroutines.Dispatchers.Main, work = kotlinx.coroutines.Dispatchers.Main, baseLimits = RunLimits(navSettleMs = 0, stepSettleMs = 0, openWaitsMs = listOf(0)), exportDir = tmp(),
+    ).also { it.selectPanelTab(LlmrpaComponent.PanelTab.JEV) }
+
+    private suspend fun awaitReport(c: LlmrpaComponent, scheduler: kotlinx.coroutines.test.TestCoroutineScheduler): UseReport = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
+        kotlinx.coroutines.withTimeoutOrNull(15_000) {
+            while (c.useRun.value?.report?.value == null) { scheduler.advanceTimeBy(500); kotlinx.coroutines.delay(20) } // the panel runs on Main, a test dispatcher: its timers are virtual
+            c.useRun.value?.report?.value
+        } ?: error("no report: error=${c.errorMessage.value} phase=${c.useRun.value?.phase?.value} steps=${c.useRun.value?.steps?.value?.size} activity=${c.useRun.value?.log?.entries?.value?.map { it.name + ":" + it.result.take(60) }}")
+    }
+
+    @Test
+    fun `the Jev tab plans and opens a new tab when none was picked, and leaves the focused tab alone`() = runBlocking {
+        val main = kotlinx.coroutines.test.UnconfinedTestDispatcher(); kotlinx.coroutines.Dispatchers.setMain(main)
+        try {
+            val provider = ai.rever.boss.plugin.dynamic.llmrpa.FakeTabs(listOf(focusedDocs), focused = { "t9" }, create = { "t1" })
+            val browser = FakeBrowser(tmp(), listOf("DONE"))
+            val requests = mutableListOf<AiRequest>()
+            val c = jevPanel(browser, provider, requests)
+            kotlinx.coroutines.delay(200) // the panel follows the focused tab on its own
+            c.updateUseInput("Can you log in to my zomato and order a tres leches")
+            assertNull(c.startUse())
+            val report = awaitReport(c, main.scheduler)
+            assertEquals(1, requests.count { it.system.startsWith("You plan") })
+            assertEquals(listOf("https://sample.com/"), provider.created)
+            assertTrue(browser.calls.none { it.second["tab_id"]?.jsonPrimitive?.content == "t9" }, "the focused tab was driven")
+            assertEquals("t1", report.tabId)
+            assertTrue(report.tabs.none { it.kind == "given" })
+            // The picker says so: the default target is a new tab until one is picked.
+            assertFalse(c.tabPicked.value)
+        } finally { kotlinx.coroutines.Dispatchers.resetMain() }
+    }
+
+    @Test
+    fun `a tab the person picked in the Jev tab is acted on, with no plan and no new tab`() = runBlocking {
+        val main = kotlinx.coroutines.test.UnconfinedTestDispatcher(); kotlinx.coroutines.Dispatchers.setMain(main)
+        try {
+            val provider = ai.rever.boss.plugin.dynamic.llmrpa.FakeTabs(listOf(focusedDocs), focused = { "t9" }, create = { "t1" })
+            val browser = FakeBrowser(tmp(), listOf("DONE"))
+            val requests = mutableListOf<AiRequest>()
+            val c = jevPanel(browser, provider, requests)
+            kotlinx.coroutines.delay(200)
+            c.selectTab(focusedDocs)
+            assertTrue(c.tabPicked.value)
+            c.updateUseInput("Summarise this page")
+            assertNull(c.startUse())
+            val report = awaitReport(c, main.scheduler)
+            assertEquals(0, requests.count { it.system.startsWith("You plan") })
+            assertTrue(provider.created.isEmpty())
+            assertEquals("t9", report.tabId)
+            assertTrue(browser.stepArgs("screenshot").isNotEmpty() && browser.calls.filter { it.first == ToolNames.STEP }.all { it.second["tab_id"]?.jsonPrimitive?.content == "t9" })
+            // Picking "New tab" is a pick too, and plans.
+            val c2Provider = ai.rever.boss.plugin.dynamic.llmrpa.FakeTabs(listOf(focusedDocs), focused = { "t9" }, create = { "t1" })
+            val c2Requests = mutableListOf<AiRequest>()
+            val c2 = jevPanel(FakeBrowser(tmp(), listOf("DONE")), c2Provider, c2Requests)
+            c2.selectTab(focusedDocs); c2.selectNewTab()
+            c2.updateUseInput("Open the docs"); assertNull(c2.startUse()); awaitReport(c2, main.scheduler)
+            assertEquals(listOf("https://sample.com/"), c2Provider.created)
+        } finally { kotlinx.coroutines.Dispatchers.resetMain() }
+    }
+
+    @Test
+    fun `browser_use with neither url, tab_id nor new_tab plans and opens a new tab, never the focused one`() = runBlocking {
+        val browser = FakeBrowser(tmp(), listOf("DONE"))
+        val requests = mutableListOf<AiRequest>()
+        val opened = mutableListOf<String>()
+        val h = HeadlessRunner(browser, { gateway(requests, plan, typedJson) }, { null }, tabs = { listOf(focusedDocs) }, activeTabId = { "t9" }, drivable = { true },
+            openTab = { u, _ -> opened += u; "t1" }, reveal = { }, locks = TabLocks(), runs = RunHistory(), runLog = testRunLog(), limits = RunLimits(navSettleMs = 0, stepSettleMs = 0, openWaitsMs = listOf(0)))
+        val out = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) { h.browserUse(BrowserUseArgs.parse("""{"task":"find places","wait_s":30}""").getOrThrow()).getOrThrow() }
+        val report = (out as HeadlessRunner.UseOutcome.Finished).report
+        assertEquals(UseStatus.DONE, report.status, report.error)
+        assertEquals(1, requests.count { it.system.startsWith("You plan") })
+        assertEquals(listOf("https://sample.com/"), opened)
+        assertTrue(browser.calls.none { it.second["tab_id"]?.jsonPrimitive?.content == "t9" })
+        // An explicit tab_id acts on that tab, with no plan.
+        val b2 = FakeBrowser(tmp(), listOf("DONE")); val r2 = mutableListOf<AiRequest>(); val o2 = mutableListOf<String>()
+        val h2 = HeadlessRunner(b2, { gateway(r2, plan, typedJson) }, { null }, tabs = { listOf(focusedDocs) }, activeTabId = { "t9" }, drivable = { true },
+            openTab = { u, _ -> o2 += u; "t1" }, reveal = { }, locks = TabLocks(), runs = RunHistory(), runLog = testRunLog(), limits = RunLimits(navSettleMs = 0, stepSettleMs = 0, openWaitsMs = listOf(0)))
+        val out2 = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) { h2.browserUse(BrowserUseArgs.parse("""{"task":"summarise","tab_id":"t9","wait_s":30}""").getOrThrow()).getOrThrow() }
+        assertEquals("t9", (out2 as HeadlessRunner.UseOutcome.Finished).report.tabId)
+        assertEquals(0, r2.count { it.system.startsWith("You plan") }); assertTrue(o2.isEmpty())
+        // The description says so.
+        val schema = LlmrpaMcpToolProvider.BROWSER_USE_SCHEMA
+        assertTrue(schema.contains("Without tab_id the run plans and opens a new tab") && schema.contains("the focused tab is never used"))
     }
 }

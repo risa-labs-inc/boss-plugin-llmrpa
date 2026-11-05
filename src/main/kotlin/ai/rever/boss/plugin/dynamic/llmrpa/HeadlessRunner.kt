@@ -165,7 +165,8 @@ class HeadlessRunner(
 
     /** Waits up to `wait_s` for the run; if it is still going it is left running and its id is returned to poll. */
     internal suspend fun browserUse(a: BrowserUseArgs): Result<UseOutcome> = try {
-        browserUseUnguarded(a, a.newTab || (a.url != null && a.tabId == null))
+        // Only an explicit tab_id acts on an open tab; with none, the run plans (or takes url) and opens a new tab. The focused tab is never used.
+        browserUseUnguarded(a, a.newTab || a.tabId == null)
     } catch (e: CancellationException) {
         throw e
     } catch (e: Throwable) {

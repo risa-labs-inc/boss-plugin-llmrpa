@@ -131,7 +131,12 @@ class LlmrpaComponent(
     val selectedTab: StateFlow<ActiveTabData?> = _selectedTab
 
     /** Until the person picks a tab, the pick follows the focused one: Run acts in their logged-in session. */
-    private var tabPickedByUser = false
+    private val _tabPicked = MutableStateFlow(false)
+    /** The person chose the target (a tab, or New tab) in the picker; the tab that merely has focus is not a choice. */
+    val tabPicked: StateFlow<Boolean> = _tabPicked
+    private var tabPickedByUser: Boolean
+        get() = _tabPicked.value
+        set(v) { _tabPicked.value = v }
 
     private val _newTab = MutableStateFlow(false)
     /** Run opens the right page in a new tab instead of using [selectedTab]. The default when no drivable tab is focused. */
@@ -665,7 +670,8 @@ class LlmrpaComponent(
         if (task.isEmpty()) return "Type what you want done first"
         if (isUsing) return "A request is already running"
         useBlocker()?.let { return it }
-        val tab = _selectedTab.value.takeIf { !_newTab.value }
+        // Only a tab the person picked is acted on; the one that merely has focus is never used. Otherwise the planned page opens in a new tab.
+        val tab = _selectedTab.value.takeIf { !_newTab.value && tabPickedByUser }
         if (tab != null && !canDrive(tab.tabId)) return NO_BROWSER_HINT
         val provider = activeTabsProvider
         if (tab == null && provider == null) return Blocker.TAB.detail

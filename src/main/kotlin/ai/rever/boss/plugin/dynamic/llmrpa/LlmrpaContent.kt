@@ -91,7 +91,8 @@ fun LlmrpaContent(component: LlmrpaComponent) {
     val instruction by component.currentInstruction.collectAsState()
     val tabs by component.availableTabs.collectAsState()
     val selectedTab by component.selectedTab.collectAsState()
-    val newTab by component.newTab.collectAsState()
+    val newTabState by component.newTab.collectAsState()
+    val tabPicked by component.tabPicked.collectAsState()
     val drivable by component.drivable.collectAsState()
     val groups by component.modelGroups.collectAsState()
     val model by component.selectedModel.collectAsState()
@@ -122,7 +123,10 @@ fun LlmrpaContent(component: LlmrpaComponent) {
             val showHost = maxWidth >= HostVisibleWidth
             Column(Modifier.fillMaxSize()) {
                 PanelTabs(component, panelTab, enabled = !active && !component.isUsing)
-                Header(component, TabTarget(tabs, selectedTab, newTab, drivable), groups, model, blocker, compact, showHost, active || component.isUsing,
+                // The Jev tab runs on a new tab (the planned page) unless a tab was picked: the focused tab is not a target there.
+                val jevDefault = panelTab == LlmrpaComponent.PanelTab.JEV && !tabPicked
+                val newTab = newTabState || jevDefault
+                Header(component, TabTarget(tabs, selectedTab.takeIf { !jevDefault }, newTab, drivable), groups, model, blocker, compact, showHost, active || component.isUsing,
                     showModel = panelTab == LlmrpaComponent.PanelTab.TASK)
                 Box(Modifier.fillMaxWidth().height(1.dp).background(RpaTokens.Border))
                 if (panelTab == LlmrpaComponent.PanelTab.JEV) {
@@ -176,7 +180,7 @@ private data class TabTarget(val tabs: List<ActiveTabData>, val selected: Active
     fun canDrive(tabId: String) = StartPages.drivableIn(drivable, tabId)
 }
 
-private const val NEW_TAB_LABEL = "New tab (pick the page for me)"
+private const val NEW_TAB_LABEL = "New tab (planned page)"
 
 /** The tab every action lands on. Always visible, because it is where clicks will happen. */
 @Composable

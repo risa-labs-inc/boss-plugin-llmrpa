@@ -273,8 +273,8 @@ internal class LlmrpaMcpToolProvider(
         internal const val BROWSER_USE_SCHEMA = """{"type":"object","additionalProperties":false,"properties":{""" +
             """"task":{"type":"string","description":"What to do or find, in plain language, e.g. find the top 10 restaurants in Palo Alto"},""" +
             """"url":{"type":"string","description":"http(s) address to open in a new tab; replaces the page the planner would choose (the goal is still planned)"},""" +
-            """"tab_id":{"type":"string","description":"Browser tab to act on; defaults to a new tab when url or new_tab is given, else the focused tab"},""" +
-            """"new_tab":{"type":"boolean","default":false,"description":"Open the planned page in a new tab"},""" +
+            """"tab_id":{"type":"string","description":"Browser tab to act on (explicit; giving it skips planning). Without tab_id the run plans and opens a new tab (as with new_tab: true); the focused tab is never used"},""" +
+            """"new_tab":{"type":"boolean","default":false,"description":"Open the planned page in a new tab. The default whenever tab_id is not given"},""" +
             """"mode":{"type":"string","enum":["vision","dom"],"default":"vision","description":"vision: Jev works from screenshots; dom: the text-list runner of llmrpa_execute"},""" +
             """"model":{"type":"string","description":"Jev model; vision needs one that takes images and boxes (default typesafe/jev-1.14). In dom mode, any model id of llmrpa_execute"},""" +
             """"planner_model":{"type":"string","description":"Chat model id (from Settings → AI Providers) that plans the task and writes text for fields; defaults to the selected one"},""" +
