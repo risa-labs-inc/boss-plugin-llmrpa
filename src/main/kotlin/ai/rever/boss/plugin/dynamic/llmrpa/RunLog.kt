@@ -166,6 +166,7 @@ class RunLogStore(private val dir: File, private val keep: Int = 50) {
         s.consult?.let { put("consult", it) }
         s.dialog?.let { put("dialog", it) }
         s.popup?.let { put("popup", it) }
+        s.snapped?.let { n -> putJsonObject("snapped") { put("from", n.from); put("to", n.to); put("tag", n.tag); put("label", n.label) } }
         if (s.failed) put("failed", true)
     }
 

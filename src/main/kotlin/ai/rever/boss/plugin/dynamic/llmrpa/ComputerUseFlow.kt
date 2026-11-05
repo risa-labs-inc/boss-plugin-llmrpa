@@ -802,29 +802,33 @@ internal class ComputerUseFlow(
                 val (x, y) = Cu.clickPoint(d.box, shot.cssWidth, shot.cssHeight)
                     ?: return base("Jev gave no usable target box", failed = true)
                 val where = base().copy(x = x, y = y, xPct = Cu.percent(d.box!!.centreX), yPct = Cu.percent(d.box.centreY))
-                val click = send("click_at", "$x,$y")
+                // The box goes along so a click that lands beside its target is moved onto it.
+                val click = tools.invoke(ToolNames.STEP, Cu.step(tab, "click_at", "$x,$y", pointer, Cu.snapBox(d.box, shot.cssWidth, shot.cssHeight)))
                 failure(click)?.let { return where.copy(note = it, failed = true) }
-                if (d.op == VisionOp.CLICK) return where
+                val snapped = Cu.parseSnapped(click.json)
+                fun noted(extra: String? = null) = listOfNotNull(snapped?.note, extra).joinToString("; ").ifEmpty { null }
+                val clicked = where.copy(snapped = snapped, note = noted())
+                if (d.op == VisionOp.CLICK) return clicked
                 // TYPE_TEXT: what did the click land on, and which of the goal's texts goes there?
                 val fr = send("focused", withPointer = false)
-                failure(fr)?.let { return where.copy(note = it, failed = true) }
+                failure(fr)?.let { return clicked.copy(note = noted(it), failed = true) }
                 val field = fr.json?.let(Cu::parseFocused)
                 // A native dropdown reports itself as not editable; RPA Engine's type_text answers it by type-ahead.
                 val isSelect = field?.tag.equals("select", ignoreCase = true)
-                if (field == null || (!field.editable && !isSelect)) return where.copy(note = "the box did not land on a text field; nothing typed")
+                if (field == null || (!field.editable && !isSelect)) return clicked.copy(note = noted("the box did not land on a text field; nothing typed"))
                 val sensitive = Cu.sensitiveField(field)
                 // A dropdown offers its own options: the text must be one of them.
                 val listed = if (isSelect) field.options.orEmpty().map { it.trim() }.filter { it.isNotEmpty() }.distinctBy { it.lowercase() }.take(40) else emptyList()
                 val options = listed.ifEmpty { Cu.textOptions(plan.goal, plan.typeValues, url, sensitive, req.inputs) }
                 // A private field never gets text a model wrote, and a dropdown's text is chosen, not written.
                 val mayAsk = req.llmTyping && !sensitive && !isSelect
-                if (options.isEmpty() && !mayAsk) return where.copy(note = "no text from the goal fits '${field.label.take(40)}'")
+                if (options.isEmpty() && !mayAsk) return clicked.copy(note = noted("no text from the goal fits '${field.label.take(40)}'"))
                 val picked = pickText(tools, llm, req, plan, field, options, url, title, history, mayAsk)
-                    ?: return where.copy(note = "no text found for '${field.label.take(40)}'")
+                    ?: return clicked.copy(note = noted("no text found for '${field.label.take(40)}'"))
                 if (sensitive) tools.secrets.add(picked.first)
                 val typed = send("type_text", picked.first)
-                failure(typed)?.let { return where.copy(note = it, failed = true) }
-                return where.copy(text = if (sensitive) Secrets.MASK else picked.first, textSource = if (picked.second) WRITTEN_BY_MODEL else null)
+                failure(typed)?.let { return clicked.copy(note = noted(it), failed = true) }
+                return clicked.copy(text = if (sensitive) Secrets.MASK else picked.first, textSource = if (picked.second) WRITTEN_BY_MODEL else null)
             }
             VisionOp.PRESS_ENTER -> return send("key", "Enter").let { r -> failure(r)?.let { base(it, true) } ?: base() }
             VisionOp.SCROLL_DOWN, VisionOp.SCROLL_UP -> {

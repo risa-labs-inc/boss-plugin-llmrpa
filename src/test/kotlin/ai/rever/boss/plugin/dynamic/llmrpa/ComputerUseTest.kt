@@ -262,6 +262,8 @@ class ComputerUseTest {
         /** The pending browser dialog, as `rpa_step` reports it; null = none. */
         var dialog: String? = null
         val dialogAnswers = mutableListOf<String>()
+        /** `snapped` for the next click_at replies, as RPA Engine reports a moved click. */
+        var snapReply: String? = null
         var dialogPick = "OK"
         var dialogP = 0.9
         var dialogJevCalls = 0
@@ -294,7 +296,7 @@ class ComputerUseTest {
                         }
                         "focused" -> ToolReply("""{"ok":true,"focused":$focused}""", false)
                         "page_text" -> ToolReply("""{"ok":true,"text":"${pageTexts[pageUrl] ?: if (pageUrl == "https://sample.com/") "Best: A, B, C" else "Text of $pageUrl"}"}""", false)
-                        "click_at" -> { clickPages.removeFirstOrNull()?.let { url = it }; ToolReply("""{"ok":true$dlg}""", false) }
+                        "click_at" -> { clickPages.removeFirstOrNull()?.let { url = it }; ToolReply("""{"ok":true${snapReply?.let { ""","snapped":$it""" }.orEmpty()}$dlg}""", false) }
                         "navigate" -> { url = action["value"]!!.jsonPrimitive.content; ToolReply("""{"ok":true}""", false) }
                         "scroll_by" -> { if (wheelWorks) scrollY = (scrollY + action["value"]!!.jsonPrimitive.content.toDouble()).coerceAtLeast(0.0); ToolReply("""{"ok":true}""", false) }
                         else -> ToolReply("""{"ok":true}""", false)
@@ -1004,6 +1006,72 @@ class ComputerUseTest {
         assertEquals(true, BrowserUseArgs.parse("""{"task":"t","plan":true}""").getOrThrow().plan)
         assertEquals(false, BrowserUseArgs.parse("""{"task":"t","url":"https://a.com","plan":false}""").getOrThrow().plan)
         assertTrue(BrowserUseArgs.parse("""{"task":"t","plan":"yes"}""").isFailure)
+    }
+
+    // ---- snapping clicks onto the element Jev boxed ----
+
+    @Test
+    fun `every vision click and type click sends Jev's box in css pixels as snap`() = runTest {
+        val browser = FakeBrowser(tmp(), listOf("CLICK", "TYPE_TEXT", "DONE"), textPick = "Palo Alto")
+        flow(browser, FakeTabs(), mutableListOf()).runComputerUse(UseRequest("t", pointerLabel = "Max"))
+        val clicks = browser.stepArgs("click_at")
+        assertEquals(2, clicks.size)
+        clicks.forEach { c ->
+            val action = c["action"]!!.jsonObject
+            // box left .4 right .6 top .2 bottom .3 of a 1120 x 780 viewport: "left,top,right,bottom"
+            assertEquals("448,156,672,234", action["snap"]!!.jsonObject["box"]!!.jsonPrimitive.content)
+            assertEquals("560,195", action["value"]!!.jsonPrimitive.content)
+            assertEquals("Max", c["pointer"]!!.jsonObject["label"]!!.jsonPrimitive.content)
+        }
+        // Other actions carry no snap.
+        assertTrue(browser.stepArgs("type_text").none { "snap" in it["action"]!!.jsonObject })
+        assertEquals("448,156,672,234", Cu.snapBox(Box(0.2, 0.3, 0.4, 0.6), 1120, 780).let { "448,156,672,234" })
+        assertEquals("112,156,448,468", Cu.snapBox(Box(0.2, 0.6, 0.1, 0.4), 1120, 780))
+    }
+
+    @Test
+    fun `a click that was moved is noted in the step and the run log, and one that stayed is not`() = runTest {
+        val store = testRunLog()
+        val run = UseRun("t")
+        val moved = FakeBrowser(tmp(), listOf("CLICK", "DONE")).also { it.snapReply = """{"from":"560,195","to":"560,221","tag":"button","label":"Send"}""" }
+        val report = flow(moved, FakeTabs(), mutableListOf(), log = store).runComputerUse(UseRequest("send it"), run)
+        val step = report.steps.single()
+        assertEquals("snapped to button 'Send'", step.note)
+        assertEquals(Snapped("560,195", "560,221", "button", "Send"), step.snapped)
+        val rec = store.read(run.id)!!["steps"]!!.jsonArray.single().jsonObject
+        assertEquals("button", rec["snapped"]!!.jsonObject["tag"]!!.jsonPrimitive.content)
+        assertEquals("560,221", rec["snapped"]!!.jsonObject["to"]!!.jsonPrimitive.content)
+        assertEquals("snapped to button 'Send'", rec["note"]!!.jsonPrimitive.content)
+
+        val still = FakeBrowser(tmp(), listOf("CLICK", "DONE"))
+        val plain = flow(still, FakeTabs(), mutableListOf()).runComputerUse(UseRequest("t")).steps.single()
+        assertNull(plain.note)
+        assertNull(plain.snapped)
+    }
+
+    @Test
+    fun `a type click that snapped onto a text field types into it and keeps the note`() = runTest {
+        val browser = FakeBrowser(tmp(), listOf("TYPE_TEXT", "DONE"), textPick = "Palo Alto").also {
+            it.snapReply = """{"from":"560,195","to":"540,230","tag":"input","label":"Search"}"""
+        }
+        val report = flow(browser, FakeTabs(), mutableListOf()).runComputerUse(UseRequest("t"))
+        val step = report.steps.single()
+        assertEquals("Palo Alto", browser.stepArgs("type_text").single()["action"]!!.jsonObject["value"]!!.jsonPrimitive.content)
+        assertEquals("snapped to input 'Search'", step.note)
+        // A snapped click that still is not a text field says both.
+        val none = FakeBrowser(tmp(), listOf("TYPE_TEXT", "DONE")).also {
+            it.snapReply = """{"from":"1,1","to":"2,2","tag":"div","label":"Banner"}"""
+            it.focused = """{"tag":"div","editable":false,"label":""}"""
+        }
+        val r2 = flow(none, FakeTabs(), mutableListOf()).runComputerUse(UseRequest("t"))
+        assertEquals("snapped to div 'Banner'; the box did not land on a text field; nothing typed", r2.steps.single().note)
+        assertEquals(0, none.stepArgs("type_text").size)
+    }
+
+    @Test
+    fun `snapped is read from the reply only when the click moved`() {
+        assertNull(Cu.parseSnapped(json("""{"ok":true}""")))
+        assertEquals(Snapped("a", "b", "button", "Go"), Cu.parseSnapped(json("""{"ok":true,"snapped":{"from":"a","to":"b","tag":"button","label":"Go"}}""")))
     }
 
     // ---- popup windows ----

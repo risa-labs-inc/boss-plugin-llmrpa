@@ -93,6 +93,7 @@ internal data class UseStep(
     val dialog: String? = null,
     /** For a scroll: how far down the page it was left, in percent, known after the next screenshot. */
     val scrolledTo: ScrollPos? = null,
+    val snapped: Snapped? = null,
 ) {
     val where: String? get() = if (xPct != null) "${xPct}%, ${yPct}%" else null
     val description: String
@@ -228,9 +229,13 @@ internal object Cu {
 
     // ---- rpa_step (contract C) ----
 
-    fun step(tabId: String, type: String, value: String? = null, pointer: String? = null): JsonObject = buildJsonObject {
+    fun step(tabId: String, type: String, value: String? = null, pointer: String? = null, snapBox: String? = null): JsonObject = buildJsonObject {
         put("tab_id", tabId)
-        putJsonObject("action") { put("type", type); value?.let { put("value", it) } }
+        putJsonObject("action") {
+            put("type", type); value?.let { put("value", it) }
+            // RPA Engine moves a click that misses an interactive element to the one that best overlaps this box (CSS px: left,top,right,bottom).
+            snapBox?.let { b -> putJsonObject("snap") { put("box", b) } }
+        }
         pointer?.let { label -> putJsonObject("pointer") { put("label", label) } }
     }
 
@@ -247,6 +252,17 @@ internal object Cu {
             maxScrollY = (scroll?.get("max_y") as? JsonPrimitive)?.doubleOrNull,
             contentHash = (s["content_hash"] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() },
         )
+    }
+
+    /** Jev's box in CSS px for `snap`: "left,top,right,bottom". */
+    fun snapBox(box: Box, cssWidth: Int, cssHeight: Int): String =
+        listOf(box.left * cssWidth, box.top * cssHeight, box.right * cssWidth, box.bottom * cssHeight).joinToString(",") { it.roundToInt().toString() }
+
+    /** Where a click moved to, from the `snapped` in a `click_at` result; null when it stayed. */
+    fun parseSnapped(reply: JsonObject?): Snapped? {
+        val sn = reply?.get("snapped") as? JsonObject ?: return null
+        fun str(k: String) = (sn[k] as? JsonPrimitive)?.contentOrNull.orEmpty()
+        return Snapped(str("from"), str("to"), str("tag"), str("label"))
     }
 
     fun parseFocused(reply: JsonObject): Focused? {
@@ -548,6 +564,11 @@ Use ONLY the collected text; if it does not contain the answer, say so. Never in
 }
 
 /** The chat model's plan: [open] pages (the first is driven), the goal for Jev, and text Jev may type. */
+/** A click that was moved onto the interactive element best overlapping Jev's box. */
+internal data class Snapped(val from: String, val to: String, val tag: String, val label: String) {
+    val note: String get() = "snapped to $tag '${label.take(40)}'"
+}
+
 internal data class UsePlan(val open: List<String>, val goal: String, val typeValues: List<String>)
 
 internal data class ConfidenceStat(val op: VisionOp, val n: Int, val min: Double, val median: Double)
