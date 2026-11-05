@@ -106,6 +106,7 @@ class RunLogStore(private val dir: File, private val keep: Int = 50) {
             put("seconds", report?.seconds ?: ((run.priorMs + (now - run.segmentStart.coerceAtLeast(run.startedAt)).coerceAtLeast(0)) / 1000.0))
             put("jev_model", run.jevModel)
             put("llm_model", run.llmModel)
+            run.consultModel?.let { put("consult_model", it) }
             run.tabId?.let { put("tab_id", it) }
             putJsonArray("inputs") { run.inputNames.forEach { add(JsonPrimitive(it)) } }
             run.plan.value?.let { p ->

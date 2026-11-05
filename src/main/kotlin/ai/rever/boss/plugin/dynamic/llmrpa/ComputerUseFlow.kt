@@ -275,6 +275,8 @@ internal data class UseRequest(
     /** Jev's operation confidence below this counts as stuck. */
     val consultBelow: Double = 0.5,
     val maxConsults: Int = 5,
+    /** The model that looks at the screenshot when Jev is stuck; null = the planner if it can see, else the first model that can. No model that can see: no consult. */
+    val consultModel: ModelOption? = null,
     /** Named values the caller gives (a phone number, a code); names that sound private are only typed into private fields. */
     val inputs: Map<String, String> = emptyMap(),
     /** One LLM call that answers the task from the collected text. */
@@ -336,6 +338,8 @@ internal class UseRun(val task: String, val startedAt: Long = System.currentTime
     internal var jevModel: String = ""
     internal var llmModel: String = ""
     internal var mode: String = "vision"
+    /** The model consulted when stuck, once chosen. */
+    internal var consultModel: String? = null
     internal var endedAt: Long? = null
     internal var segmentStart: Long = startedAt
     /** The tabs the run drove, in order. */
@@ -366,7 +370,13 @@ internal class ComputerUseFlow(
     private val popupWaitMs: Long = 1_500,
     private val popupPollMs: Long = 250,
 ) {
-    suspend fun runComputerUse(req: UseRequest, run: UseRun = UseRun(req.task, clock())): UseReport {
+    suspend fun runComputerUse(request: UseRequest, run: UseRun = UseRun(request.task, clock())): UseReport {
+        // "continue" among the inputs says the person did the asked thing in the tab themselves: carry on from the page as it is, with no plan.
+        val continuing = request.inputs.keys.any { it.equals("continue", ignoreCase = true) }
+        val req = if (!continuing) request else request.copy(
+            inputs = request.inputs.filterKeys { !it.equals("continue", ignoreCase = true) }, planWithLlm = false,
+            advice = request.advice + "The person did what the page asked in this tab themselves (logged in, entered a code): continue from the page as it is now",
+        )
         val tools = RecordingTools(rawTools, run.log, clock, run.secrets)
         val llm = UseLlm(gateway, req.llm, run.log, clock)
         val state = FlowState(segmentStart = clock())
@@ -421,6 +431,9 @@ internal class ComputerUseFlow(
         var known: Map<String, String> = emptyMap()
         /** False once `locate_text` proves unsupported, so older engines are not asked every step. */
         var locateWorks = true
+        /** The model consulted when stuck (resolved once), and whether there is none that can see. */
+        var consultLlm: UseLlm? = null
+        var consultResolved = false
         /** The last screenshot that was taken, for a dialog decision (the engine refuses new ones while a dialog waits). */
         var lastShotObj: Shot? = null
         /** locate_text answers by page state and phrase. */
@@ -631,22 +644,32 @@ internal class ComputerUseFlow(
                     }
                 }
             }
+            // The page asks for something only the person can give (a login, a code, payment): stop for them in either mode, before any consult.
+            if (d != null && (d.op == VisionOp.NEEDS_INPUT || d.op == VisionOp.BLOCKED)) {
+                userWall(tools, tab, url, title, explicit = d.op == VisionOp.NEEDS_INPUT)?.let { return it }
+            }
             if (stuck != null) {
-                if (req.onStuck == OnStuck.CONSULT && consults < req.maxConsults) {
-                    consults++
-                    when (val r = consult(req, run, tools, llm, tab, plan, shotView, url, title, steps, stuck)) {
-                        is ConsultResult.Stepped -> {
-                            steps += r.step.copy(index = steps.size + 1, before = now, tabId = tab)
-                            publish()
-                            mark = steps.size
-                            prevHash = null
-                            delay(stepSettleMs)
-                            continue
+                var tail = if (req.onStuck == OnStuck.CONSULT && stuck != Cu.HIDDEN_REASON && consults >= req.maxConsults) " (already consulted ${req.maxConsults} times)" else ""
+                // A hidden tab has no screen to look at, and a model that cannot see would be guessing: neither is consulted.
+                if (req.onStuck == OnStuck.CONSULT && consults < req.maxConsults && stuck != Cu.HIDDEN_REASON) {
+                    val consultLlm = consultLlmFor(req, run, st)
+                    if (consultLlm == null) {
+                        tail = " (no vision-capable model to consult)"
+                    } else {
+                        consults++
+                        when (val r = consult(req, run, tools, consultLlm, tab, plan, shotView, url, title, steps, stuck)) {
+                            is ConsultResult.Stepped -> {
+                                steps += r.step.copy(index = steps.size + 1, before = now, tabId = tab)
+                                publish()
+                                mark = steps.size
+                                prevHash = null
+                                delay(stepSettleMs)
+                                continue
+                            }
+                            is ConsultResult.Stop -> return r.outcome
                         }
-                        is ConsultResult.Stop -> return r.outcome
                     }
                 }
-                val tail = if (req.onStuck == OnStuck.CONSULT) " (already consulted ${req.maxConsults} times)" else ""
                 return Outcome(UseStatus.NEEDS_INPUT, stuck + tail,
                     "Jev is stuck: $stuck. Tell it what to do next, or give it the details it needs (for example a phone number or a code).")
             }
@@ -884,6 +907,31 @@ internal class ComputerUseFlow(
         return added
     }
 
+    /** The model that looks at the screen when Jev is stuck, resolved once; null when none can see (consulting would be blind). */
+    private fun consultLlmFor(req: UseRequest, run: UseRun, st: FlowState): UseLlm? {
+        if (!st.consultResolved) {
+            st.consultResolved = true
+            val pick = Cu.pickConsultModel(req.consultModel, req.llm, runCatching { gateway() }.getOrNull())
+            st.consultLlm = pick?.let { UseLlm(gateway, it, run.log, clock) }
+            run.consultModel = st.consultLlm?.label
+        }
+        return st.consultLlm
+    }
+
+    /**
+     * Whether the page is waiting on the person: Jev said so, or it is blocked while a login, a code or payment details are asked for (an open
+     * dialog's label and the page text say which). Returns the stop, or null when it is an ordinary block.
+     */
+    private suspend fun userWall(tools: RecordingTools, tab: String, url: String, title: String, explicit: Boolean): Outcome? {
+        val modal = runCatching { tools.invoke(ToolNames.OBSERVE, buildJsonObject { put("tab_id", tab) }).json?.let(PageSnapshot::parse)?.modal }.getOrNull()
+        val text = runCatching { readPageText(tools, tab) }.getOrNull()
+        val kind = Cu.wallKind(modal, text)
+        if (kind == null && !explicit) return null
+        val what = kind ?: "provide something only you can"
+        val site = host(url).ifBlank { title }
+        return Outcome(UseStatus.NEEDS_INPUT, "The page asks for something only you can provide ($what)", Cu.needsInputQuestion(site, what))
+    }
+
     // ---- consulting the chat model ----
 
     private sealed interface ConsultResult {
@@ -901,7 +949,8 @@ internal class ComputerUseFlow(
     ): ConsultResult {
         val t0 = System.nanoTime()
         val page = tools.invoke(ToolNames.OBSERVE, buildJsonObject { put("tab_id", tab) }).json?.let(PageSnapshot::parse)
-        val elements = page?.elements.orEmpty().take(MAX_CONSULT_ELEMENTS)
+        // What an open dialog covers cannot be reached from where it is, so it is not offered.
+        val elements = page?.elements.orEmpty().filter { !it.covered }.take(MAX_CONSULT_ELEMENTS)
         val image = if (llm.sees()) runCatching { File(shot.path).readBytes() }.getOrNull() else null
         val user = buildString {
             appendLine("Request: ${req.task.take(2_000)}")
@@ -913,6 +962,7 @@ internal class ComputerUseFlow(
             if (run.advice.isNotEmpty()) appendLine("Advice so far: ${run.advice.takeLast(3).joinToString("; ") { ChatDecider.quote(it, 200) }}")
             if (req.inputs.isNotEmpty()) appendLine("Inputs the person gave (use \"{{name}}\" as a value): " +
                 req.inputs.entries.joinToString(", ") { (k, v) -> if (Cu.secretName(k)) "$k (private)" else "$k=${ChatDecider.quote(v, 60)}" })
+            page?.modal?.let { appendLine("A dialog ${ChatDecider.quote(it)} is open over the page; the elements it covers are left out.") }
             appendLine("Interactive elements (id | role | label):")
             elements.forEach { e ->
                 appendLine("${e.id} | ${e.role} | ${ChatDecider.quote(e.label.orEmpty(), 80)}${if (e.sensitive) " | private field" else ""}${if (e.options.isNotEmpty()) " | options: ${e.options.take(8).joinToString(", ")}" else ""}")
@@ -964,6 +1014,8 @@ internal class ComputerUseFlow(
         val fromInput = a.value?.let { Regex("""\{\{.*}}""").containsMatchIn(it) } == true
         var value = Cu.fillInputs(a.value, req.inputs)
         if (a.value != null && value == null) return "an input named in the value was not given" to true
+        // Never a password, a one-time code or a card: those are for the person.
+        if (a.type == "input" && Cu.consultMayNotType(el.label, el.sensitive)) return "refused: $label is a password, code or card field, which only the person fills" to true
         if (a.type == "input" || a.type == "select") {
             // A private field only takes what the person gave; text a model wrote never goes there. Model-written text needs typing allowed.
             if (a.type == "input" && el.sensitive && !fromInput) return "refused: only a value the person gave goes into $label" to true
@@ -1146,7 +1198,7 @@ internal class ComputerUseFlow(
             llmTokens = run.log.llmTokens.takeIf { it > 0 }, jevModel = req.jevModel, llmModel = llm.label,
             confidences = Cu.confidenceStats(steps.filter { it.op != VisionOp.CONSULT }), screenshotPath = st.lastShot, error = o.error,
             tabId = tab, blocker = blocker, collected = run.store.list, pagesVisited = run.visited.toList(), answer = answer, extract = req.extract,
-            runId = run.id, tabRevealed = run.revealed, tabs = run.tabsUsed.map { t -> t.copy(title = t.title.ifBlank { st.known[t.tabId].orEmpty() }) },
+            runId = run.id, tabRevealed = run.revealed, consultModel = run.consultModel, tabs = run.tabsUsed.map { t -> t.copy(title = t.title.ifBlank { st.known[t.tabId].orEmpty() }) },
         )
         run.report.value = report
         run.endedAt = clock()

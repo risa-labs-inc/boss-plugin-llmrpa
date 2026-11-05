@@ -21,14 +21,21 @@ data class PageElement(
     val selector: SelectorInfo,
     /** The image this element is or wraps (RPA Engine 1.3+), when it is big enough to matter. */
     val imageSrc: String? = null,
+    /** Another element is on top of this one (a dialog's backdrop, a modal): it cannot be clicked from where it is. */
+    val covered: Boolean = false,
 )
 
-data class PageSnapshot(val url: String, val title: String, val elements: List<PageElement>, val truncated: Boolean) {
+data class PageSnapshot(
+    val url: String, val title: String, val elements: List<PageElement>, val truncated: Boolean,
+    /** The label of a dialog or overlay open over the page, when RPA Engine reports one. */
+    val modal: String? = null,
+) {
     companion object {
         fun parse(root: JsonObject): PageSnapshot = PageSnapshot(
             url = root.str("url").orEmpty(),
             title = root.str("title").orEmpty(),
             truncated = (root["truncated"] as? JsonPrimitive)?.booleanOrNull ?: false,
+            modal = (root["modal"] as? JsonObject)?.str("label")?.takeIf { it.isNotBlank() } ?: (root["modal"] as? JsonPrimitive)?.takeIf { it.isString }?.content?.takeIf { it.isNotBlank() },
             elements = (root["elements"] as? JsonArray).orEmpty().mapNotNull { e ->
                 val o = e as? JsonObject ?: return@mapNotNull null
                 val sel = o["selector"] as? JsonObject ?: return@mapNotNull null
@@ -45,6 +52,7 @@ data class PageSnapshot(val url: String, val title: String, val elements: List<P
                     inViewport = (o["in_viewport"] as? JsonPrimitive)?.booleanOrNull ?: true,
                     selector = SelectorInfo(sel.str("type") ?: "css", sel.str("value")),
                     imageSrc = (o["image"] as? JsonObject)?.str("src"),
+                    covered = (o["covered"] as? JsonPrimitive)?.booleanOrNull ?: false,
                 )
             },
         )
@@ -263,7 +271,8 @@ internal object Candidates {
         urls(instruction).filter { it.trimEnd('/') != page.url.trimEnd('/') }.forEach { u ->
             out += Candidate(next(), Candidate.Kind.NAVIGATE, "Go to $u", StepAction("navigate", value = u))
         }
-        for (el in page.elements) {
+        // Under a dialog or overlay, what is covered cannot be reached; offering it would send the run clicking behind the modal.
+        for (el in page.elements.filter { !it.covered }) {
             if (out.size >= MAX - 1) break
             val label = el.label ?: continue
             val quotedLabel = "'${label.take(60)}'"

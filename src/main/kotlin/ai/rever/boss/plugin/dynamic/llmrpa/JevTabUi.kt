@@ -147,6 +147,7 @@ private fun ModelRow(component: LlmrpaComponent, enabled: Boolean) {
     val pointer by component.pointerLabel.collectAsState()
     val llmTyping by component.llmTyping.collectAsState()
     val consult by component.consultWhenStuck.collectAsState()
+    val consultModel by component.consultModel.collectAsState()
     val extract by component.extract.collectAsState()
     var menu by remember { mutableStateOf<String?>(null) }
     FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -178,6 +179,19 @@ private fun ModelRow(component: LlmrpaComponent, enabled: Boolean) {
             }
         }
         OutlineButton("When stuck: ${if (consult) "consult the LLM" else "ask me"}", { component.setConsultWhenStuck(!consult) }, enabled = enabled, tone = Tone.NEUTRAL)
+        Box {
+            OutlineButton("Consult: ${consultModel?.label ?: "auto"}", { menu = "consult"; component.refreshModels() }, enabled = enabled && consult, tone = Tone.NEUTRAL, trailing = "▾")
+            if (menu == "consult") RpaMenu(onDismiss = { menu = null }, width = 300) {
+                MenuHeading("Consult model", "must be able to read images")
+                MenuRow("Automatic", onClick = { menu = null; component.selectConsultModel(null) }, selected = consultModel == null, detail = "the planner if it can see, else one that can")
+                Column(Modifier.heightIn(max = 300.dp).verticalScroll(rememberScrollState())) {
+                    groups.filter { it.kind == ModelOption.Kind.CHAT }.forEach { g ->
+                        MenuHeading(g.providerName)
+                        g.models.take(100).forEach { m -> MenuRow(m.label, onClick = { menu = null; component.selectConsultModel(m) }, selected = m.key == consultModel?.key) }
+                    }
+                }
+            }
+        }
         OutlineButton("Answer with LLM: ${if (extract) "on" else "off"}", { component.setExtract(!extract) }, enabled = enabled, tone = Tone.NEUTRAL)
         OutlineButton("LLM typing: ${if (llmTyping) "on" else "off"}", { component.setLlmTyping(!llmTyping) }, enabled = enabled, tone = Tone.NEUTRAL)
         Box {

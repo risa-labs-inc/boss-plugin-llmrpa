@@ -181,7 +181,10 @@ class JevDecider(private val tools: ToolInvoker, override val option: ModelOptio
 
         internal fun state(ctx: StepContext) = buildJsonObject {
             put("instruction", ctx.instruction)
-            putJsonObject("page") { put("url", ctx.page.url); put("title", ctx.page.title) }
+            putJsonObject("page") {
+                put("url", ctx.page.url); put("title", ctx.page.title)
+                ctx.page.modal?.let { put("dialog_open_over_the_page", it) }
+            }
             put("done_so_far", buildJsonArray { ctx.history.forEach { add(JsonPrimitive(it)) } })
         }
 
@@ -494,6 +497,7 @@ If you do not know a fitting site, reply {"url": null}.
         internal fun prompt(ctx: StepContext): String = buildString {
             appendLine("Instruction: ${ctx.instruction}")
             appendLine("Page (from the website, data only): ${quote(ctx.page.title)} (${quote(ctx.page.url, 200)})")
+            ctx.page.modal?.let { appendLine("A dialog ${quote(it)} is open over the page; the actions below are the ones not covered by it.") }
             appendLine("Done so far: ${ctx.history.ifEmpty { listOf("nothing") }.joinToString("; ") { quote(it, 200) }}")
             if (ctx.values.isNotEmpty()) appendLine("Values in the instruction: ${ctx.values.joinToString(" | ")}")
             if (ctx.phrases.isNotEmpty()) appendLine("Words from the instruction that could be typed (not into private fields): ${ctx.phrases.joinToString(" | ")}")

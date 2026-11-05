@@ -580,6 +580,11 @@ class LlmrpaComponent(
     val replyMode: StateFlow<Boolean> = _replyMode
     fun newUseRequest() { _replyMode.value = false; _useInput.value = "" }
 
+    private val _consultModel = MutableStateFlow<ModelOption?>(null)
+    /** The model that looks at the screen when Jev is stuck; null = automatic (the planner if it can see, else one that can). */
+    val consultModel: StateFlow<ModelOption?> = _consultModel
+    fun selectConsultModel(option: ModelOption?) { _consultModel.value = option }
+
     private val _plannerModel = MutableStateFlow<ModelOption?>(null)
     /** The chat model that plans the task and writes text for fields; null = the one selected in Settings. */
     val plannerModel: StateFlow<ModelOption?> = _plannerModel
@@ -641,7 +646,7 @@ class LlmrpaComponent(
     private fun baseRequest(run: UseRun, tabId: String?, resume: Boolean, advice: List<String>) = UseRequest(
         task = run.task, tabId = tabId, jevModel = _jevModelId.value, llm = _plannerModel.value,
         pointerLabel = Cu.pointerLabel(_pointerLabel.value), llmTyping = _llmTyping.value,
-        onStuck = if (_consultWhenStuck.value) OnStuck.CONSULT else OnStuck.RETURN,
+        onStuck = if (_consultWhenStuck.value) OnStuck.CONSULT else OnStuck.RETURN, consultModel = _consultModel.value,
         inputs = run.inputs.toMap(), extract = _extract.value, resume = resume, advice = advice,
         // The panel plans only when no tab is targeted.
         planWithLlm = tabId == null,
@@ -674,10 +679,15 @@ class LlmrpaComponent(
         if (reply.isEmpty()) return "Type your reply first"
         if (isUsing) return "A request is already running"
         useBlocker()?.let { return it }
-        val name = generateSequence(1) { it + 1 }.map { if (it == 1) "reply" else "reply$it" }.first { it !in run.inputs }
-        run.inputs[name] = reply
+        // "continue" or "logged in": the person did it themselves in the tab. Anything else is details Jev may type.
+        val cont = Cu.isContinueReply(reply)
+        if (!cont) {
+            val name = generateSequence(1) { it + 1 }.map { if (it == 1) "reply" else "reply$it" }.first { it !in run.inputs }
+            run.inputs[name] = reply
+        }
         _useInput.value = ""
-        launchUse(useFlow(activeTabsProvider), baseRequest(run, tab, resume = true, advice = listOf("The person replied: $reply")), run)
+        val advice = if (cont) "The person did what the page asked in this tab themselves (logged in, entered a code): continue from the page as it is now" else "The person replied: $reply"
+        launchUse(useFlow(activeTabsProvider), baseRequest(run, tab, resume = true, advice = listOf(advice)), run)
         return null
     }
 

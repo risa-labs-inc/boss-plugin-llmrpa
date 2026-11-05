@@ -179,19 +179,24 @@ class HeadlessRunner(
         if (newTab && a.tabId != null) return Result.failure(IllegalArgumentException("Pass tab_id or new_tab/url, not both"))
         val page = a.url?.let { StartPages.usable(it, httpsOnly = false) ?: return Result.failure(IllegalArgumentException("url must be an http(s) address with a host and no credentials")) }
         val tab = if (newTab) null else pickTab(a.tabId).getOrElse { return Result.failure(it) }
-        val llm = a.plannerModel?.let { id ->
-            val chat = withContext(Dispatchers.IO) { ModelDirectory(tools, llmProvider, gateway).load() }.flatMap { it.models }.filter { it.kind == ModelOption.Kind.CHAT }
-            chat.firstOrNull { it.key == id } ?: chat.filter { it.modelId == id }.let { same ->
-                if (same.size > 1) return Result.failure(IllegalArgumentException("'$id' is offered by more than one provider. Pass one of: ${same.joinToString { it.key }}"))
-                same.singleOrNull()
-            } ?: return Result.failure(IllegalArgumentException("Unknown planner_model '$id'. Pass a chat model id configured in Settings → AI Providers."))
-        }
+        val chat = if (a.plannerModel == null && a.consultModel == null) emptyList()
+            else withContext(Dispatchers.IO) { ModelDirectory(tools, llmProvider, gateway).load() }.flatMap { it.models }.filter { it.kind == ModelOption.Kind.CHAT }
+        fun resolveChat(id: String, arg: String): Result<ModelOption> =
+            chat.firstOrNull { it.key == id }?.let { Result.success(it) } ?: chat.filter { it.modelId == id }.let { same ->
+                when {
+                    same.size > 1 -> Result.failure(IllegalArgumentException("'$id' is offered by more than one provider. Pass one of: ${same.joinToString { it.key }}"))
+                    same.isEmpty() -> Result.failure(IllegalArgumentException("Unknown $arg '$id'. Pass a chat model id configured in Settings → AI Providers."))
+                    else -> Result.success(same.single())
+                }
+            }
+        val llm = a.plannerModel?.let { resolveChat(it, "planner_model").getOrElse { e -> return Result.failure(e) } }
+        val consultModel = a.consultModel?.let { resolveChat(it, "consult_model").getOrElse { e -> return Result.failure(e) } }
         val flow = ComputerUseFlow(tools, gateway, LockedTabs(locks, TabLocks.Owner.HEADLESS, openTab, reveal, list = { tabs().filter { it.url != null }.associate { it.tabId to it.title } }),
             openWaitsMs = limits.openWaitsMs, settleMs = limits.navSettleMs, stepSettleMs = limits.stepSettleMs, runLog = runLog)
         val request = UseRequest(
             task = a.task, url = page, tabId = tab?.tabId, jevModel = a.model ?: Cu.VISION_DEFAULT_MODEL, llm = llm,
             pointerLabel = Cu.pointerLabel(a.displayName), llmTyping = a.llmTyping,
-            onStuck = a.onStuck, consultBelow = a.consultBelow, maxConsults = a.maxConsults, inputs = a.inputs, extract = a.extract,
+            onStuck = a.onStuck, consultBelow = a.consultBelow, maxConsults = a.maxConsults, consultModel = consultModel, inputs = a.inputs, extract = a.extract,
             maxSteps = a.maxSteps, timeoutMs = a.timeoutS * 1000L, confirm = null,
             // A caller that names the page needs no plan; `plan` forces one either way.
             planWithLlm = a.plan ?: (page == null && tab == null),

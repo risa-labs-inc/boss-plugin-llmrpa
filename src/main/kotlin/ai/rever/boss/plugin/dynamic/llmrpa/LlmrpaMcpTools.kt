@@ -91,7 +91,7 @@ internal class LlmrpaMcpToolProvider(
                     "It opens a new tab at the planned page (or url), or acts on tab_id; only tabs in the space on screen can be driven. " +
                     "The run keeps its tab in front while it works: if the tab is hidden the screenshot brings it back first (a hidden tab's screen is stale), so the user should not switch away. " +
                     "It never waits for a person. When it is stuck (no progress, Jev blocked or unsure) it stops with status needs_input and a blocker, leaving the tab open: " +
-                    "call it again with the same tab_id, task and inputs (named values such as phone or code) to continue where it stopped; with on_stuck consult it asks the planner chat model what to do first. " +
+                    "call it again with the same tab_id, task and inputs (named values such as phone or code) to continue where it stopped; when the page asks for a login, a code or payment (status needs_input, nothing is consulted) the person does it in the tab and you call again with inputs {\"continue\":\"yes\"} to resume without replanning; with on_stuck consult it asks the planner chat model what to do first. " +
                     "Information on the pages it passes is saved in collected[]. " +
                     "A long task does not block the call: after wait_s (default 45 s) it returns {ok:false, status:\"running\", run_id, tab_id, steps so far} and the run goes on in the background; poll browser_use_status with run_id until it returns the final report. " +
                     "Returns JSON {ok, status (done|needs_input|blocked|budget|error|running), run_id, summary (built from the steps, not a model's opinion), url, title, tab_id, page_text, collected[] (text saved from pages), pages_visited[], blocker {reason, question, url, title, tab_id, screenshot_path, step} when it stopped, answer (only with extract), steps, seconds, jev_calls, " +
@@ -282,6 +282,7 @@ internal class LlmrpaMcpToolProvider(
             """"on_stuck":{"type":"string","enum":["return","consult"],"default":"return","description":"When stuck: return stops with status needs_input and a blocker (the tab stays open; call again with the same tab_id, task and inputs to continue); consult asks the planner chat model what to do, up to max_consults times"},""" +
             """"consult_below":{"type":"number","minimum":0,"maximum":1,"default":0.5,"description":"Jev operation confidence below this counts as stuck"},""" +
             """"max_consults":{"type":"integer","minimum":0,"maximum":10,"default":5},""" +
+            """"consult_model":{"type":"string","description":"Chat model that looks at the screenshot when Jev is stuck (a model that can see images). Default: the planner if it can, else the first available that can; with none, the run returns instead of consulting a model that cannot see"},""" +
             """"inputs":{"type":"object","additionalProperties":{"type":"string"},"description":"Named values for Jev to type when asked, e.g. {\"phone\":\"...\"}; names that sound private (password, code, otp, card) are only typed into private fields and masked in the record"},""" +
             """"extract":{"type":"boolean","default":false,"description":"One LLM call answers the task only from the collected and final page text and returns it as answer"},""" +
             """"plan":{"type":"boolean","description":"Ask the planner chat model for the goal and page first. Default: false when url or tab_id is given (the task is the goal), true otherwise"},""" +
@@ -418,6 +419,7 @@ internal data class BrowserUseArgs(
     val onStuck: OnStuck,
     val consultBelow: Double,
     val maxConsults: Int,
+    val consultModel: String?,
     val inputs: Map<String, String>,
     val extract: Boolean,
     /** Plan with the chat model; null = only when no url or tab_id was given. */
@@ -429,7 +431,7 @@ internal data class BrowserUseArgs(
     val includeText: Boolean,
 ) {
     companion object {
-        private val KEYS = setOf("task", "url", "tab_id", "new_tab", "mode", "model", "planner_model", "display_name", "llm_typing", "on_stuck", "consult_below", "max_consults", "inputs", "extract", "plan", "max_steps", "timeout_s", "wait_s", "include_text")
+        private val KEYS = setOf("task", "url", "tab_id", "new_tab", "mode", "model", "planner_model", "display_name", "llm_typing", "on_stuck", "consult_below", "max_consults", "consult_model", "inputs", "extract", "plan", "max_steps", "timeout_s", "wait_s", "include_text")
 
         fun parse(raw: String): Result<BrowserUseArgs> = runCatching {
             val root = Json.parseToJsonElement(raw.ifBlank { "{}" }) as? JsonObject ?: error("Arguments must be a JSON object")
@@ -465,7 +467,7 @@ internal data class BrowserUseArgs(
                 url = str("url"), tabId = str("tab_id"), newTab = bool("new_tab", false), mode = mode,
                 model = str("model"), plannerModel = str("planner_model"), displayName = str("display_name") ?: "Jev", llmTyping = bool("llm_typing", true),
                 onStuck = if (stuck == "consult") OnStuck.CONSULT else OnStuck.RETURN, consultBelow = dbl("consult_below", 0.5, 0.0, 1.0),
-                maxConsults = int("max_consults", 5, 0, 10), inputs = inputs, extract = bool("extract", false),
+                maxConsults = int("max_consults", 5, 0, 10), consultModel = str("consult_model"), inputs = inputs, extract = bool("extract", false),
                 plan = if (root["plan"] == null) null else bool("plan", false),
                 maxSteps = int("max_steps", 25, 1, 60), timeoutS = int("timeout_s", 180, 10, 600), waitS = int("wait_s", 45, 5, 600), includeText = bool("include_text", true),
             )

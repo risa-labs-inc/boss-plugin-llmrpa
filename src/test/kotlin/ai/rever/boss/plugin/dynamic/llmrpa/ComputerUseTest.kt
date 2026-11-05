@@ -234,7 +234,7 @@ class ComputerUseTest {
     fun `the browser_use schema is closed and lists every argument`() {
         val schema = json(LlmrpaMcpToolProvider.BROWSER_USE_SCHEMA)
         assertEquals(false, (schema["additionalProperties"] as JsonPrimitive).content.toBoolean())
-        assertEquals(setOf("task", "url", "tab_id", "new_tab", "mode", "model", "planner_model", "display_name", "max_steps", "timeout_s", "include_text", "llm_typing", "on_stuck", "consult_below", "max_consults", "inputs", "extract", "plan", "wait_s"),
+        assertEquals(setOf("task", "url", "tab_id", "new_tab", "mode", "model", "planner_model", "display_name", "max_steps", "timeout_s", "include_text", "llm_typing", "on_stuck", "consult_below", "max_consults", "inputs", "extract", "plan", "wait_s", "consult_model"),
             schema["properties"]!!.jsonObject.keys)
         assertEquals("task", schema["required"]!!.jsonArray.single().jsonPrimitive.content)
     }
@@ -300,6 +300,7 @@ class ComputerUseTest {
         /** Tabs whose calls fail as closed. */
         val deadTabs = mutableSetOf<String>()
         var jevDelayMs = 0L
+        var modalLabel: String? = null
         /** One entry per screenshot call, in order: (revealed, visible) as the engine reports them; none = the plain reply. */
         val screenshotFlags = ArrayDeque<Pair<Boolean?, Boolean?>>()
         var pageTextFn: (() -> String)? = null
@@ -320,7 +321,7 @@ class ComputerUseTest {
             return when (toolName) {
                 ToolNames.OBSERVE -> if (tabArg in observeFailsFor) ToolReply("""{"error":{"code":"NO_BROWSER","message":"observe does not work on popup windows"}}""", true)
                     else if (strictDialogs && dialog != null) { refused += "observe"; ToolReply("""{"ok":false,"error":"A browser dialog is waiting","dialog":$dialog}""", false) }
-                    else ToolReply("""{"tab_id":"$tabArg","url":"$pageUrl","title":"S","elements":$elements}""", false)
+                    else ToolReply("""{"tab_id":"$tabArg","url":"$pageUrl","title":"S"${modalLabel?.let { ""","modal":{"label":"$it"}""" }.orEmpty()},"elements":$elements}""", false)
                 ToolNames.STEP -> {
                     val action = a["action"]!!.jsonObject
                     val actionType = action["type"]!!.jsonPrimitive.content
@@ -397,7 +398,10 @@ class ComputerUseTest {
 
     private var consultReplies = ArrayDeque<String>()
     private var extractReply = """{"answer":"A, B and C"}"""
-    private var gatewayCaps = emptySet<String>()
+    private val defaultCaps = setOf(AiGatewayAPI.CAPABILITY_VISION, AiGatewayAPI.CAPABILITY_PROVIDER_OVERRIDE)
+    private var gatewayCaps = defaultCaps
+    private var activeInfo = AiModelInfo("OPENAI", "OpenAI", "gpt-5")
+    private var catalog = emptyList<ai.rever.boss.plugin.api.AiProviderModels>()
 
     private fun gateway(requests: MutableList<AiRequest>, planner: String, typed: String) = object : AiGatewayAPI {
         override suspend fun complete(request: AiRequest): Result<AiReply> {
@@ -413,7 +417,8 @@ class ComputerUseTest {
         override suspend fun runAgent(request: AiRequest, tools: List<AiToolSpec>, budget: AiBudget, invoke: suspend (AiToolCall) -> AiToolOutcome): Result<AiAgentResult> =
             Result.failure(UnsupportedOperationException())
         override fun capabilities(): Set<String> = gatewayCaps
-        override fun activeModel(): AiModelInfo? = AiModelInfo("OPENAI", "OpenAI", "gpt-5")
+        override fun activeModel(): AiModelInfo? = activeInfo
+        override fun availableModels(): List<ai.rever.boss.plugin.api.AiProviderModels> = catalog
     }
 
     private val plan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"Search Palo Alto restaurants and read the top ones","type_values":["Palo Alto"]}"""
@@ -682,18 +687,18 @@ class ComputerUseTest {
     }
 
     @Test
-    fun `the screenshot goes with the consult only when the gateway can see`() = runTest {
+    fun `the screenshot goes with the consult, and without a gateway that can see nothing is consulted`() = runTest {
         consultReplies = ArrayDeque(listOf("""{"give_up":"x"}"""))
         val seen = mutableListOf<AiRequest>()
-        gatewayCaps = setOf(AiGatewayAPI.CAPABILITY_VISION)
-        try {
-            flow(FakeBrowser(tmp(), listOf("BLOCKED")), FakeTabs(), seen).runComputerUse(UseRequest("t", onStuck = OnStuck.CONSULT))
-        } finally { gatewayCaps = emptySet() }
+        flow(FakeBrowser(tmp(), listOf("BLOCKED")), FakeTabs(), seen).runComputerUse(UseRequest("t", onStuck = OnStuck.CONSULT))
         assertEquals(1, seen.single { it.system.startsWith("You help") }.messages.single().images.size)
-        consultReplies = ArrayDeque(listOf("""{"give_up":"x"}"""))
+        // A gateway with no vision: a blind consult is no help, so there is none and the run returns.
+        gatewayCaps = setOf(AiGatewayAPI.CAPABILITY_PROVIDER_OVERRIDE)
         val blind = mutableListOf<AiRequest>()
-        flow(FakeBrowser(tmp(), listOf("BLOCKED")), FakeTabs(), blind).runComputerUse(UseRequest("t", onStuck = OnStuck.CONSULT))
-        assertEquals(0, blind.single { it.system.startsWith("You help") }.messages.single().images.size)
+        val r = try { flow(FakeBrowser(tmp(), listOf("BLOCKED")), FakeTabs(), blind).runComputerUse(UseRequest("t", onStuck = OnStuck.CONSULT)) } finally { gatewayCaps = defaultCaps }
+        assertEquals(0, blind.count { it.system.startsWith("You help") })
+        assertEquals(UseStatus.NEEDS_INPUT, r.status)
+        assertTrue(r.error!!.contains("no vision-capable model to consult"))
     }
 
     @Test
@@ -751,10 +756,10 @@ class ComputerUseTest {
         val (b1, r1) = run("""{"action":{"type":"input","element":"e3","value":"hunter2"}}""")
         assertEquals(0, b1.stepArgs("input").size)
         assertTrue(r1.steps.first().description.contains("refused"))
-        // A value the person gave goes in, allowed for the private field and masked everywhere.
+        // Even a value the person gave never goes into a private field through a consult: credentials are for them.
         val (b2, r2) = run("""{"action":{"type":"input","element":"e3","value":"{{password}}"}}""", mapOf("password" to "s3cret!"))
-        assertEquals("s3cret!", b2.stepArgs("input").single()["action"]!!.jsonObject["value"]!!.jsonPrimitive.content)
-        assertEquals(true, b2.stepArgs("input").single()["allow_sensitive"]!!.jsonPrimitive.content.toBoolean())
+        assertEquals(0, b2.stepArgs("input").size)
+        assertTrue(r2.steps.first().description.contains("refused"))
         assertFalse(r2.steps.first().description.contains("s3cret!"))
         // A named input that was not given is refused.
         val (b3, _) = run("""{"action":{"type":"input","element":"e2","value":"{{phone}}"}}""")
@@ -1741,7 +1746,7 @@ class ComputerUseTest {
         try {
             val b = FakeBrowser(tmp(), listOf("CLICK", "DONE")).also { x -> x.strictDialogs = true; x.armedDialogOnClick = confirmDialog; x.dialogP = 0.6; x.dialogConfidence = 0.1 }
             flow(b, FakeTabs(), requests).runComputerUse(UseRequest("t", onStuck = OnStuck.CONSULT), run)
-        } finally { gatewayCaps = emptySet() }
+        } finally { gatewayCaps = defaultCaps }
         val rendered = run.log.entries.value.first { it.name == "render dialog" }.image!!
         val image = requests.single { it.system.startsWith("You help a browser agent") }.messages.single().images.single()
         assertTrue(image.bytes.contentEquals(java.io.File(rendered).readBytes()))
@@ -1908,18 +1913,14 @@ class ComputerUseTest {
     }
 
     @Test
-    fun `a hidden tab under consult mode asks the chat model without an image and goes on`() = runTest {
-        consultReplies = ArrayDeque(listOf("""{"hint":"the tab is back"}"""))
-        gatewayCaps = setOf(AiGatewayAPI.CAPABILITY_VISION)
+    fun `a hidden tab is not consulted either, there is no screen to look at`() = runTest {
         val requests = mutableListOf<AiRequest>()
         val browser = FakeBrowser(tmp(), listOf("DONE")).also { it.screenshotFlags += (false to false); it.screenshotFlags += (false to false) }
-        val report = try { flow(browser, FakeTabs(), requests).runComputerUse(UseRequest("t", onStuck = OnStuck.CONSULT)) } finally { gatewayCaps = emptySet() }
-        assertEquals(UseStatus.DONE, report.status, report.error)
-        val consult = requests.single { it.system.startsWith("You help a browser agent") }
-        assertEquals(0, consult.messages.single().images.size)
-        assertTrue(consult.messages.single().text.contains("Why Jev is stuck: the tab is not visible"))
-        assertEquals(1, browser.jevCalls) // asked once the tab was readable
-        assertEquals(VisionOp.CONSULT, report.steps.single().op)
+        val report = flow(browser, FakeTabs(), requests).runComputerUse(UseRequest("t", onStuck = OnStuck.CONSULT))
+        assertEquals(UseStatus.NEEDS_INPUT, report.status)
+        assertEquals(Cu.HIDDEN_REASON, report.blocker!!.reason)
+        assertEquals(0, requests.count { it.system.startsWith("You help a browser agent") })
+        assertEquals(0, browser.jevCalls)
     }
 
     @Test
@@ -1929,6 +1930,199 @@ class ComputerUseTest {
                 openTab = { _, _ -> null }, reveal = { }, locks = TabLocks(), runs = RunHistory(), runLog = testRunLog()),
             runs = RunHistory(), runLog = testRunLog())
         assertTrue(provider.tools().first { it.name == "browser_use" }.description.contains("keeps its tab in front while it works"))
+    }
+
+    // ---- no blind consults, things only the person can give, continuing, covered elements ----
+
+    private fun cliModel() = ModelOption(ModelOption.Kind.CHAT, "CLAUDE_CLI", "Claude Code CLI", "Claude Code CLI")
+    private fun providerModels(id: String, name: String, vararg models: String) =
+        ai.rever.boss.plugin.api.AiProviderModels(id, name, models.map { ai.rever.boss.plugin.api.AiAvailableModel(it, it, null) })
+
+    @Test
+    fun `a model that cannot see is not consulted, the planner is used if it can see, else the first that can, else nobody`() {
+        val vision = setOf(AiGatewayAPI.CAPABILITY_VISION, AiGatewayAPI.CAPABILITY_PROVIDER_OVERRIDE)
+        fun api(caps: Set<String>, active: AiModelInfo?, models: List<ai.rever.boss.plugin.api.AiProviderModels>) = object : AiGatewayAPI {
+            override suspend fun complete(request: AiRequest): Result<AiReply> = Result.failure(UnsupportedOperationException())
+            override fun stream(request: AiRequest): Flow<AiChunk> = emptyFlow()
+            override suspend fun runAgent(request: AiRequest, tools: List<AiToolSpec>, budget: AiBudget, invoke: suspend (AiToolCall) -> AiToolOutcome): Result<AiAgentResult> = Result.failure(UnsupportedOperationException())
+            override fun capabilities() = caps
+            override fun activeModel() = active
+            override fun availableModels() = models
+        }
+        val gpt = ModelOption(ModelOption.Kind.CHAT, "OPENAI", "OpenAI", "gpt-5")
+        val cliActive = AiModelInfo("CLAUDE_CLI", "Claude Code CLI", "Claude Code CLI")
+        val models = listOf(providerModels("CLAUDE_CLI", "Claude Code CLI", "Claude Code CLI"), providerModels("OPENAI", "OpenAI", "gpt-4.1-mini", "gpt-5"))
+        // The caller's own choice, trusted.
+        assertEquals(cliModel(), Cu.pickConsultModel(cliModel(), null, api(vision, cliActive, models)))
+        // The planner sees: it is used. The planner is a CLI: the first model that can see.
+        assertEquals(gpt, Cu.pickConsultModel(null, gpt, api(vision, cliActive, models)))
+        assertEquals("gpt-4.1-mini", Cu.pickConsultModel(null, cliModel(), api(vision, cliActive, models))!!.modelId)
+        // No planner chosen: the active model stands in for it.
+        assertEquals("gpt-4.1-mini", Cu.pickConsultModel(null, null, api(vision, cliActive, models))!!.modelId)
+        // Nothing can see, the gateway cannot take images, or it can only route to the active model: nobody.
+        assertNull(Cu.pickConsultModel(null, cliModel(), api(vision, cliActive, listOf(models[0]))))
+        assertNull(Cu.pickConsultModel(null, cliModel(), api(setOf(AiGatewayAPI.CAPABILITY_PROVIDER_OVERRIDE), cliActive, models)))
+        assertNull(Cu.pickConsultModel(null, cliModel(), api(setOf(AiGatewayAPI.CAPABILITY_VISION), cliActive, models)))
+        assertNull(Cu.pickConsultModel(null, null, null))
+        assertFalse(Cu.mayBeVision("Claude Code CLI", "Claude Code CLI"))
+        assertTrue(Cu.mayBeVision("Anthropic", "claude-sonnet-4"))
+        assertTrue(Cu.mayBeVision("OpenRouter", "google/gemini-2.5-pro"))
+        assertFalse(Cu.mayBeVision("Local", "llama-3-8b"))
+    }
+
+    @Test
+    fun `a stuck run whose planner cannot see consults a model that can, with the image, and records which`() = runTest {
+        activeInfo = AiModelInfo("CLAUDE_CLI", "Claude Code CLI", "Claude Code CLI")
+        catalog = listOf(providerModels("CLAUDE_CLI", "Claude Code CLI", "Claude Code CLI"), providerModels("OPENAI", "OpenAI", "gpt-5"))
+        consultReplies = ArrayDeque(listOf("""{"hint":"go"}"""))
+        val requests = mutableListOf<AiRequest>()
+        val run = UseRun("t")
+        val report = try {
+            flow(FakeBrowser(tmp(), listOf("BLOCKED", "DONE")), FakeTabs(), requests).runComputerUse(UseRequest("t", onStuck = OnStuck.CONSULT, llm = cliModel()), run)
+        } finally { activeInfo = AiModelInfo("OPENAI", "OpenAI", "gpt-5"); catalog = emptyList() }
+        assertEquals(UseStatus.DONE, report.status, report.error)
+        val consult = requests.single { it.system.startsWith("You help a browser agent") }
+        assertEquals("gpt-5", consult.extras[AiRequest.EXTRAS_KEY_MODEL_OVERRIDE])
+        assertEquals("OPENAI", consult.extras[AiRequest.EXTRAS_KEY_PROVIDER_ID])
+        assertEquals(1, consult.messages.single().images.size)
+        // The plan and the typing still go to the planner.
+        assertEquals("Claude Code CLI", requests.first { it.system.startsWith("You plan") }.extras[AiRequest.EXTRAS_KEY_MODEL_OVERRIDE])
+        assertEquals("OpenAI gpt-5", report.consultModel)
+        assertEquals("OpenAI gpt-5", report.toJson()["consult_model"]!!.jsonPrimitive.content)
+        assertTrue(report.steps.single().description.startsWith("Consulted OpenAI gpt-5"))
+        assertEquals("OpenAI gpt-5", store(run))
+    }
+
+    private fun store(run: UseRun) = testRunLog().also { it.begin(run) }.read(run.id)!!["consult_model"]!!.jsonPrimitive.content
+
+    @Test
+    fun `with no model that can see the run returns saying so instead of consulting a blind one, and an explicit consult model is used`() = runTest {
+        activeInfo = AiModelInfo("CLAUDE_CLI", "Claude Code CLI", "Claude Code CLI")
+        catalog = listOf(providerModels("CLAUDE_CLI", "Claude Code CLI", "Claude Code CLI"))
+        try {
+            val requests = mutableListOf<AiRequest>()
+            val report = flow(FakeBrowser(tmp(), listOf("BLOCKED")), FakeTabs(), requests).runComputerUse(UseRequest("t", onStuck = OnStuck.CONSULT, llm = cliModel()))
+            assertEquals(0, requests.count { it.system.startsWith("You help a browser agent") })
+            assertEquals(UseStatus.NEEDS_INPUT, report.status)
+            assertTrue(report.error!!.contains("no vision-capable model to consult"))
+            // The caller picks one: used as given.
+            consultReplies = ArrayDeque(listOf("""{"give_up":"x"}"""))
+            val explicit = mutableListOf<AiRequest>()
+            flow(FakeBrowser(tmp(), listOf("BLOCKED")), FakeTabs(), explicit).runComputerUse(UseRequest("t", onStuck = OnStuck.CONSULT, llm = cliModel(),
+                consultModel = ModelOption(ModelOption.Kind.CHAT, "OPENAI", "OpenAI", "my-vision-model")))
+            assertEquals("my-vision-model", explicit.single { it.system.startsWith("You help a browser agent") }.extras[AiRequest.EXTRAS_KEY_MODEL_OVERRIDE])
+        } finally { activeInfo = AiModelInfo("OPENAI", "OpenAI", "gpt-5"); catalog = emptyList() }
+    }
+
+    private val loginModal = "Login"
+    private val loginText = "Login\nEnter your phone number\nSend one time password\nContinue with Email\nSign in with Google"
+
+    @Test
+    fun `a login modal stops for the person in both modes, before any consult, whether Jev says blocked or needs input`() = runTest {
+        for (mode in listOf(OnStuck.RETURN, OnStuck.CONSULT)) for (op in listOf("BLOCKED", "NEEDS_INPUT")) {
+            val browser = FakeBrowser(tmp(), listOf(op)).also { it.modalLabel = loginModal; it.pageTextFn = { loginText } }
+            val requests = mutableListOf<AiRequest>()
+            val report = flow(browser, FakeTabs(), requests).runComputerUse(UseRequest("order a cake", onStuck = mode))
+            assertEquals(UseStatus.NEEDS_INPUT, report.status, "$mode $op")
+            assertEquals(0, requests.count { it.system.startsWith("You help a browser agent") }, "no consult in $mode")
+            val q = report.blocker!!.question!!
+            assertTrue(q.contains("sample.com is asking you to enter a verification code") || q.contains("is asking you to"), q)
+            assertTrue(q.contains("Do it yourself in this tab (it's your browser), then reply 'continue'"), q)
+            assertTrue(q.contains("Or reply with the details (e.g. a phone number) and Jev will type them."), q)
+            assertEquals("t1", report.blocker!!.tabId)
+        }
+        // A plain login wall (no code or payment): "log in".
+        val plain = FakeBrowser(tmp(), listOf("BLOCKED")).also { it.modalLabel = "Sign in to continue"; it.pageTextFn = { "Sign in\nEmail\nPassword" } }
+        val r = flow(plain, FakeTabs(), mutableListOf()).runComputerUse(UseRequest("t"))
+        assertTrue(r.blocker!!.question!!.startsWith("sample.com is asking you to log in."), r.blocker!!.question)
+        // Blocked with a login link in an ordinary page (no modal) is an ordinary block: consulted as before.
+        consultReplies = ArrayDeque(listOf("""{"give_up":"x"}"""))
+        val menu = FakeBrowser(tmp(), listOf("BLOCKED")).also { it.pageTextFn = { "Home\nLogin\nSign up" } }
+        val req = mutableListOf<AiRequest>()
+        flow(menu, FakeTabs(), req).runComputerUse(UseRequest("t", onStuck = OnStuck.CONSULT))
+        assertEquals(1, req.count { it.system.startsWith("You help a browser agent") })
+        // A code or card on the page counts without a modal; NEEDS_INPUT alone, with nothing recognised, still stops.
+        val pay = FakeBrowser(tmp(), listOf("BLOCKED")).also { it.pageTextFn = { "Pay now\nCard number\nCVV" } }
+        assertTrue(flow(pay, FakeTabs(), mutableListOf()).runComputerUse(UseRequest("t")).blocker!!.question!!.contains("enter payment details"))
+        val odd = FakeBrowser(tmp(), listOf("NEEDS_INPUT"))
+        assertTrue(flow(odd, FakeTabs(), mutableListOf()).runComputerUse(UseRequest("t")).blocker!!.question!!.contains("provide something only you can"))
+        assertTrue(Cu.OPERATIONS.getValue("NEEDS_INPUT").contains("sign-in or login, a verification code or OTP, payment details, an address"))
+    }
+
+    @Test
+    fun `a consult never types into a password, code or card field`() = runTest {
+        for ((label, sensitive) in listOf("Password" to false, "Enter OTP" to false, "Card number" to false, "Phone" to true)) {
+            consultReplies = ArrayDeque(listOf("""{"action":{"type":"input","element":"e2","value":"{{phone}}"}}""", """{"give_up":"x"}"""))
+            val b = FakeBrowser(tmp(), listOf("BLOCKED")).also {
+                it.elements = """[{"id":"e2","role":"textbox","tag":"input","label":"$label","options":null,"sensitive":$sensitive,"in_viewport":true,"selector":{"type":"css","value":"#f"}}]"""
+            }
+            val r = flow(b, FakeTabs(), mutableListOf()).runComputerUse(UseRequest("t", onStuck = OnStuck.CONSULT, inputs = mapOf("phone" to "555")))
+            assertEquals(0, b.stepArgs("input").size, label)
+            assertTrue(r.steps.first().description.contains("refused"), label)
+        }
+        assertTrue(Cu.CONSULT_SYSTEM.contains("Never type into a password, one-time code or card field"))
+        // An ordinary field is still fine.
+        consultReplies = ArrayDeque(listOf("""{"action":{"type":"input","element":"e2","value":"{{phone}}"}}"""))
+        val ok = FakeBrowser(tmp(), listOf("BLOCKED", "DONE"))
+        flow(ok, FakeTabs(), mutableListOf()).runComputerUse(UseRequest("t", onStuck = OnStuck.CONSULT, inputs = mapOf("phone" to "555")))
+        assertEquals("555", ok.stepArgs("input").single()["action"]!!.jsonObject["value"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `replying continue resumes the same run on the same tab with a fresh screenshot and no replan`() = runTest {
+        // Unit: what counts as "I did it myself".
+        listOf("continue", "Done", "logged in", "I'm logged in", "i have signed in", "ok", "Continue.").forEach { assertTrue(Cu.isContinueReply(it), it) }
+        listOf("555 0100", "my phone is 555", "continue with email please", "").forEach { assertFalse(Cu.isContinueReply(it), it) }
+        // The run stops at a login wall; the person logs in; the same run continues from the page as it is, with no plan call.
+        val run = UseRun("order a cake")
+        val wall = FakeBrowser(tmp(), listOf("NEEDS_INPUT")).also { it.modalLabel = loginModal; it.pageTextFn = { loginText } }
+        val first = flow(wall, FakeTabs(), mutableListOf()).runComputerUse(UseRequest("order a cake"), run)
+        assertEquals(UseStatus.NEEDS_INPUT, first.status)
+        val tab = first.blocker!!.tabId!!
+        val after = FakeBrowser(tmp(), listOf("CLICK", "DONE"))
+        val requests = mutableListOf<AiRequest>()
+        val tabs = FakeTabs()
+        val second = flow(after, tabs, requests).runComputerUse(UseRequest("order a cake", tabId = tab, resume = true), run)
+        assertEquals(UseStatus.DONE, second.status, second.error)
+        assertEquals(0, requests.count { it.system.startsWith("You plan") })
+        assertTrue(tabs.opened.isEmpty())
+        assertEquals(0, after.stepArgs("navigate").size)
+        assertTrue(after.stepArgs("screenshot").isNotEmpty())
+        // browser_use: the same tab_id with inputs {"continue":"yes"}: no plan even when asked to plan, the flag is not text to type, and Jev is told.
+        val viaTool = FakeBrowser(tmp(), listOf("TYPE_TEXT", "DONE"), textPick = "555")
+        val reqs = mutableListOf<AiRequest>()
+        val r = flow(viaTool, FakeTabs(), reqs).runComputerUse(UseRequest("order a cake", tabId = "t7", planWithLlm = true, inputs = mapOf("continue" to "yes", "phone" to "555")))
+        assertEquals(UseStatus.DONE, r.status, r.error)
+        assertEquals(0, reqs.count { it.system.startsWith("You plan") })
+        assertTrue("yes" !in viaTool.textOptionsSeen.flatten())
+        assertTrue(viaTool.jevArgs.first()["state"]!!.jsonObject["advice"]!!.jsonArray.single().jsonPrimitive.content.contains("did what the page asked in this tab themselves"))
+    }
+
+    @Test
+    fun `elements covered by a dialog are dropped from the consult list and from DOM candidates, and the dialog is named`() = runTest {
+        val covered = """[{"id":"e1","role":"button","tag":"button","label":"Add to cart","covered":true,"selector":{"type":"css","value":"#add"}},""" +
+            """{"id":"e2","role":"textbox","tag":"input","label":"Phone number","selector":{"type":"css","value":"#phone"}}]"""
+        val page = PageSnapshot.parse(json("""{"url":"https://a.com/","title":"A","modal":{"label":"Login"},"elements":$covered}"""))
+        assertEquals("Login", page.modal)
+        assertEquals(listOf(true, false), page.elements.map { it.covered })
+        // DOM mode: nothing covered is offered.
+        val cands = Candidates.build(page, "Order a cake \"cake\"", writes = true)
+        assertTrue(cands.none { it.description.contains("Add to cart") })
+        assertTrue(cands.any { it.description.contains("Phone number") })
+        // ... and the model is told a dialog is open.
+        val ctx = StepContext("Order", page, cands, emptyList(), emptyList())
+        assertEquals("Login", JevDecider.state(ctx)["page"]!!.jsonObject["dialog_open_over_the_page"]!!.jsonPrimitive.content)
+        assertTrue(ChatDecider.prompt(ctx).contains("A dialog \"Login\" is open over the page"))
+        assertNull(JevDecider.state(StepContext("x", page.copy(modal = null), emptyList(), emptyList(), emptyList()))["page"]!!.jsonObject["dialog_open_over_the_page"])
+        // The consult list.
+        consultReplies = ArrayDeque(listOf("""{"give_up":"x"}"""))
+        val b = FakeBrowser(tmp(), listOf("BLOCKED")).also { it.elements = covered; it.modalLabel = "Cookie banner" }
+        val requests = mutableListOf<AiRequest>()
+        flow(b, FakeTabs(), requests).runComputerUse(UseRequest("t", onStuck = OnStuck.CONSULT))
+        val prompt = requests.single { it.system.startsWith("You help a browser agent") }.messages.single().text
+        assertFalse(prompt.contains("Add to cart"))
+        assertTrue(prompt.contains("e2 | textbox | \"Phone number\""))
+        assertTrue(prompt.contains("A dialog \"Cookie banner\" is open over the page; the elements it covers are left out."))
     }
 
     // ---- popup windows that are not tabs ----
