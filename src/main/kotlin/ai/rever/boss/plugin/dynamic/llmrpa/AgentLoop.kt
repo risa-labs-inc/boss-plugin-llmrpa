@@ -176,14 +176,22 @@ internal class AgentLoop(
                     val text = look.pageText
                     // What the last action did, now that the page is seen again.
                     if (lastStepIndex >= 0 && mem.turns.isNotEmpty() && mem.turns.last().result == null) {
-                        val changed = url != st.url || (shot.contentHash != null && shot.contentHash != st.content) || (shot.contentHash == null && text != st.pageText)
+                        val contentChanged = url != st.url || (shot.contentHash != null && shot.contentHash != st.content) || (shot.contentHash == null && text != st.pageText)
+                        // content_hash ignores scrolling: the view's movement is read from the scroll position before and after.
+                        val op = steps[lastStepIndex].op
+                        val viewOp = op == VisionOp.SCROLL_DOWN || op == VisionOp.SCROLL_UP || op == VisionOp.KEY || op == VisionOp.PRESS_ENTER || op == VisionOp.FIND
+                        val moved = if (url == st.url) AgentPrompt.movement(st.shot?.position, shot.position) else null
+                        val scrolled = moved != null && !moved.startsWith("did not move")
+                        val content = if (contentChanged && url == st.url) Cu.changeSummary(st.pageText, text)?.take(120) ?: if (scrolled) null else "the page changed" else null
                         val result = when {
                             url != st.url -> "now on '${shot.title.orEmpty().take(60)}' (${host(url)})"
-                            changed -> Cu.changeSummary(st.pageText, text)?.take(120) ?: "the page changed"
+                            scrolled || (viewOp && moved != null && !contentChanged) -> listOfNotNull(moved, content).joinToString("; ")
+                            contentChanged -> content ?: "the page changed"
                             else -> NOTHING
                         }
-                        mem.turns[mem.turns.lastIndex] = mem.turns.last().copy(result = result)
-                        steps[lastStepIndex] = steps[lastStepIndex].copy(result = result, contentChanged = changed, changed = changed)
+                        val changed = contentChanged || scrolled
+                        mem.turns[mem.turns.lastIndex] = mem.turns.last().copy(result = result, changed = changed)
+                        steps[lastStepIndex] = steps[lastStepIndex].copy(result = result, contentChanged = contentChanged, changed = changed)
                         publish()
                     }
                     st.shot = shot; st.url = url; st.title = shot.title; st.pageText = text; st.content = shot.contentHash
@@ -192,7 +200,7 @@ internal class AgentLoop(
                     marks = look.marks
                     // The ONLY loop guard: the same action on the same target three times, changing nothing.
                     val last3 = mem.turns.takeLast(3)
-                    if (last3.size == 3 && last3.all { it.error == null && it.result == NOTHING && it.action == last3[0].action && it.target == last3[0].target }) {
+                    if (last3.size == 3 && last3.all { it.error == null && it.changed == false && it.action == last3[0].action && it.target == last3[0].target }) {
                         return Outcome(UseStatus.BLOCKED, "Repeated '${last3[0].action}${last3[0].target?.let { " on $it" }.orEmpty()}' three times and nothing changed")
                     }
                 }
@@ -232,12 +240,12 @@ internal class AgentLoop(
             misses = 0
             taken++
             // A failed action has no page change to wait for: its result is the error.
-            mem.turns += AgentTurn(act.desc, act.target, if (act.error != null) "failed" else null, act.error)
+            mem.turns += AgentTurn(act.desc, act.target.takeIf { act.op != VisionOp.FIND }, act.result ?: if (act.error != null) "failed" else null, act.error, act.changed)
             steps += UseStep(
                 index = steps.size + 1, op = act.op, confidence = 1.0, ms = (System.nanoTime() - t0) / 1_000_000,
                 text = act.text, note = listOfNotNull(act.error, act.note).joinToString("; ").ifEmpty { null }, failed = act.error != null && !act.refused,
                 refused = act.refused, before = Seen(st.url.orEmpty(), st.shot?.scrollY, "", st.content), tabId = act.tab, screenshotPath = st.image,
-                target = act.target, thought = decision.thought.ifBlank { null }, action = AgentPrompt.actionJson(a), popup = act.popup,
+                target = act.target, thought = decision.thought.ifBlank { null }, action = AgentPrompt.actionJson(a), popup = act.popup, result = act.result, changed = act.changed,
                 dialog = act.dialog,
             )
             lastStepIndex = steps.lastIndex
@@ -252,6 +260,9 @@ internal class AgentLoop(
         /** The action was refused before anything reached the page. */
         val notRun: Boolean = false,
         val ask: Outcome? = null,
+        /** Known at once (a find that did not scroll); otherwise read from the next look. */
+        val result: String? = null,
+        val changed: Boolean? = null,
     )
 
     private suspend fun act(req: AgentRequest, run: UseRun, tools: RecordingTools, st: St, mem: AgentMemory, a: AgentAction, marks: List<Mark>, dialog: Cu.DialogInfo?): Act {
@@ -335,6 +346,26 @@ internal class AgentLoop(
                     val e = err(tools.invoke(ToolNames.STEP, Cu.step(tab, "navigate", u, pointer)))
                     if (e == null && settleMs > 0) delay(settleMs)
                     Act(VisionOp.NAVIGATE, "navigate", u, tab, error = e)
+                }
+            }
+            is AgentAction.Find -> {
+                val t = checkNotNull(tab)
+                val shot = st.shot
+                val r = tools.invoke(ToolNames.STEP, Cu.step(t, "locate_text", a.text))
+                err(r)?.let { e -> return Act(VisionOp.FIND, "find '${a.text.take(60)}'", "'${a.text.take(60)}'", t, error = e) }
+                val found = Cu.parseLocated(r.json) ?: return Act(VisionOp.FIND, "find", "'${a.text.take(60)}'", notRun = true, error = "this RPA Engine cannot search the page (no locate_text)")
+                val what = "'${a.text.take(60)}'"
+                when {
+                    !found.found -> Act(VisionOp.FIND, "find $what", what, t, result = "not found on this page", changed = false)
+                    found.inView -> Act(VisionOp.FIND, "find $what", what, t, result = "found $what, already in view", changed = false)
+                    else -> {
+                        val h = shot?.cssHeight ?: 780
+                        // The match's own rect (viewport px) puts it a third of the way down; else its distance in screens.
+                        val dy = found.rect?.let { (it.top - h / 3.0).roundToInt() }
+                            ?: ((found.screens ?: 1.0) * h * (if (found.direction == "up") -1 else 1)).roundToInt()
+                        val e = err(tools.invoke(ToolNames.STEP, Cu.step(t, "scroll_by", dy.toString(), pointer)))
+                        Act(VisionOp.FIND, "find $what", what, t, error = e, result = if (e == null) "found $what and scrolled it into view" else null, changed = e == null)
+                    }
                 }
             }
             is AgentAction.ClickPoint -> {

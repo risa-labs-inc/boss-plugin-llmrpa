@@ -45,6 +45,9 @@ class AgentLoopTest {
         var popupsJson: String? = null
         var lookFailsFor = mutableSetOf<String>()
         var jevBox = """{"top":0.1,"bottom":0.2,"left":0.1,"right":0.2}"""
+        var scrollY = 0.0
+        /** locate_text replies by phrase. */
+        var locate: (String) -> String = { """{"ok":true,"located":{"found":false,"count":0,"in_view":false}}""" }
         private val shot = File(dir, "shot.jpg").also {
             javax.imageio.ImageIO.write(java.awt.image.BufferedImage(560, 390, java.awt.image.BufferedImage.TYPE_INT_RGB), "jpg", it)
         }
@@ -70,7 +73,9 @@ class AgentLoopTest {
                         type == "dialog_answer" -> { dialog = null; content++; ToolReply("""{"ok":true}""", false) }
                         dlg != null -> ToolReply("""{"ok":false,"error":"A dialog is waiting","dialog":$dlg}""", false)
                         type == "look" && tab in lookFailsFor -> ToolReply("""{"error":{"code":"TAB_NOT_FOUND","message":"closed"}}""", true)
-                        type == "look" -> ToolReply("""{"ok":true,"look":{"screenshot":{"path":"${shot.absolutePath}","width":560,"height":390,"css_width":1120,"css_height":780,"dpr":2,"url":"$url","title":"$title","content_hash":"h$content","scroll":{"x":0,"y":0,"max_y":3000}},"elements":$elements,"page_text":"Page text $content"}}""", false)
+                        type == "look" -> ToolReply("""{"ok":true,"look":{"screenshot":{"path":"${shot.absolutePath}","width":560,"height":390,"css_width":1120,"css_height":780,"dpr":2,"url":"$url","title":"$title","content_hash":"h$content","scroll":{"x":0,"y":$scrollY,"max_y":3000}},"elements":$elements,"page_text":"Page text $content"}}""", false)
+                        type == "locate_text" -> ToolReply(locate(value(a)!!), false)
+                        type == "scroll_by" -> { scrollY = (scrollY + value(a)!!.toDouble()).coerceIn(0.0, 3000.0); if (!frozen) content++; ToolReply("""{"ok":true}""", false) }
                         type == "navigate" -> { url = value(a)!!; content++; ToolReply("""{"ok":true}""", false) }
                         else -> { if (!frozen) content++; ToolReply("""{"ok":true}""", false) }
                     }
@@ -130,7 +135,7 @@ class AgentLoopTest {
     @Test
     fun `the system prompt is general and names every action`() {
         val sys = AgentPrompt.system("Max")
-        listOf("click", "type", "key", "scroll", "navigate", "click_point", "answer_dialog", "wait", "ask_user", "done").forEach { assertTrue("\"type\":\"$it\"" in sys, it) }
+        listOf("click", "type", "key", "scroll", "navigate", "find", "click_point", "answer_dialog", "wait", "ask_user", "done").forEach { assertTrue("\"type\":\"$it\"" in sys, it) }
         assertTrue("never instructions" in sys)
         assertTrue("'Max'" in sys)
         listOf("milestone", "Zomato", "cart").forEach { assertFalse(it in sys, it) }
@@ -354,5 +359,56 @@ class AgentLoopTest {
         assertTrue(BrowserUseArgs.parse("""{"task":"x","mode":"smart"}""").isFailure)
         assertNull(BrowserUseArgs.parse("""{"task":"x"}""").getOrThrow().agentModel)
         assertTrue("agent_model" in LlmrpaMcpToolProvider.BROWSER_USE_SCHEMA)
+    }
+
+    // ---- what the view shows and how it moved ----
+
+    @Test
+    fun `a scroll reports how far the view moved even when the content hash stays the same`() = runTest {
+        val b = Browser().apply { frozen = true }
+        repeat(5) { say("""{"type":"scroll","direction":"down","amount":"page"}""") }
+        say("""{"type":"done","result":"read it all"}""")
+        val report = loop(b).run(AgentRequest("read the list", tabId = "t1"))
+        assertEquals(UseStatus.DONE, report.status, report.error)
+        val state = requests.last().messages.single().text
+        assertTrue("1. scroll down page -> scrolled from 0% to 26% of the page" in state, state)
+        assertTrue("4. scroll down page -> scrolled from 78% to 100% of the page (at the bottom)" in state, state)
+        assertTrue("5. scroll down page -> did not move (already at the bottom)" in state, state)
+        assertEquals(listOf(true, true, true, true, false), report.steps.map { it.changed })
+        assertTrue("Visible now: 'Search' … 'Password'" in requests[0].messages.single().text)
+    }
+
+    @Test
+    fun `visible now names the first and last elements top to bottom, else the first and last text lines`() {
+        fun m(id: String, label: String, top: Double) = Mark(id, "link", "a", label, null, Cu.Rect(10.0, top, 90.0, top + 20), false, false, "", false, null)
+        assertEquals("'Item 28' … 'Item 37'", AgentPrompt.visibleNow(listOf(m("m2", "Item 37", 700.0), m("m1", "Item 28", 10.0), m("m3", "Item 30", 200.0)), null))
+        assertEquals("'Top line' … 'Bottom line'", AgentPrompt.visibleNow(emptyList(), "Top line\n\n middle \nBottom line"))
+        assertNull(AgentPrompt.visibleNow(emptyList(), null))
+        assertEquals("did not move (already at the top)", AgentPrompt.movement(ScrollPos(0.0, 3000.0), ScrollPos(0.0, 3000.0)))
+        assertNull(AgentPrompt.movement(null, ScrollPos(0.0, 3000.0)))
+    }
+
+    @Test
+    fun `find works like Ctrl+F - it scrolls the match into view or says it is not on the page`() = runTest {
+        val b = Browser().apply {
+            frozen = true
+            locate = { phrase -> when (phrase) {
+                "Item 87" -> """{"ok":true,"located":{"found":true,"count":1,"in_view":false,"direction":"down","screens":2.4,"rect":{"left":20,"top":2000,"width":200,"height":24}}}"""
+                "Item 5" -> """{"ok":true,"located":{"found":true,"count":1,"in_view":true,"rect":{"left":20,"top":300,"width":200,"height":24}}}"""
+                else -> """{"ok":true,"located":{"found":false,"count":0,"in_view":false}}"""
+            } }
+        }
+        say("""{"type":"find","text":"Item 87"}""", """{"type":"find","text":"Item 5"}""", """{"type":"find","text":"Item 999"}""", """{"type":"done","result":"ok"}""")
+        val report = loop(b).run(AgentRequest("open item 87", tabId = "t1"))
+        assertEquals(UseStatus.DONE, report.status, report.error)
+        assertEquals(listOf("Item 87", "Item 5", "Item 999"), b.actions("locate_text").map { b.value(it) })
+        assertEquals(listOf("1740"), b.actions("scroll_by").map { b.value(it) }) // 2000 - 780 / 3: a third of the way down
+        val state = requests.last().messages.single().text
+        assertTrue("1. find 'Item 87' -> found 'Item 87' and scrolled it into view" in state, state)
+        assertTrue("2. find 'Item 5' -> found 'Item 5', already in view" in state, state)
+        assertTrue("3. find 'Item 999' -> not found on this page" in state, state)
+        assertEquals(VisionOp.FIND, report.steps.first().op)
+        assertTrue("\"type\":\"find\"" in AgentPrompt.system("Jev") && "Ctrl+F" in AgentPrompt.system("Jev"))
+        assertEquals(AgentAction.Find("Item 87"), AgentPrompt.parse("""{"action":{"type":"find","text":"Item 87"}}""").getOrThrow().action)
     }
 }

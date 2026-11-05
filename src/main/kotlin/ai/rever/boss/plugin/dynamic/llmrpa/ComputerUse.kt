@@ -33,7 +33,7 @@ internal enum class VisionOp {
     /** Not a Jev operation: the planner chose a new place to continue from. */
     REPLAN,
     /** Agent mode only: a key press other than Enter, and going to an address. */
-    KEY, NAVIGATE,
+    KEY, NAVIGATE, FIND,
 }
 
 /** What the page looked like when a step was decided: its address, vertical scroll (when RPA Engine reports it) and pixel hash. */
@@ -153,6 +153,7 @@ internal data class UseStep(
             VisionOp.BLOCKED -> "Blocked"
             VisionOp.KEY -> "Press ${target ?: "a key"}"
             VisionOp.NAVIGATE -> "Go to ${target ?: "a page"}"
+            VisionOp.FIND -> "Find ${target ?: "text"} on the page"
         }
 }
 

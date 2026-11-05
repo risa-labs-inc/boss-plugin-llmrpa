@@ -18,6 +18,7 @@ internal sealed interface AgentAction {
     data class Key(val key: String) : AgentAction
     data class Scroll(val down: Boolean, val amount: String) : AgentAction
     data class Navigate(val url: String) : AgentAction
+    data class Find(val text: String) : AgentAction
     data class ClickPoint(val description: String) : AgentAction
     data class AnswerDialog(val ok: Boolean, val text: String?) : AgentAction
     data class Wait(val ms: Long) : AgentAction
@@ -27,8 +28,8 @@ internal sealed interface AgentAction {
 
 internal data class AgentDecision(val thought: String, val action: AgentAction, val raw: JsonObject)
 
-/** A remembered step, as the model sees it in the next turns. */
-internal data class AgentTurn(val action: String, val target: String?, val result: String?, val error: String?)
+/** A remembered step, as the model sees it in the next turns; [changed] is whether it changed the page or the view. */
+internal data class AgentTurn(val action: String, val target: String?, val result: String?, val error: String?, val changed: Boolean? = null)
 
 /** Agent mode's memory across a pause for the person: kept on the [UseRun]. */
 internal class AgentMemory {
@@ -54,6 +55,7 @@ Reply with only JSON: {"thought":"<one short sentence>","action":{...}} where ac
 {"type":"key","key":"Enter|Escape|Tab|ArrowDown|ArrowUp|Backspace|PageDown"}
 {"type":"scroll","direction":"down|up","amount":"half|page|two_pages"}
 {"type":"navigate","url":"https://..."}
+{"type":"find","text":"Item 87"}
 {"type":"click_point","description":"the element to click, described so it can be found on the screenshot"}
 {"type":"answer_dialog","answer":"ok|cancel","text":"..."}
 {"type":"wait","ms":1000}
@@ -64,6 +66,8 @@ Rules:
 - When the person must act or decide (a login, a code, missing details, a choice between options, anything risky or unclear), use ask_user with a clear question and options when there are some.
 - Never guess credentials, codes or personal data. Type a named input as {{name}}; its value is filled in for you.
 - To find something, prefer a search: navigate to https://www.google.com/search?q=... rather than guessing deep links. navigate takes https only.
+- find works like Ctrl+F: it looks for the text on the whole page and scrolls the nearest match into view. Use it to reach something not on screen instead of scrolling blindly.
+- Each step's result says what changed, including how far a scroll moved; "Visible now" says what the screen shows.
 - For information tasks, read and scroll as needed, then done with the answer taken from the page.
 - Don't repeat an action that changed nothing: try something else, or ask.
 - A pending browser dialog must be answered with answer_dialog before anything else.
@@ -85,6 +89,7 @@ Rules:
         else appendLine("Page: ${title.orEmpty().take(120)} | $url")
         if (tabs.size > 1) appendLine("Tabs and popups: ${tabs.joinToString(" | ")}")
         scroll?.let { appendLine("Scroll: ${it.percentDown}% down" + if (it.atBottom) " (at the bottom)" else if (it.atTop) " (at the top)" else "") }
+        if (dialog == null && url != null) visibleNow(marks, pageText)?.let { appendLine("Visible now: $it") }
         dialog?.let { d ->
             appendLine("Dialog pending (${d.type}): '${d.message.replace(Regex("\\s+"), " ").take(300)}' buttons: ${d.okText ?: "OK"}" + if (d.type != "alert") " / ${d.cancelText ?: "Cancel"}" else "")
             appendLine("The screenshot shows the dialog drawn over the last view of the page. Answer it with answer_dialog.")
@@ -106,6 +111,27 @@ Rules:
             appendLine()
         }
     }.trimEnd()
+
+    /** The first and last things on screen: element labels top to bottom, else the visible text's first and last lines. */
+    fun visibleNow(marks: List<Mark>, pageText: String?): String? {
+        fun q(s: String) = "'" + s.replace(Regex("\\s+"), " ").trim().take(60) + "'"
+        val labels = marks.filter { !it.covered && it.label.isNotBlank() }.sortedWith(compareBy({ it.rect.top }, { it.rect.left })).map { it.label }
+        val lines = pageText.orEmpty().lines().map { it.trim() }.filter { it.isNotEmpty() }
+        val (first, last) = when {
+            labels.size >= 2 -> labels.first() to labels.last()
+            lines.size >= 2 -> lines.first() to lines.last()
+            else -> return (labels.firstOrNull() ?: lines.firstOrNull())?.let(::q)
+        }
+        return "${q(first)} … ${q(last)}"
+    }
+
+    /** How the view moved between two looks, or null when the page reports no scroll position. */
+    fun movement(before: ScrollPos?, after: ScrollPos?): String? {
+        if (before == null || after == null) return null
+        val edge = if (after.atBottom) " (at the bottom)" else if (after.atTop) " (at the top)" else ""
+        if (Math.abs(after.y - before.y) < 2) return "did not move" + if (after.atBottom) " (already at the bottom)" else if (after.atTop) " (already at the top)" else ""
+        return "scrolled from ${before.percentDown}% to ${after.percentDown}% of the page$edge"
+    }
 
     /** `[m12] button 'ADD' — Tres Leches ₹470 · disabled`. */
     fun elementLine(m: Mark): String = buildString {
@@ -147,6 +173,7 @@ Rules:
             "key" -> AgentAction.Key(KEYS.firstOrNull { it.equals(need("key"), true) } ?: throw IllegalArgumentException("Unknown key '${s("key")}'. Use one of ${KEYS.joinToString()}"))
             "scroll" -> AgentAction.Scroll(!s("direction").equals("up", true), s("amount")?.lowercase()?.takeIf { it in AMOUNTS } ?: "page")
             "navigate" -> AgentAction.Navigate(need("url"))
+            "find" -> AgentAction.Find(need("text").take(200))
             "click_point" -> AgentAction.ClickPoint(need("description"))
             "answer_dialog" -> AgentAction.AnswerDialog(!s("answer").equals("cancel", true), s("text"))
             "wait" -> AgentAction.Wait(((a["ms"] as? JsonPrimitive)?.intOrNull ?: 1000).toLong().coerceIn(500, 3_000))
@@ -165,6 +192,7 @@ Rules:
         is AgentAction.Key -> buildJsonObject { put("type", "key"); put("key", a.key) }
         is AgentAction.Scroll -> buildJsonObject { put("type", "scroll"); put("direction", if (a.down) "down" else "up"); put("amount", a.amount) }
         is AgentAction.Navigate -> buildJsonObject { put("type", "navigate"); put("url", a.url) }
+        is AgentAction.Find -> buildJsonObject { put("type", "find"); put("text", a.text) }
         is AgentAction.ClickPoint -> buildJsonObject { put("type", "click_point"); put("description", a.description) }
         is AgentAction.AnswerDialog -> buildJsonObject { put("type", "answer_dialog"); put("answer", if (a.ok) "ok" else "cancel"); a.text?.let { put("text", it) } }
         is AgentAction.Wait -> buildJsonObject { put("type", "wait"); put("ms", a.ms) }
