@@ -585,6 +585,11 @@ class LlmrpaComponent(
     val consultModel: StateFlow<ModelOption?> = _consultModel
     fun selectConsultModel(option: ModelOption?) { _consultModel.value = option }
 
+    private val _navigatorModel = MutableStateFlow<ModelOption?>(null)
+    /** The fast model that plans each page and advises; null = automatic (Claude Haiku when the gateway has one, else the planner). */
+    val navigatorModel: StateFlow<ModelOption?> = _navigatorModel
+    fun selectNavigatorModel(option: ModelOption?) { _navigatorModel.value = option }
+
     private val _plannerModel = MutableStateFlow<ModelOption?>(null)
     /** The chat model that plans the task and writes text for fields; null = the one selected in Settings. */
     val plannerModel: StateFlow<ModelOption?> = _plannerModel
@@ -646,7 +651,7 @@ class LlmrpaComponent(
     private fun baseRequest(run: UseRun, tabId: String?, resume: Boolean, advice: List<String>) = UseRequest(
         task = run.task, tabId = tabId, jevModel = _jevModelId.value, llm = _plannerModel.value,
         pointerLabel = Cu.pointerLabel(_pointerLabel.value), llmTyping = _llmTyping.value,
-        onStuck = if (_consultWhenStuck.value) OnStuck.CONSULT else OnStuck.RETURN, consultModel = _consultModel.value,
+        onStuck = if (_consultWhenStuck.value) OnStuck.CONSULT else OnStuck.RETURN, consultModel = _consultModel.value, navigatorModel = _navigatorModel.value, pagePlans = true,
         inputs = run.inputs.toMap(), extract = _extract.value, resume = resume, advice = advice,
         // The panel plans only when no tab is targeted.
         planWithLlm = tabId == null,

@@ -179,7 +179,7 @@ class HeadlessRunner(
         if (newTab && a.tabId != null) return Result.failure(IllegalArgumentException("Pass tab_id or new_tab/url, not both"))
         val page = a.url?.let { StartPages.usable(it, httpsOnly = false) ?: return Result.failure(IllegalArgumentException("url must be an http(s) address with a host and no credentials")) }
         val tab = if (newTab) null else pickTab(a.tabId).getOrElse { return Result.failure(it) }
-        val chat = if (a.plannerModel == null && a.consultModel == null) emptyList()
+        val chat = if (a.plannerModel == null && a.consultModel == null && a.navigatorModel == null) emptyList()
             else withContext(Dispatchers.IO) { ModelDirectory(tools, llmProvider, gateway).load() }.flatMap { it.models }.filter { it.kind == ModelOption.Kind.CHAT }
         fun resolveChat(id: String, arg: String): Result<ModelOption> =
             chat.firstOrNull { it.key == id }?.let { Result.success(it) } ?: chat.filter { it.modelId == id }.let { same ->
@@ -190,13 +190,14 @@ class HeadlessRunner(
                 }
             }
         val llm = a.plannerModel?.let { resolveChat(it, "planner_model").getOrElse { e -> return Result.failure(e) } }
+        val navigatorModel = a.navigatorModel?.let { resolveChat(it, "navigator_model").getOrElse { e -> return Result.failure(e) } }
         val consultModel = a.consultModel?.let { resolveChat(it, "consult_model").getOrElse { e -> return Result.failure(e) } }
         val flow = ComputerUseFlow(tools, gateway, LockedTabs(locks, TabLocks.Owner.HEADLESS, openTab, reveal, list = { tabs().filter { it.url != null }.associate { it.tabId to it.title } }),
             openWaitsMs = limits.openWaitsMs, settleMs = limits.navSettleMs, runLog = runLog)
         val request = UseRequest(
             task = a.task, url = page, tabId = tab?.tabId, jevModel = a.model ?: Cu.VISION_DEFAULT_MODEL, llm = llm,
             pointerLabel = Cu.pointerLabel(a.displayName), llmTyping = a.llmTyping,
-            onStuck = a.onStuck, consultBelow = a.consultBelow, maxConsults = a.maxConsults, consultModel = consultModel, maxReplans = a.maxReplans, inputs = a.inputs, extract = a.extract,
+            onStuck = a.onStuck, consultBelow = a.consultBelow, maxConsults = a.maxConsults, consultModel = consultModel, navigatorModel = navigatorModel, pagePlans = a.pagePlan, maxReplans = a.maxReplans, inputs = a.inputs, extract = a.extract,
             maxSteps = a.maxSteps, timeoutMs = a.timeoutS * 1000L, confirm = null,
             // A caller that names the page needs no plan; `plan` forces one either way.
             planWithLlm = a.plan ?: (page == null && tab == null),

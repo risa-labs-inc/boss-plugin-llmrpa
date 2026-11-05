@@ -278,6 +278,8 @@ internal class LlmrpaMcpToolProvider(
             """"mode":{"type":"string","enum":["vision","dom"],"default":"vision","description":"vision: Jev works from screenshots; dom: the text-list runner of llmrpa_execute"},""" +
             """"model":{"type":"string","description":"Jev model; vision needs one that takes images and boxes (default typesafe/jev-1.14). In dom mode, any model id of llmrpa_execute"},""" +
             """"planner_model":{"type":"string","description":"Chat model id (from Settings → AI Providers) that plans the task and writes text for fields; defaults to the selected one"},""" +
+            """"navigator_model":{"type":"string","description":"Fast chat model that plans each new page and advises (Claude Haiku via the AI Gateway by default; falls back to the planner when unavailable). It sees the marked screenshot when the gateway has vision"},""" +
+            """"page_plan":{"type":"boolean","default":true,"description":"The navigator plans each new page once (up to 5 steps, which Jev then grounds one by one); also splits a multi-part goal when no plan was made"},""" +
             """"display_name":{"type":"string","default":"Jev","description":"Label on the on-page pointer (always shown)"},""" +
             """"on_stuck":{"type":"string","enum":["return","consult"],"default":"return","description":"When stuck: return stops with status needs_input and a blocker (the tab stays open; call again with the same tab_id, task and inputs to continue); consult asks the planner chat model what to do, up to max_consults times"},""" +
             """"consult_below":{"type":"number","minimum":0,"maximum":1,"default":0.5,"description":"Jev operation confidence below this counts as stuck"},""" +
@@ -421,6 +423,8 @@ internal data class BrowserUseArgs(
     val consultBelow: Double,
     val maxConsults: Int,
     val consultModel: String?,
+    val navigatorModel: String?,
+    val pagePlan: Boolean,
     val maxReplans: Int,
     val inputs: Map<String, String>,
     val extract: Boolean,
@@ -433,7 +437,7 @@ internal data class BrowserUseArgs(
     val includeText: Boolean,
 ) {
     companion object {
-        private val KEYS = setOf("task", "url", "tab_id", "new_tab", "mode", "model", "planner_model", "display_name", "llm_typing", "on_stuck", "consult_below", "max_consults", "consult_model", "max_replans", "inputs", "extract", "plan", "max_steps", "timeout_s", "wait_s", "include_text")
+        private val KEYS = setOf("task", "url", "tab_id", "new_tab", "mode", "model", "planner_model", "display_name", "llm_typing", "on_stuck", "consult_below", "max_consults", "consult_model", "navigator_model", "page_plan", "max_replans", "inputs", "extract", "plan", "max_steps", "timeout_s", "wait_s", "include_text")
 
         fun parse(raw: String): Result<BrowserUseArgs> = runCatching {
             val root = Json.parseToJsonElement(raw.ifBlank { "{}" }) as? JsonObject ?: error("Arguments must be a JSON object")
@@ -469,7 +473,7 @@ internal data class BrowserUseArgs(
                 url = str("url"), tabId = str("tab_id"), newTab = bool("new_tab", false), mode = mode,
                 model = str("model"), plannerModel = str("planner_model"), displayName = str("display_name") ?: "Jev", llmTyping = bool("llm_typing", true),
                 onStuck = if (stuck == "consult") OnStuck.CONSULT else OnStuck.RETURN, consultBelow = dbl("consult_below", 0.5, 0.0, 1.0),
-                maxConsults = int("max_consults", 5, 0, 10), consultModel = str("consult_model"), maxReplans = int("max_replans", 2, 0, 5), inputs = inputs, extract = bool("extract", false),
+                maxConsults = int("max_consults", 5, 0, 10), consultModel = str("consult_model"), navigatorModel = str("navigator_model"), pagePlan = bool("page_plan", true), maxReplans = int("max_replans", 2, 0, 5), inputs = inputs, extract = bool("extract", false),
                 plan = if (root["plan"] == null) null else bool("plan", false),
                 maxSteps = int("max_steps", 25, 1, 60), timeoutS = int("timeout_s", 180, 10, 600), waitS = int("wait_s", 45, 5, 600), includeText = bool("include_text", true),
             )

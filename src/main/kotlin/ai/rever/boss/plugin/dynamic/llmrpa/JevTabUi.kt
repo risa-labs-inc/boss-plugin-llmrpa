@@ -148,6 +148,7 @@ private fun ModelRow(component: LlmrpaComponent, enabled: Boolean) {
     val llmTyping by component.llmTyping.collectAsState()
     val consult by component.consultWhenStuck.collectAsState()
     val consultModel by component.consultModel.collectAsState()
+    val navigator by component.navigatorModel.collectAsState()
     val extract by component.extract.collectAsState()
     var menu by remember { mutableStateOf<String?>(null) }
     FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -174,6 +175,19 @@ private fun ModelRow(component: LlmrpaComponent, enabled: Boolean) {
                             MenuRow(m.label, onClick = { menu = null; component.selectPlanner(m) }, selected = m.key == planner?.key,
                                 detail = if (m.label != m.modelId) m.modelId else null)
                         }
+                    }
+                }
+            }
+        }
+        Box {
+            OutlineButton("Navigator: ${navigator?.label ?: "auto"}", { menu = "navigator"; component.refreshModels() }, enabled = enabled, tone = Tone.NEUTRAL, trailing = "▾")
+            if (menu == "navigator") RpaMenu(onDismiss = { menu = null }, width = 300) {
+                MenuHeading("Navigator model", "plans each page; fast, sees the screenshot")
+                MenuRow("Automatic", onClick = { menu = null; component.selectNavigatorModel(null) }, selected = navigator == null, detail = "Claude Haiku if offered, else the planner")
+                Column(Modifier.heightIn(max = 300.dp).verticalScroll(rememberScrollState())) {
+                    groups.filter { it.kind == ModelOption.Kind.CHAT }.forEach { g ->
+                        MenuHeading(g.providerName)
+                        g.models.take(100).forEach { m -> MenuRow(m.label, onClick = { menu = null; component.selectNavigatorModel(m) }, selected = m.key == navigator?.key) }
                     }
                 }
             }

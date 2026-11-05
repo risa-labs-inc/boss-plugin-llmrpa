@@ -234,7 +234,7 @@ class ComputerUseTest {
     fun `the browser_use schema is closed and lists every argument`() {
         val schema = json(LlmrpaMcpToolProvider.BROWSER_USE_SCHEMA)
         assertEquals(false, (schema["additionalProperties"] as JsonPrimitive).content.toBoolean())
-        assertEquals(setOf("task", "url", "tab_id", "new_tab", "mode", "model", "planner_model", "display_name", "max_steps", "timeout_s", "include_text", "llm_typing", "on_stuck", "consult_below", "max_consults", "inputs", "extract", "plan", "wait_s", "consult_model", "max_replans"),
+        assertEquals(setOf("task", "url", "tab_id", "new_tab", "mode", "model", "planner_model", "display_name", "max_steps", "timeout_s", "include_text", "llm_typing", "on_stuck", "consult_below", "max_consults", "inputs", "extract", "plan", "wait_s", "consult_model", "max_replans", "navigator_model", "page_plan"),
             schema["properties"]!!.jsonObject.keys)
         assertEquals("task", schema["required"]!!.jsonArray.single().jsonPrimitive.content)
     }
@@ -452,6 +452,9 @@ class ComputerUseTest {
 
     private var consultReplies = ArrayDeque<String>()
     private var replanReplies = ArrayDeque<String>()
+    private var navigatorReplies = ArrayDeque<String>()
+    /** A model id whose requests fail, as an unusable navigator does. */
+    private var failModelOverride: String? = null
     private var extractReply = """{"answer":"A, B and C"}"""
     private val defaultCaps = setOf(AiGatewayAPI.CAPABILITY_VISION, AiGatewayAPI.CAPABILITY_PROVIDER_OVERRIDE)
     private var gatewayCaps = defaultCaps
@@ -461,7 +464,9 @@ class ComputerUseTest {
     private fun gateway(requests: MutableList<AiRequest>, planner: String, typed: String) = object : AiGatewayAPI {
         override suspend fun complete(request: AiRequest): Result<AiReply> {
             requests += request
+            if (failModelOverride != null && request.extras[AiRequest.EXTRAS_KEY_MODEL_OVERRIDE] == failModelOverride) return Result.failure(IllegalStateException("model down"))
             return Result.success(AiReply(when {
+                request.system.startsWith("You navigate") -> navigatorReplies.removeFirstOrNull() ?: "{}"
                 request.system.startsWith("You plan") -> planner
                 request.system.startsWith("You help a browser agent") -> consultReplies.removeFirstOrNull() ?: """{"give_up":"nothing left"}"""
                 request.system.startsWith("A browser agent, Jev, is stuck") -> replanReplies.removeFirstOrNull() ?: "no idea"
@@ -3641,5 +3646,212 @@ class ComputerUseTest {
             val marks = (0 until 14).map { i -> Mark("m${i + 1}", "button", "button", "ADD", if (i % 4 == 0) "checked" else null, Cu.Rect(40.0 + (i % 7) * 150, 120.0 + (i / 7) * 160, 40.0 + (i % 7) * 150 + 100, 150.0 + (i / 7) * 160), i == 5, false, "Item $i", false, null) }
             File(MarkImage.render(css, marks)!!).copyTo(File("build/reports/visual/marks-real.jpg"), overwrite = true)
         }
+    }
+
+    // ---- batch 3: the navigator ----
+
+    private val haikuCatalog = listOf(
+        providerModels("ANTHROPIC", "Anthropic", "claude-3-5-haiku-latest", "claude-haiku-4-5-20251001", "claude-sonnet-4-5"),
+        providerModels("OPENROUTER", "OpenRouter", "anthropic/claude-haiku-4.5", "openai/gpt-5"),
+    )
+
+    @Test
+    fun `the navigator is the newest Claude Haiku the gateway offers, else the planner, and the caller's choice wins`() {
+        val api = gateway(mutableListOf(), plan, typedJson)
+        val planner = ModelOption(ModelOption.Kind.CHAT, "OPENAI", "OpenAI", "gpt-5")
+        try {
+            catalog = haikuCatalog
+            val pick = Cu.pickNavigator(null, planner, api)!!
+            assertEquals("claude-haiku-4-5-20251001", pick.modelId)
+            assertEquals("ANTHROPIC", pick.providerId)
+            val explicit = ModelOption(ModelOption.Kind.CHAT, "OPENROUTER", "OpenRouter", "openai/gpt-5")
+            assertEquals(explicit, Cu.pickNavigator(explicit, planner, api))
+            // No Haiku on offer, or no provider routing (only the active model can be used): the planner.
+            catalog = listOf(providerModels("OPENAI", "OpenAI", "gpt-5"))
+            assertEquals(planner, Cu.pickNavigator(null, planner, api))
+            catalog = haikuCatalog
+            gatewayCaps = setOf(AiGatewayAPI.CAPABILITY_VISION)
+            assertEquals(planner, Cu.pickNavigator(null, planner, api))
+            assertNull(Cu.pickNavigator(null, null, null))
+        } finally { catalog = emptyList(); gatewayCaps = defaultCaps }
+    }
+
+    @Test
+    fun `the navigator plans, advises, types and extracts in place of the planner, and falls back to it when it cannot be used`() = runTest {
+        try {
+            catalog = haikuCatalog
+            val requests = mutableListOf<AiRequest>()
+            val run = UseRun("find places")
+            val ok = flow(FakeBrowser(tmp(), listOf("DONE")), FakeTabs(), requests).runComputerUse(UseRequest("find places"), run)
+            assertEquals(UseStatus.DONE, ok.status, ok.error)
+            val planReq = requests.single { it.system.startsWith("You plan") }
+            assertEquals("claude-haiku-4-5-20251001", planReq.extras[AiRequest.EXTRAS_KEY_MODEL_OVERRIDE])
+            assertTrue(run.llmModel.contains("haiku"), run.llmModel)
+            assertEquals(run.llmModel, ok.llmModel)
+            // The activity says how long it took, and flags a slow one.
+            val entry = run.log.entries.value.first { it.name == "gateway chat: plan" }
+            assertTrue(Regex(", \\d+\\.\\d s").containsMatchIn(entry.args), entry.args)
+            // Down: the planner (here the active model) answers instead, and both calls are in the activity.
+            failModelOverride = "claude-haiku-4-5-20251001"
+            val r2 = mutableListOf<AiRequest>()
+            val run2 = UseRun("find places")
+            val fb = flow(FakeBrowser(tmp(), listOf("DONE")), FakeTabs(), r2).runComputerUse(UseRequest("find places"), run2)
+            assertEquals(UseStatus.DONE, fb.status, fb.error)
+            assertEquals(2, r2.count { it.system.startsWith("You plan") })
+            assertNull(r2.last { it.system.startsWith("You plan") }.extras[AiRequest.EXTRAS_KEY_MODEL_OVERRIDE])
+            val names = run2.log.entries.value.filter { it.kind == ActivityKind.LLM }
+            assertTrue(names[0].failed && names[1].name.contains("fallback"), names.map { it.name }.toString())
+            // The consulted model is the navigator when it can see.
+            consultReplies = ArrayDeque(listOf("""{"give_up":"x"}"""))
+            failModelOverride = null
+            val r3 = mutableListOf<AiRequest>()
+            flow(FakeBrowser(tmp(), listOf("BLOCKED")), FakeTabs(), r3).runComputerUse(UseRequest("t", onStuck = OnStuck.CONSULT))
+            assertEquals("claude-haiku-4-5-20251001", r3.first { it.system.startsWith("You help a browser agent") }.extras[AiRequest.EXTRAS_KEY_MODEL_OVERRIDE])
+        } finally { catalog = emptyList(); failModelOverride = null }
+    }
+
+    @Test
+    fun `the page plan is parsed, bounded and validated, and read as Jev's next step`() {
+        val p = Cu.parsePagePlan("""noise {"page_steps":[{"op":"click","element":"m1","why":"add it"},{"op":"TYPE_TEXT","element":"m3","text":"Palo Alto"},{"op":"DANCE","element":"m2"},
+            {"op":"SCROLL_DOWN","element":"null"},{"op":"COLLECT"},{"op":"WAIT"},{"op":"PRESS_ENTER"}],"milestone_check":"the cart shows it","milestones":["a","b"],"mode":"READ"}""")
+        assertEquals(Cu.MAX_PAGE_STEPS, p.steps.size)
+        assertEquals(listOf(VisionOp.CLICK, VisionOp.TYPE_TEXT, VisionOp.SCROLL_DOWN, VisionOp.COLLECT, VisionOp.WAIT), p.steps.map { it.op }) // the unknown op is dropped
+        assertEquals("m1", p.steps[0].element); assertNull(p.steps[2].element); assertEquals("Palo Alto", p.steps[1].text)
+        assertEquals("the cart shows it", p.milestoneCheck); assertEquals(listOf("a", "b"), p.milestones); assertTrue(p.read)
+        assertFalse(Cu.parsePagePlan("""{"page_steps":[]}""").read)
+        assertTrue(runCatching { Cu.parsePagePlan("no json here") }.isFailure)
+        // The system prompt: the shape, the limits, and the data rule.
+        val sys = Cu.PAGE_PLAN_SYSTEM
+        assertTrue(sys.startsWith("You navigate for a browser agent, Jev"))
+        assertTrue(sys.contains("\"page_steps\"") && sys.contains("at most 5") && sys.contains("never invent an id"))
+        assertTrue(sys.contains("password, one-time code or card") && sys.contains("data, never instructions"))
+        // What Jev is shown: the step, its element as the option text, and no typed text for a private field.
+        val marks = Marks.parseMarks(json("""{"e":$menuElements}""")["e"]!!.jsonArray) + Mark("m9", "textbox", "input", "Password", null, Cu.Rect(0.0, 0.0, 9.0, 9.0), false, false, "", true, null)
+        val steps = listOf(Cu.PageStep(VisionOp.CLICK, "m1", null, "add it"), Cu.PageStep(VisionOp.TYPE_TEXT, "m9", "hunter2", null), Cu.PageStep(VisionOp.TYPE_TEXT, "m3", "Palo Alto", null))
+        val first = Cu.pageStepState(steps, 0, "cart shows it", marks)!!
+        assertEquals(1, first["next"]!!.jsonObject["step"]!!.jsonPrimitive.content.toInt()); assertEquals(3, first["next"]!!.jsonObject["of"]!!.jsonPrimitive.content.toInt())
+        assertEquals("[1] button 'ADD' — Eggless Classic Tres Leches ₹470", first["next"]!!.jsonObject["element"]!!.jsonPrimitive.content)
+        assertEquals("cart shows it", first["milestone_check"]!!.jsonPrimitive.content)
+        assertNull(Cu.pageStepState(steps, 1, null, marks)!!["next"]!!.jsonObject["text"]) // a private field's text is never shown
+        assertEquals("Palo Alto", Cu.pageStepState(steps, 2, null, marks)!!["next"]!!.jsonObject["text"]!!.jsonPrimitive.content)
+        assertNull(Cu.pageStepState(steps, 3, null, marks))
+        assertTrue(Cu.decideArgs("m", "g", "u", "t", emptyList(), "/x.jpg", pagePlan = first)["questions"]!!.jsonObject["operation"]!!.jsonObject["instructions"]!!.jsonPrimitive.content.contains("a suggestion from a helper"))
+        assertNull(Cu.decideArgs("m", "g", "u", "t", emptyList(), "/x.jpg")["state"]!!.jsonObject["page_plan"])
+        // A page is planned again when the address changes or most elements differ, not for a few new ones.
+        assertFalse(Cu.majorChange(setOf("a", "b", "c", "d"), setOf("a", "b", "c", "e")))
+        assertTrue(Cu.majorChange(setOf("a", "b", "c", "d"), setOf("a", "x", "y", "z")))
+        assertFalse(Cu.majorChange(emptySet(), emptySet()))
+    }
+
+    private val navPlan = """{"page_steps":[{"op":"CLICK","element":"m1","why":"add the cake"},{"op":"TYPE_TEXT","element":"m3","text":"Palo Alto","why":"search"}],"milestone_check":"the cart shows it","milestones":["Both parts are done"]}"""
+
+    @Test
+    fun `a new page is planned once with the marked screenshot, Jev is given each step, and a goal without milestones is split`() = runTest {
+        val b = looking(listOf("CLICK", "TYPE_TEXT", "SCROLL_DOWN", "DONE")) { lookElements = menuElements; clickPick = "m1"; typePick = "m3"; boxJson = boxOnM1 }
+        navigatorReplies = ArrayDeque(listOf(navPlan))
+        val requests = mutableListOf<AiRequest>()
+        val run = UseRun("Add the cake")
+        val report = flow(b, FakeTabs(), requests, plan = "{}").runComputerUse(UseRequest("Add the cake and search Palo Alto", url = "https://sample.com/", planWithLlm = false, pagePlans = true, maxSteps = 8), run)
+        // (c) no plan call, yet the navigator's page plan split the goal into milestones.
+        assertEquals(0, requests.count { it.system.startsWith("You plan") })
+        assertEquals(1, requests.count { it.system.startsWith("You navigate") }) // once for the page, not per step
+        assertEquals(listOf("Both parts are done"), run.plan.value!!.milestones)
+        assertEquals("1 of 1: Both parts are done", b.jevArgs[0]["state"]!!.jsonObject["milestone"]!!.jsonPrimitive.content)
+        // The input: goal, elements, page text, and the marked screenshot as the image.
+        val req = requests.single { it.system.startsWith("You navigate") }
+        val text = req.messages.single().text
+        assertTrue(text.contains("Goal: Add the cake and search Palo Alto") && text.contains("m1 | button | \"ADD\" | \"Eggless Classic Tres Leches") && text.contains("Best: A, B, C"), text)
+        val marked = b.jevArgs[0]["assets"]!!.jsonObject[Cu.SHOT_REF]!!.jsonObject["path"]!!.jsonPrimitive.content
+        assertTrue(marked.endsWith("-marks.jpg"))
+        assertTrue(req.messages.single().images.single().bytes.contentEquals(File(marked).readBytes()))
+        // Jev is shown the steps in turn, and grounds each with its usual call.
+        val shown = b.jevArgs.map { it["state"]!!.jsonObject["page_plan"]?.jsonObject?.get("next")?.jsonObject }
+        assertEquals("CLICK", shown[0]!!["op"]!!.jsonPrimitive.content)
+        assertTrue(shown[0]!!["element"]!!.jsonPrimitive.content.startsWith("[1] button 'ADD'"))
+        assertEquals("TYPE_TEXT", shown[1]!!["op"]!!.jsonPrimitive.content)
+        assertEquals("the cart shows it", b.jevArgs[0]["state"]!!.jsonObject["page_plan"]!!.jsonObject["milestone_check"]!!.jsonPrimitive.content)
+        assertEquals("m1", b.stepArgs("click_at")[0]["action"]!!.jsonObject["element"]!!.jsonPrimitive.content)
+        assertEquals("m3", b.stepArgs("click_at")[1]["action"]!!.jsonObject["element"]!!.jsonPrimitive.content)
+        assertEquals("Palo Alto", b.stepArgs("type_text").single()["action"]!!.jsonObject["value"]!!.jsonPrimitive.content)
+        // The call's latency is in the activity.
+        assertTrue(run.log.entries.value.single { it.name == "gateway chat: page plan" }.args.contains(" s"))
+        assertEquals(UseStatus.DONE, report.status, report.error)
+    }
+
+    @Test
+    fun `a new address is planned again, and a plan call that fails is not retried every step`() = runTest {
+        val b = looking(listOf("CLICK", "SCROLL_DOWN", "SCROLL_DOWN", "DONE")) { clickPick = "m1"; boxJson = boxOnM1; clickPages += "https://sample.com/menu" }
+        navigatorReplies = ArrayDeque(listOf(navPlan, "not json", navPlan))
+        val requests = mutableListOf<AiRequest>()
+        flow(b, FakeTabs(), requests, plan = "{}").runComputerUse(UseRequest("t", url = "https://sample.com/", planWithLlm = false, pagePlans = true, maxSteps = 8))
+        // Page 1, then page 2 (unreadable reply, so no steps), and nothing more while the address stays.
+        assertEquals(2, requests.count { it.system.startsWith("You navigate") })
+        // Off by default: a bare flow makes no navigator call.
+        val off = mutableListOf<AiRequest>()
+        flow(looking(listOf("CLICK", "DONE")), FakeTabs(), off, plan = "{}").runComputerUse(UseRequest("t", url = "https://sample.com/", planWithLlm = false))
+        assertEquals(0, off.count { it.system.startsWith("You navigate") })
+    }
+
+    @Test
+    fun `Jev's strong pick over the navigator's element is followed and noted, an unsure one gives way to the navigator`() = runTest {
+        val plan = """{"page_steps":[{"op":"CLICK","element":"m1"}]}"""
+        suspend fun run(p: Double): Pair<FakeBrowser, UseReport> {
+            val b = looking(listOf("CLICK", "DONE")) { lookElements = threeItems; clickPick = "m2"; pickP = p; boxJson = """{"top":0.5,"bottom":0.56,"left":0.8,"right":0.88}""" }
+            navigatorReplies = ArrayDeque(listOf(plan))
+            return b to flow(b, FakeTabs(), mutableListOf(), plan = "{}").runComputerUse(UseRequest("t", url = "https://sample.com/", planWithLlm = false, pagePlans = true, maxSteps = 6))
+        }
+        val (strong, rs) = run(0.85)
+        assertEquals("m2", strong.stepArgs("click_at").single()["action"]!!.jsonObject["element"]!!.jsonPrimitive.content)
+        assertTrue(rs.steps.first { it.op == VisionOp.CLICK }.note!!.contains("navigator suggested button 'ADD'") && rs.steps.first { it.op == VisionOp.CLICK }.note!!.contains("followed Jev"))
+        val (weak, rw) = run(0.4)
+        assertEquals("m1", weak.stepArgs("click_at").single()["action"]!!.jsonObject["element"]!!.jsonPrimitive.content)
+        assertTrue(rw.steps.first { it.op == VisionOp.CLICK }.note!!.contains("followed the navigator's"))
+        // The rule on its own: the same pick, other operations and disabled targets are left alone.
+        val marks = Marks.parseMarks(json("""{"e":$threeItems}""")["e"]!!.jsonArray)
+        val d = VisionDecision(VisionOp.CLICK, 0.9, null, null, null, 0.0, clickChoice = "m2", mark = marks[1], markP = 0.4)
+        assertEquals(d, Marks.followNavigator(d, Cu.PageStep(VisionOp.CLICK, "m2", null, null), marks).first)
+        assertNull(Marks.followNavigator(d, Cu.PageStep(VisionOp.CLICK, "m1", null, null), marks.map { if (it.id == "m1") it.copy(disabled = true) else it }).second)
+        assertNull(Marks.followNavigator(d, Cu.PageStep(VisionOp.TYPE_TEXT, "m1", null, null), marks).second)
+        assertNull(Marks.followNavigator(d, Cu.PageStep(VisionOp.CLICK, null, null, null), marks).second)
+    }
+
+    @Test
+    fun `read mode reads the whole page, scrolls once to the bottom for a lazy list, and extracts, with no Jev call`() = runTest {
+        var reads = 0
+        val readPlan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"List the top restaurants","mode":"read","type_values":[]}"""
+        val b = looking(listOf("DONE")) { pageTextFn = { if (reads++ == 0) "1. A\n2. B" else "1. A\n2. B\n3. C\n4. D" } }
+        extractReply = """{"answer":"A, B, C, D"}"""
+        val r = try { flow(b, FakeTabs(), mutableListOf(), plan = readPlan).runComputerUse(UseRequest("List the top restaurants")) } finally { extractReply = """{"answer":"A, B and C"}""" }
+        assertEquals(UseStatus.DONE, r.status, r.error)
+        assertEquals(0, b.jevCalls); assertEquals(0, b.lookArgs.size)
+        assertEquals(listOf(VisionOp.COLLECT, VisionOp.SCROLL_DOWN, VisionOp.COLLECT), r.steps.map { it.op })
+        assertEquals("100000", b.stepArgs("scroll_by").single()["action"]!!.jsonObject["value"]!!.jsonPrimitive.content)
+        assertEquals(2, r.collected.size) // the page, and what the scroll brought in
+        assertTrue(r.collected.last().text.contains("4. D"))
+        assertEquals("A, B, C, D", r.answer) // extract without the switch: reading is for answering
+        assertTrue(r.toJson()["answer"]!!.jsonPrimitive.content.isNotEmpty())
+        // The navigator can flag it too, from the page: the first decision is never made.
+        val nav = looking(listOf("DONE")) { lookElements = menuElements }
+        navigatorReplies = ArrayDeque(listOf("""{"page_steps":[],"mode":"read"}"""))
+        val nr = flow(nav, FakeTabs(), mutableListOf(), plan = "{}").runComputerUse(UseRequest("What is on the page?", url = "https://sample.com/", planWithLlm = false, pagePlans = true))
+        assertEquals(UseStatus.DONE, nr.status, nr.error)
+        assertEquals(0, nav.jevCalls)
+        assertEquals(1, nav.stepArgs("scroll_by").size)
+        // A login wall in front of it is the person's.
+        val wall = looking(listOf("DONE")) { modalLabel = "Login"; pageTextFn = { "Login\nPhone number\nSend one time password" } }
+        assertEquals(UseStatus.NEEDS_INPUT, flow(wall, FakeTabs(), mutableListOf(), plan = readPlan).runComputerUse(UseRequest("t")).status)
+        // The plan says it.
+        assertEquals("read", Cu.parsePlan(readPlan, "t").mode)
+        assertNull(Cu.parsePlan("""{"open":[],"jev_goal":"g","mode":"act"}""", "t").mode)
+        assertTrue(Cu.PLAN_SYSTEM.contains("\"mode\":\"read\""))
+    }
+
+    @Test
+    fun `browser_use takes the navigator model and the page plan switch`() {
+        val a = BrowserUseArgs.parse("""{"task":"t","navigator_model":"claude-haiku-4-5","page_plan":false}""").getOrThrow()
+        assertEquals("claude-haiku-4-5", a.navigatorModel); assertFalse(a.pagePlan)
+        val d = BrowserUseArgs.parse("""{"task":"t"}""").getOrThrow()
+        assertNull(d.navigatorModel); assertTrue(d.pagePlan)
+        assertTrue(LlmrpaMcpToolProvider.BROWSER_USE_SCHEMA.contains("\"navigator_model\"") && LlmrpaMcpToolProvider.BROWSER_USE_SCHEMA.contains("\"page_plan\""))
     }
 }

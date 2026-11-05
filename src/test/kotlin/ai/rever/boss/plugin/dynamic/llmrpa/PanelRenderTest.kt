@@ -232,6 +232,22 @@ class PanelRenderTest {
     }
 
     @Test
+    fun `the navigator model is a setting of the Jev tab, automatic until one is picked`() {
+        Dispatchers.setMain(UnconfinedTestDispatcher())
+        try {
+            val c = jevComponent()
+            assertEquals(null, c.navigatorModel.value)
+            val haiku = ModelOption(ModelOption.Kind.CHAT, "ANTHROPIC", "Anthropic", "claude-haiku-4-5")
+            c.selectNavigatorModel(haiku)
+            assertEquals(haiku, c.navigatorModel.value)
+            c.selectNavigatorModel(null)
+            assertEquals(null, c.navigatorModel.value)
+        } finally {
+            Dispatchers.resetMain()
+        }
+    }
+
+    @Test
     fun `readiness recovers when Jev registers after the panel opened`() {
         Dispatchers.setMain(UnconfinedTestDispatcher())
         try {
