@@ -961,12 +961,16 @@ internal class ComputerUseFlow(
                 // A private field never gets text a model wrote, and a dropdown's text is chosen, not written.
                 val mayAsk = req.llmTyping && !sensitive && !isSelect
                 if (options.isEmpty() && !mayAsk) return clicked.copy(note = noted("no text from the goal fits '${field.label.take(40)}'"))
-                val picked = pickText(tools, llm, req, plan, field, options, url, title, history, mayAsk)
+                // A message box takes a sentence: the writing model writes it straight from the goal, not a phrase chosen from the goal.
+                val free = Cu.freeTextField(field) && !sensitive && !isSelect
+                val given = (plan.typeValues + req.inputs.values + Candidates.values(plan.goal)).map { it.trim() }.filter { it.isNotEmpty() }
+                val picked = (if (free && req.llmTyping && given.size != 1) writeText(llm, req, plan, field, url, title, history, free = true)?.let { it to true } else null)
+                    ?: pickText(tools, llm, req, plan, field, options, url, title, history, mayAsk)
                     ?: return clicked.copy(note = noted("no text found for '${field.label.take(40)}'"))
                 if (sensitive) tools.secrets.add(picked.first)
                 val typed = send("type_text", picked.first)
                 failure(typed)?.let { return clicked.copy(note = noted(it), failed = true) }
-                return clicked.copy(text = if (sensitive) Secrets.MASK else picked.first, textSource = if (picked.second) WRITTEN_BY_MODEL else null)
+                return clicked.copy(text = if (sensitive) Secrets.MASK else picked.first, textSource = if (picked.second) WRITTEN_BY_MODEL else null, field = "${field.label.trim().lowercase()}|${field.tag.lowercase()}")
             }
             VisionOp.PRESS_ENTER -> return send("key", "Enter").let { r -> failure(r)?.let { base(it, true) } ?: base() }
             VisionOp.SCROLL_DOWN, VisionOp.SCROLL_UP -> {
@@ -1009,10 +1013,14 @@ internal class ComputerUseFlow(
     }
 
     /** One planner-model call for a field's text; null when it fails or says nothing. */
-    private suspend fun writeText(llm: UseLlm, req: UseRequest, plan: UsePlan, field: Focused, url: String, title: String, history: List<UseStep>): String? {
+    private suspend fun writeText(llm: UseLlm, req: UseRequest, plan: UsePlan, field: Focused, url: String, title: String, history: List<UseStep>, free: Boolean = false): String? {
         val user = buildString {
             appendLine("Request: ${req.task.take(2_000)}")
             appendLine("Goal: ${plan.goal}")
+            if (free) {
+                appendLine("This is a free-text field: write what the user wants it to say as one short sentence taken from the request, for example \"The export button is broken.\".")
+                Cu.clauseOptions(plan.goal).firstOrNull()?.let { appendLine("The request's own clause for it: ${ChatDecider.quote(it, 200)}") }
+            }
             appendLine("Field: label=${ChatDecider.quote(field.label, 100)}, tag=${field.tag}, type=${field.type ?: "text"}, options=${field.options?.take(40)?.joinToString(" | ") { ChatDecider.quote(it, 60) } ?: "none"}")
             appendLine("Page: ${ChatDecider.quote(title)} (${ChatDecider.quote(url, 200)})")
             appendLine("Recent steps: ${history.takeLast(6).joinToString("; ") { it.description }.ifEmpty { "none" }}")

@@ -94,6 +94,8 @@ internal data class UseStep(
     /** For a scroll: how far down the page it was left, in percent, known after the next screenshot. */
     val scrolledTo: ScrollPos? = null,
     val snapped: Snapped? = null,
+    /** What a TYPE_TEXT typed into: the focused field's label and tag, to tell the same field from another. */
+    val field: String? = null,
 ) {
     val where: String? get() = if (xPct != null) "${xPct}%, ${yPct}%" else null
     val description: String
@@ -454,6 +456,14 @@ internal object Cu {
             clicks.all { Math.abs(it.xPct!! - clicks[0].xPct!!) <= 2 && Math.abs(it.yPct!! - clicks[0].yPct!!) <= 2 }) {
             return "the same spot clicked 3 times with no new page"
         }
+        // The same text typed into the same field again, and nothing on the page changed: a retype loop. Two are enough.
+        val typed = acts.takeLast(2)
+        if (typed.size == 2 && typed.all { it.op == VisionOp.TYPE_TEXT && it.text != null && it.field != null && it.xPct != null } &&
+            typed[0].text == typed[1].text && typed[0].field == typed[1].field &&
+            Math.abs(typed[0].xPct!! - typed[1].xPct!!) <= 3 && Math.abs(typed[0].yPct!! - typed[1].yPct!!) <= 3 &&
+            contentUnchanged(typed[1].before, now)) {
+            return "the same text typed twice into the same field with nothing changing"
+        }
         // Saving the same screen over and over.
         if (steps.takeLast(3).let { l -> l.size == 3 && l.all { it.op == VisionOp.COLLECT } }) return "collecting the same screen again"
         // A dialog that keeps coming back after it was answered.
@@ -490,8 +500,41 @@ internal object Cu {
     fun textOptions(goal: String, typeValues: List<String>, pageUrl: String, sensitive: Boolean, inputs: Map<String, String> = emptyMap()): List<String> {
         // A caller's input named like a secret (a password, a code) goes only into a private field.
         val given = (typeValues + inputs.filterKeys { sensitive || !secretName(it) }.values + Candidates.values(goal)).map { it.trim() }.filter { it.isNotEmpty() }
-        val all = if (sensitive) given else given.filterNot { Candidates.isKeywordSecret(goal, it) } + Candidates.phrases(goal, listOf(pageUrl))
+        val all = if (sensitive) given else given.filterNot { Candidates.isKeywordSecret(goal, it) } + Candidates.phrases(goal, listOf(pageUrl)) + clauseOptions(goal)
         return all.distinctBy { it.lowercase() }
+    }
+
+    private val CLAUSE_MARKERS = listOf(Regex("""(?i)\b(?:saying|says|asking|that|about|with the message)\b[\s:,-]*"""), Regex("""[:\u2014]\s*"""))
+    private const val CLAUSE_MAX_WORDS = 20
+
+    /**
+     * The goal's clause after "saying", "that", "about", "asking", "with the message", ":" or an em dash (up to 20 words), as whole-sentence
+     * text options: [Candidates.phrases] stops at 4 words, which cuts "the export button is broken" to "export button". Anything that
+     * holds a secret the goal names is left out.
+     */
+    fun clauseOptions(goal: String): List<String> {
+        val secrets = Candidates.keywordPrivate(goal).filter { it.isNotBlank() }
+        val out = mutableListOf<String>()
+        for (marker in CLAUSE_MARKERS) {
+            val m = marker.find(goal) ?: continue
+            val rest = goal.substring(m.range.last + 1).trim().trim('"', '\u201c', '\u201d', '\u2018', '\u2019', '\'', ' ')
+            val words = rest.split(Regex("\\s+")).filter { it.isNotEmpty() }
+            if (words.isEmpty()) continue
+            val clause = words.take(CLAUSE_MAX_WORDS).joinToString(" ").trimEnd('.', ',', ';', '"', '\u201d', '\'', ' ')
+            if (clause.length < 3 || secrets.any { clause.contains(it, ignoreCase = true) }) continue
+            out += clause.replaceFirstChar { it.uppercase() }
+        }
+        return out.distinctBy { it.lowercase() }
+    }
+
+    private val FREE_TEXT_LABEL = Regex("(?i)message|comment|description|note|details|feedback|reason|body|question")
+
+    /** A field that takes a sentence: a textarea, a contenteditable, or an input labelled like a message. */
+    fun freeTextField(f: Focused): Boolean {
+        val tag = f.tag.lowercase()
+        if (tag == "textarea") return true
+        if (tag != "input" && tag != "select" && f.editable) return true // contenteditable
+        return tag == "input" && FREE_TEXT_LABEL.containsMatchIn(f.label)
     }
 
     fun secretName(name: String): Boolean = Regex("(?i)pass|pin\\b|otp|code|cvv|cvc|ssn|secret|token|card").containsMatchIn(name)

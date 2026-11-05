@@ -247,6 +247,7 @@ class ComputerUseTest {
         val calls = mutableListOf<Pair<String, JsonObject>>()
         var jevCalls = 0
         val askLlmOffered = mutableListOf<Boolean>()
+        val textOptionsSeen = mutableListOf<List<String>>()
         var shots = 0
         /** The screenshot content; clicks change it unless [frozen]. */
         var frozen = false
@@ -345,6 +346,7 @@ class ComputerUseTest {
                     } else if ("text" in q) {
                         val criteria = q["text"]!!.jsonObject["criteria"]!!.jsonObject.mapValues { it.value.jsonPrimitive.content }
                         askLlmOffered += JevDecider.ASK_LLM in criteria
+                        textOptionsSeen += criteria.filterKeys { it != JevDecider.NONE_OF_THESE && it != JevDecider.ASK_LLM }.values.toList()
                         val key = if (textPick == ASK) JevDecider.ASK_LLM else criteria.entries.firstOrNull { it.value == textPick }?.key ?: JevDecider.NONE_OF_THESE
                         ToolReply("""{"response":{"answers":{"text":{"type":"choice","choice":"$key","probabilities":{"$key":0.95}}},"usage":{"cost":0.001}}}""", false)
                     } else {
@@ -1479,6 +1481,106 @@ class ComputerUseTest {
         TaskRunner(dom2, JevDecider(dom2, JEV), "t1", "Open the sign in link", pointerLabel = long) { Answer.Stop }.run()
         assertTrue(dom2.stepArgs.isNotEmpty())
         assertEquals(clipped, dom2.stepArgs.first()["pointer"]!!.jsonObject["label"]!!.jsonPrimitive.content)
+    }
+
+    // ---- free text, whole clauses, and the retype loop ----
+
+    private val messageGoal = "Fill the contact form and send a message saying the export button is broken"
+
+    @Test
+    fun `the goal's clause after saying, that, about, asking or a colon is a whole-sentence option`() {
+        assertEquals(listOf("The export button is broken"), Cu.clauseOptions(messageGoal))
+        assertEquals(listOf("Hello there, I need help"), Cu.clauseOptions("Write to support: hello there, I need help."))
+        assertEquals(listOf("Pricing for teams"), Cu.clauseOptions("Ask sales about pricing for teams"))
+        // Up to 20 words, with no cap of 4.
+        val long = Cu.clauseOptions("Send a message saying " + (1..30).joinToString(" ") { "w$it" }).single()
+        assertEquals(20, long.split(" ").size)
+        assertEquals(emptyList(), Cu.clauseOptions("Open the orders page"))
+        // A secret the goal names is never part of an option.
+        assertTrue(Cu.clauseOptions("Log in saying password hunter2x please").none { it.contains("hunter2x") })
+        // They join every text choice, but never a private field's.
+        val opts = Cu.textOptions(messageGoal, emptyList(), "https://a.com", sensitive = false)
+        assertTrue("The export button is broken" in opts)
+        assertTrue("export button" in opts) // the 4-word phrases are still there
+        assertFalse("The export button is broken" in Cu.textOptions(messageGoal, listOf("hunter2"), "https://a.com", sensitive = true))
+    }
+
+    @Test
+    fun `a textarea, a contenteditable and a message-like input are free-text fields, other fields are not`() {
+        fun f(tag: String, label: String, editable: Boolean = true) = Focused(tag, editable, label, null, null)
+        assertTrue(Cu.freeTextField(f("textarea", "")))
+        assertTrue(Cu.freeTextField(f("div", "", editable = true)))
+        assertTrue(Cu.freeTextField(f("input", "Your Message")))
+        assertTrue(Cu.freeTextField(f("input", "Additional details")))
+        assertTrue(Cu.freeTextField(f("input", "Reason for contact")))
+        assertFalse(Cu.freeTextField(f("input", "Email")))
+        assertFalse(Cu.freeTextField(f("input", "Search")))
+        assertFalse(Cu.freeTextField(f("select", "Topic", editable = false)))
+        assertFalse(Cu.freeTextField(f("div", "", editable = false)))
+    }
+
+    @Test
+    fun `the same text typed again into the same field with nothing changed is no progress after two`() {
+        fun typed(text: String, field: String = "message|textarea", x: Int = 50, y: Int = 60, content: String? = "c1") =
+            act(VisionOp.TYPE_TEXT, Seen("https://a.com/", 0.0, "h", content), x, y, text).copy(field = field)
+        val now = Seen("https://a.com/", 0.0, "caret-blink", "c1")
+        assertNotNull(Cu.noProgress(listOf(typed("export button"), typed("export button")), now))
+        // One typing is not a loop; another text, another field or a click elsewhere is not the same.
+        assertNull(Cu.noProgress(listOf(typed("export button")), now))
+        assertNull(Cu.noProgress(listOf(typed("export button"), typed("the export button is broken")), now))
+        assertNull(Cu.noProgress(listOf(typed("export button"), typed("export button", field = "email|input")), now))
+        assertNull(Cu.noProgress(listOf(typed("export button"), typed("export button", x = 58)), now))
+        // Within 3% is the same spot.
+        assertNotNull(Cu.noProgress(listOf(typed("export button"), typed("export button", x = 52, y = 58)), now))
+        // The page changed with the last typing: it did something.
+        assertNull(Cu.noProgress(listOf(typed("export button"), typed("export button", content = "c0")), now))
+    }
+
+    @Test
+    fun `a retyped phrase in a message box stops the run instead of looping until the budget`() = runTest {
+        val browser = FakeBrowser(tmp(), listOf("TYPE_TEXT"), textPick = "export button").also {
+            it.focused = """{"tag":"textarea","editable":true,"label":"Message"}"""
+            it.contentHash = { "form-state" }
+        }
+        val report = flow(browser, FakeTabs(), mutableListOf(), plan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"$messageGoal","type_values":[]}""")
+            .runComputerUse(UseRequest("t", llmTyping = false, maxSteps = 15))
+        assertEquals(UseStatus.NEEDS_INPUT, report.status)
+        assertEquals(2, report.steps.size)
+        assertEquals(2, browser.stepArgs("type_text").size)
+        assertTrue(report.blocker!!.reason.contains("same text typed twice into the same field"))
+    }
+
+    @Test
+    fun `a textarea gets a sentence written by the model from the goal, not a phrase`() = runTest {
+        val browser = FakeBrowser(tmp(), listOf("TYPE_TEXT", "DONE")).also { it.focused = """{"tag":"textarea","editable":true,"label":"Message"}""" }
+        val requests = mutableListOf<AiRequest>()
+        val report = flow(browser, FakeTabs(), requests, plan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"$messageGoal","type_values":[]}""").runComputerUse(UseRequest("t"))
+        assertEquals("written text", browser.stepArgs("type_text").single()["action"]!!.jsonObject["value"]!!.jsonPrimitive.content)
+        assertEquals(ComputerUseFlow.WRITTEN_BY_MODEL, report.steps.single().textSource)
+        // No phrase choice was made: the writing model was asked, with the field and the goal's own clause.
+        assertEquals(0, browser.textOptionsSeen.size)
+        val ask = requests.single { it.system.startsWith("You write") }.messages.single().text
+        assertTrue(ask.contains("free-text field"))
+        assertTrue(ask.contains("The export button is broken"))
+        assertTrue(ask.contains("Field: label=\"Message\""))
+        // A private field never gets it, and a given value wins over writing.
+        val given = FakeBrowser(tmp(), listOf("TYPE_TEXT", "DONE"), textPick = "Please call me").also { it.focused = """{"tag":"textarea","editable":true,"label":"Message"}""" }
+        val r2 = mutableListOf<AiRequest>()
+        flow(given, FakeTabs(), r2, plan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"Send my note","type_values":[]}""").runComputerUse(UseRequest("t", inputs = mapOf("note" to "Please call me")))
+        assertEquals("Please call me", given.stepArgs("type_text").single()["action"]!!.jsonObject["value"]!!.jsonPrimitive.content)
+        assertEquals(0, r2.count { it.system.startsWith("You write") })
+    }
+
+    @Test
+    fun `with typing by the model off, the goal's clause is offered as an option for a message box`() = runTest {
+        val browser = FakeBrowser(tmp(), listOf("TYPE_TEXT", "DONE"), textPick = "The export button is broken").also { it.focused = """{"tag":"textarea","editable":true,"label":"Message"}""" }
+        val requests = mutableListOf<AiRequest>()
+        val report = flow(browser, FakeTabs(), requests, plan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"$messageGoal","type_values":[]}""").runComputerUse(UseRequest("t", llmTyping = false))
+        assertTrue("The export button is broken" in browser.textOptionsSeen.single())
+        assertEquals("The export button is broken", browser.stepArgs("type_text").single()["action"]!!.jsonObject["value"]!!.jsonPrimitive.content)
+        assertNull(report.steps.single().textSource)
+        assertEquals(0, requests.count { it.system.startsWith("You write") })
+        assertEquals(listOf(false), browser.askLlmOffered)
     }
 
     // ---- popup windows that are not tabs ----
