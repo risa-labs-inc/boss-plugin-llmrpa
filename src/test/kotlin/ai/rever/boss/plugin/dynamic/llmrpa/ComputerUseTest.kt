@@ -3510,7 +3510,7 @@ class ComputerUseTest {
         {"id":"m3","role":"button","tag":"button","label":"ADD","rect":{"x":900,"y":540,"w":80,"h":32},"disabled":false,"covered":false,"context":"Chocolate Tres Leches ₹500","editable":false},
         {"id":"m4","role":"button","tag":"button","label":"ADD","rect":{"x":900,"y":660,"w":80,"h":32},"disabled":false,"covered":false,"context":"Brownie ₹250","editable":false},
         {"id":"m5","role":"link","tag":"a","label":"Classic Tres Leches","rect":{"x":100,"y":300,"w":200,"h":20},"disabled":false,"covered":false,"context":"","editable":false}]"""
-    private val tresPlan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"Add Tres Leches to the cart","entities":["Tres Leches"],"type_values":[]}"""
+    private val tresPlan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"Add Tres Leches to the cart","milestones":["Tres Leches is visible on the menu"],"entities":["Tres Leches"],"type_values":[]}"""
 
     @Test
     fun `several matching items and a hesitant Jev is a question with options, not stuck`() = runTest {
@@ -3530,7 +3530,7 @@ class ComputerUseTest {
         val sure = looking(listOf("CLICK", "DONE")) { lookElements = threeItems; clickPick = "m1"; pickP = 0.9 }
         assertEquals(UseStatus.DONE, flow(sure, FakeTabs(), mutableListOf(), plan = tresPlan).runComputerUse(UseRequest("t", maxSteps = 6)).status)
         val one = looking(listOf("CLICK", "DONE")) { lookElements = threeItems; clickPick = "m4"; pickP = 0.4 }
-        assertEquals(UseStatus.DONE, flow(one, FakeTabs(), mutableListOf(), plan = tresPlan.replace("Tres Leches\"]", "Brownie\"]")).runComputerUse(UseRequest("t", maxSteps = 6)).status)
+        assertEquals(UseStatus.DONE, flow(one, FakeTabs(), mutableListOf(), plan = tresPlan.replace("Tres Leches is visible", "Brownie is visible").replace("\"entities\":[\"Tres Leches\"]", "\"entities\":[\"Brownie\"]")).runComputerUse(UseRequest("t", maxSteps = 6)).status)
         // The reply resumes on the same tab: by number, found again in a fresh look, with the choice as advice.
         val resume = flow(b, FakeTabs(), mutableListOf(), plan = tresPlan).runComputerUse(UseRequest("Add Tres Leches to the cart", tabId = "t1", resume = true, inputs = mapOf("choice" to "2"), maxSteps = 6), run)
         assertEquals(UseStatus.DONE, resume.status, resume.error)
@@ -3555,7 +3555,7 @@ class ComputerUseTest {
     fun `when the goal's own words name exactly one candidate it is picked without asking`() = runTest {
         val task = "Add the classic tres leches to the cart"
         val b = looking(listOf("CLICK", "DONE")) { lookElements = threeItems; clickPick = "m2"; pickP = 0.4 }
-        val r = flow(b, FakeTabs(), mutableListOf(), plan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"$task","entities":["Tres Leches"],"type_values":[]}""").runComputerUse(UseRequest(task, maxSteps = 6))
+        val r = flow(b, FakeTabs(), mutableListOf(), plan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"$task","milestones":["Tres Leches is visible on the menu"],"entities":["Tres Leches"],"type_values":[]}""").runComputerUse(UseRequest(task, maxSteps = 6))
         assertEquals(UseStatus.DONE, r.status, r.error)
         assertEquals("m1", b.stepArgs("click_at").single()["action"]!!.jsonObject["element"]!!.jsonPrimitive.content)
         // Not enough: "tres leches" alone is every candidate's name part, so it asks.
@@ -3563,16 +3563,83 @@ class ComputerUseTest {
         assertEquals(UseStatus.NEEDS_INPUT, flow(vague, FakeTabs(), mutableListOf(), plan = tresPlan).runComputerUse(UseRequest("Add Tres Leches to the cart", maxSteps = 6)).status)
         // The rule on its own.
         val marks = Marks.parseMarks(json("""{"e":$threeItems}""")["e"]!!.jsonArray)
+        val ms = "Tres Leches is visible on the menu"
+        val page = "Z https://sample.com/"
         val low = VisionDecision(VisionOp.CLICK, 0.9, null, null, null, 0.0, clickChoice = "m2", mark = marks[1], markP = 0.4)
-        assertEquals("m3", (Marks.disambiguate(low, marks, listOf("Tres Leches"), listOf("chocolate tres leches")) as Marks.Disambiguation.Chosen).mark.id)
-        assertTrue(Marks.disambiguate(low, marks, listOf("Tres Leches"), emptyList()) is Marks.Disambiguation.Ask)
-        assertNull(Marks.disambiguate(low.copy(markP = 0.7), marks, listOf("Tres Leches"), emptyList()))
-        assertNull(Marks.disambiguate(low.copy(op = VisionOp.SCROLL_DOWN), marks, listOf("Tres Leches"), emptyList()))
-        assertNull(Marks.disambiguate(low, marks, listOf("Brownie"), emptyList()))
+        assertEquals("m3", (Marks.disambiguate(low, marks, listOf("Tres Leches"), listOf("chocolate tres leches"), ms, page) as Marks.Disambiguation.Chosen).mark.id)
+        assertTrue(Marks.disambiguate(low, marks, listOf("Tres Leches"), emptyList(), ms, page) is Marks.Disambiguation.Ask)
+        assertNull(Marks.disambiguate(low.copy(markP = 0.7), marks, listOf("Tres Leches"), emptyList(), ms, page))
+        assertNull(Marks.disambiguate(low.copy(markP = 0.6), marks, listOf("Tres Leches"), emptyList(), ms, page)) // 0.6 is enough for one candidate
+        assertNull(Marks.disambiguate(low.copy(op = VisionOp.SCROLL_DOWN), marks, listOf("Tres Leches"), emptyList(), ms, page))
+        assertNull(Marks.disambiguate(low, marks, listOf("Brownie"), emptyList(), ms, page))
+        // The current milestone must name the item; with none, or naming something else, nothing is asked.
+        assertNull(Marks.disambiguate(low, marks, listOf("Tres Leches"), emptyList(), null, page))
+        assertNull(Marks.disambiguate(low, marks, listOf("Tres Leches"), emptyList(), "The menu is open", page))
+        // An entity in the page's title or address is the site or brand, not an item.
+        assertNull(Marks.disambiguate(low, marks, listOf("Tres Leches"), emptyList(), ms, "Tres Leches Bakery https://tresleches.example/"))
+        // Options read name and price, never the label of the element.
+        assertEquals(listOf("Classic Tres Leches \u20B9450", "Eggless Classic Tres Leches \u20B9470", "Chocolate Tres Leches \u20B9500"), (Marks.disambiguate(low, marks, listOf("Tres Leches"), emptyList(), ms, page) as Marks.Disambiguation.Ask).options.map(Marks::display))
         // At most 6 options, each at most 60 characters.
         val many = (1..9).map { Mark("m$it", "button", "button", "ADD", null, Cu.Rect(0.0, it * 10.0, 5.0, it * 10.0 + 5), false, false, "Tres Leches variant $it " + "x".repeat(80), false, null) }
-        val ask = Marks.disambiguate(low.copy(clickChoice = "m1", mark = many[0]), many, listOf("Tres Leches"), emptyList()) as Marks.Disambiguation.Ask
+        val ask = Marks.disambiguate(low.copy(clickChoice = "m1", mark = many[0]), many, listOf("Tres Leches"), emptyList(), ms, page) as Marks.Disambiguation.Ask
         assertEquals(6, ask.options.size)
         assertTrue(ask.options.all { Marks.display(it).length <= 60 })
+    }
+
+    @Test
+    fun `run 04e7, a restaurant page whose entity is the brand and whose candidates are an address link and an icon asks nothing`() = runTest {
+        val elements = """[
+            {"id":"m1","role":"link","tag":"a","label":"Direction","rect":{"x":100,"y":300,"w":80,"h":20},"disabled":false,"covered":false,"context":"Khasra No- 542, Sector 29, Gurgaon","editable":false},
+            {"id":"m2","role":"img","tag":"svg","label":"right-triangle","rect":{"x":300,"y":300,"w":20,"h":20},"disabled":false,"covered":false,"context":"","editable":false},
+            {"id":"m3","role":"button","tag":"button","label":"Call","rect":{"x":400,"y":300,"w":60,"h":20},"disabled":false,"covered":false,"context":"Magnolia Bakery, Gurgaon","editable":false}]"""
+        val plan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"Order Tres Leches from Magnolia Bakery","milestones":["Magnolia Bakery's Order Online menu is open","Tres Leches is in the cart"],"entities":["Magnolia Bakery","Tres Leches"],"type_values":[]}"""
+        // The entity is in the page's title: it is the brand. Jev's hesitation is its own business (a normal decision).
+        val brand = looking(listOf("CLICK", "DONE")) { lookElements = elements; clickPick = "m1"; pickP = 0.4; shotMeta = true; currentTitle = "Magnolia Bakery - Order online" }
+        val r = flow(brand, FakeTabs(), mutableListOf(), plan = plan).runComputerUse(UseRequest("t", maxSteps = 6))
+        assertTrue(r.blocker?.options.isNullOrEmpty(), r.blocker?.question)
+        // Even when the title does not say it, a link with an address and an icon are not look-alike items.
+        val untitled = Marks.disambiguate(VisionDecision(VisionOp.CLICK, 0.9, null, null, null, 0.0, clickChoice = "m1", markP = 0.3), Marks.parseMarks(json("""{"e":$elements}""")["e"]!!.jsonArray),
+            listOf("Magnolia Bakery"), emptyList(), "Magnolia Bakery's Order Online menu is open", "Order online https://sample.com/")
+        assertNull(untitled)
+        // Two buttons with the same label on different cards, where the title does not hold the entity: an item question.
+        val two = Marks.parseMarks(json("""{"e":[
+            {"id":"m1","role":"button","tag":"button","label":"Call","rect":{"x":1,"y":1,"w":9,"h":9},"disabled":false,"covered":false,"context":"Magnolia Bakery Sector 29","editable":false},
+            {"id":"m2","role":"button","tag":"button","label":"Call","rect":{"x":1,"y":20,"w":9,"h":9},"disabled":false,"covered":false,"context":"Magnolia Bakery Sector 51","editable":false}]}""")["e"]!!.jsonArray)
+        assertTrue(Marks.disambiguate(VisionDecision(VisionOp.CLICK, 0.9, null, null, null, 0.0, clickChoice = "m1", markP = 0.3), two, listOf("Magnolia Bakery"), emptyList(), "Magnolia Bakery's page is open", "Order https://x/") is Marks.Disambiguation.Ask)
+    }
+
+    @Test
+    fun `the number tags are at least 18 px tall with 14 px bold digits, outside the corner, and never cover each other`() {
+        assertTrue(MarkImage.tagFontSize(1100) >= 14)
+        val dir = tmp()
+        val src = File(dir, "wide.jpg")
+        javax.imageio.ImageIO.write(java.awt.image.BufferedImage(1100, 700, java.awt.image.BufferedImage.TYPE_INT_RGB).also { img -> img.createGraphics().apply { color = java.awt.Color.WHITE; fillRect(0, 0, 1100, 700); dispose() } }, "jpg", src)
+        val shot = Shot(src.absolutePath, 1100, 700, 1100, 700, 1.0)
+        // Ten small elements packed in a row (their corners are 2 px apart), and one at the very top edge.
+        val packed = (1..10).map { i -> Mark("m$i", "button", "button", "ADD", null, Cu.Rect(100.0 + i * 12, 300.0, 100.0 + i * 12 + 10, 320.0), false, false, "c", false, null) } +
+            Mark("m11", "button", "button", "Top", null, Cu.Rect(500.0, 2.0, 560.0, 30.0), false, false, "c", false, null)
+        val out = File(MarkImage.render(shot, packed)!!)
+        File("build/reports/visual").mkdirs()
+        out.copyTo(File("build/reports/visual/marks-packed.jpg"), overwrite = true)
+        val img = javax.imageio.ImageIO.read(out)
+        // Tags are dark with white digits: find the dark pill rows above the packed row (y 276..299 holds them, outside the corner).
+        fun dark(x: Int, y: Int) = java.awt.Color(img.getRGB(x, y)).let { it.red + it.green + it.blue < 450 }
+        val rows = (270..300).filter { y -> (100..300).any { x -> dark(x, y) } }
+        assertTrue(rows.size >= 18, "tag rows ${rows.size}")
+        // Every tag is its own: count separate pills along the strip (columns of dark pixels split by light gaps).
+        val cols = (100..330).map { x -> (270..300).any { y -> dark(x, y) } }
+        val groups = cols.zipWithNext().count { (a, b) -> !a && b } + if (cols.first()) 1 else 0
+        assertTrue(groups >= 5, "separate tags: $groups")
+        // The one at the top edge goes inside the corner, still on the image.
+        assertTrue((2..24).any { y -> dark(520, y) || dark(505, y) })
+        // A real screenshot, when this machine has one: kept for a look.
+        val real = File(System.getProperty("user.home"), ".boss/cache/rpaengine/shots/plugin-tab-1793895149248-b9184be154185de0-1793895153899.jpg")
+        if (real.exists()) {
+            val r = javax.imageio.ImageIO.read(real)
+            val tmpCopy = File(dir, "real.jpg").also { real.copyTo(it, overwrite = true) }
+            val css = Shot(tmpCopy.absolutePath, r.width, r.height, r.width, r.height, 1.0)
+            val marks = (0 until 14).map { i -> Mark("m${i + 1}", "button", "button", "ADD", if (i % 4 == 0) "checked" else null, Cu.Rect(40.0 + (i % 7) * 150, 120.0 + (i / 7) * 160, 40.0 + (i % 7) * 150 + 100, 150.0 + (i / 7) * 160), i == 5, false, "Item $i", false, null) }
+            File(MarkImage.render(css, marks)!!).copyTo(File("build/reports/visual/marks-real.jpg"), overwrite = true)
+        }
     }
 }

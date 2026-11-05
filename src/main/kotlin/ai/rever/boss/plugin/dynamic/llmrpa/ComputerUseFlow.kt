@@ -701,11 +701,11 @@ internal class ComputerUseFlow(
                         .getOrElse { return Outcome(UseStatus.ERROR, "Jev could not decide: ${it.message}") }
                     // Several equally good matches and Jev hesitating: the person chooses, unless the goal's own words name exactly one.
                     val goalWords = (Candidates.phrases(req.task, listOf(url)) + Candidates.phrases(plan.goal, listOf(url)) + Candidates.values(req.task) + Candidates.values(plan.goal)).distinct()
-                    d = when (val amb = Marks.disambiguate(decided, marks, lookPhrases, goalWords)) {
+                    d = when (val amb = Marks.disambiguate(decided, marks, plan.entities + lookPhrases, goalWords, milestoneNow, "$title $url")) {
                         is Marks.Disambiguation.Chosen -> decided.copy(mark = amb.mark, boxDisagreed = false, confidence = maxOf(decided.confidence, Cu.ASK_BELOW))
                         is Marks.Disambiguation.Ask -> {
                             run.pendingOptions = amb.options.map(Marks::display)
-                            return Outcome(UseStatus.NEEDS_INPUT, "Several items match '${amb.entity}' and Jev is only ${TaskRunner.pct(minOf(decided.markP ?: 1.0, decided.confidence))} sure which one you want",
+                            return Outcome(UseStatus.NEEDS_INPUT, "Several items match '${amb.entity}' and Jev is only ${TaskRunner.pct(decided.markP ?: 0.0)} sure which one you want",
                                 Marks.choiceQuestion(amb.options), amb.options.mapIndexed { i, m -> ChoiceOption("${i + 1}", Marks.display(m)) })
                         }
                         null -> decided

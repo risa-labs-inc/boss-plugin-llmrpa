@@ -163,24 +163,39 @@ internal object Marks {
     const val AMBIGUOUS_BELOW = 0.6
     const val MAX_CHOICES = 6
 
-    /** What an element is called to a person: the card or row around it, else its own label, at most 60 characters. */
-    fun display(m: Mark): String = clean(m.context.ifBlank { m.label }, 60)
+    private val PRICE = Regex("[\\u20B9$\\u20AC\\u00A3]\\s?\\d[\\d.,]*")
 
-    /** [display] without a price: "Classic Tres Leches ₹450" is "Classic Tres Leches". */
-    fun nameOf(m: Mark): String = display(m).replace(Regex("[\\u20B9$\\u20AC\\u00A3]\\s?\\d[\\d.,]*"), "").replace(Regex("\\s+"), " ").trim().trim('-', '\u2014', '\u00B7', ' ')
+    private fun context(m: Mark): String = clean(m.context, 60)
+
+    /** The item's name from the card or row around the element: its text without the price ("Classic Tres Leches"). Empty for an element with no context. */
+    fun nameOf(m: Mark): String = context(m).replace(PRICE, "").replace(Regex("\\s+"), " ").trim().trim('-', '\u2014', '\u00B7', ' ')
+
+    /** What an element is called to a person: the item name and its price from the context ("Classic Tres Leches \u20B9450"), else its own label. */
+    fun display(m: Mark): String {
+        val name = nameOf(m)
+        if (name.isEmpty()) return clean(m.label, 60)
+        val price = PRICE.find(context(m))?.value
+        return if (price != null) "$name $price" else name
+    }
+
+    /** Labels of an action button that adds or picks an item: ADD, Add to cart, Select, Buy, Book... */
+    private val ACTION_LABEL = Regex("(?i)^\\s*(\\+|add( item)?( to (cart|bag|basket|order))?|select|choose|buy( now)?|book( now)?|order( now)?|get)\\s*$")
 
     private fun pool(marks: List<Mark>, op: VisionOp) = (if (op == VisionOp.TYPE_TEXT) typeables(marks) else clickable(marks)).filter { !it.covered && !it.disabled }
 
+    /** An element that acts on one item of a list: a button (or an action-labelled element) with the item's card or row around it. */
+    private fun itemAction(m: Mark) = m.context.isNotBlank() && (m.role.equals("button", true) || ACTION_LABEL.matches(m.label))
+
     /**
-     * Marks that name the same [entities] entity and are alike (the same kind of element with the same label, such as the ADD buttons of three items),
-     * distinct by what they are called: two or more means the goal does not say which. Alike to [picked] when it is one of them, else the largest such group.
+     * The items [entity] names, each by an action element of the same kind (the ADD buttons of three products): same role and label as [picked] when it is
+     * one of them, else the largest such group, distinct by item name. Two or more means the goal does not say which.
      */
     fun alike(candidates: List<Mark>, entities: List<String>, picked: Mark?): Pair<String, List<Mark>>? {
         for (e in entities) {
-            val hit = candidates.filter { "${it.label} ${it.context}".contains(e, ignoreCase = true) }
+            val hit = candidates.filter { itemAction(it) && "${it.label} ${it.context}".contains(e, ignoreCase = true) }
             val group = if (picked != null && hit.any { it.id == picked.id }) hit.filter { it.role == picked.role && it.label.equals(picked.label, true) }
             else hit.groupBy { it.role to it.label.lowercase() }.values.maxByOrNull { it.size }.orEmpty()
-            val distinct = group.distinctBy { display(it).lowercase() }
+            val distinct = group.filter { nameOf(it).isNotEmpty() }.distinctBy { nameOf(it).lowercase() }
             if (distinct.size >= 2) return e to distinct.take(MAX_CHOICES)
         }
         return null
@@ -193,14 +208,16 @@ internal object Marks {
     }
 
     /**
-     * Jev picked CLICK or TYPE_TEXT with low confidence (its target probability or its operation confidence under [AMBIGUOUS_BELOW]) and two or more marks
-     * that name the same entity look alike: ask the person, unless one of [phrases] (the goal's own words) is exactly one candidate's name.
+     * Jev picked CLICK or TYPE_TEXT and no candidate has [AMBIGUOUS_BELOW] or more of its click_target probability, and the current [milestone] names an
+     * item ([entities] it holds that the page's [titleAndUrl] does not: that would be the site or brand) offered by two or more look-alike action
+     * elements: ask the person, unless one of [phrases] (the goal's own words) is exactly one candidate's name.
      */
-    fun disambiguate(d: VisionDecision, marks: List<Mark>, entities: List<String>, phrases: List<String>): Disambiguation? {
+    fun disambiguate(d: VisionDecision, marks: List<Mark>, entities: List<String>, phrases: List<String>, milestone: String?, titleAndUrl: String): Disambiguation? {
         if (d.op != VisionOp.CLICK && d.op != VisionOp.TYPE_TEXT) return null
-        if ((d.markP ?: 1.0) >= AMBIGUOUS_BELOW && d.confidence >= AMBIGUOUS_BELOW) return null
-        val (entity, group) = alike(pool(marks, d.op), entities, d.mark) ?: return null
-        val named = group.filter { m -> nameOf(m).let { n -> n.isNotEmpty() && phrases.any { it.trim().equals(n, ignoreCase = true) } } }
+        if (milestone == null || (d.markP ?: 1.0) >= AMBIGUOUS_BELOW) return null
+        val items = entities.filter { milestone.contains(it, ignoreCase = true) && !titleAndUrl.contains(it, ignoreCase = true) }
+        val (entity, group) = alike(pool(marks, d.op), items, d.mark) ?: return null
+        val named = group.filter { m -> nameOf(m).let { n -> phrases.any { it.trim().equals(n, ignoreCase = true) } } }
         named.singleOrNull()?.let { return Disambiguation.Chosen(it) }
         return Disambiguation.Ask(entity, group)
     }
@@ -225,7 +242,7 @@ internal object Marks {
             pool.filter { nameOf(it).equals(text, true) }.singleOrNull()?.let { return it }
             return pool.filter { display(it).contains(text, true) || (nameOf(it).length >= 3 && text.contains(nameOf(it), true)) }.distinctBy { display(it) }.singleOrNull()
         }
-        return find(cands.filter { it.context.isNotBlank() }) ?: find(cands)
+        return find(cands.filter(::itemAction)) ?: find(cands.filter { it.context.isNotBlank() }) ?: find(cands)
     }
 
     private val REFUSAL = Regex("""(?i)\bis (disabled|covered by\b.*)""")
@@ -235,10 +252,13 @@ internal object Marks {
         error?.takeIf { REFUSAL.containsMatchIn(it) }?.replace("'", "")?.replace(Regex("\\s+"), " ")?.trim()?.take(160)
 }
 
-/** Draws the numbered marks on a copy of the screenshot for Jev: a thin outline and a small numbered pill at each element's top-left corner. */
+/** Draws the numbered marks on a copy of the screenshot for Jev: a thin outline and a numbered pill (white bold digits on a dark colour) by each element's top-left corner. */
 internal object MarkImage {
-    private val OUTLINES = listOf(Color(0xE5, 0x39, 0x35), Color(0x1E, 0x88, 0xE5), Color(0x43, 0xA0, 0x47), Color(0xF5, 0x7C, 0x00), Color(0x8E, 0x24, 0xAA))
-    private val GREY = Color(0x9E, 0x9E, 0x9E)
+    private val OUTLINES = listOf(Color(0xB7, 0x1C, 0x1C), Color(0x0D, 0x47, 0xA1), Color(0x1B, 0x5E, 0x20), Color(0xE6, 0x51, 0x00), Color(0x4A, 0x14, 0x8C))
+    private val GREY = Color(0x42, 0x42, 0x42)
+
+    /** The tag's own size: at least 18 px tall with 14 px bold digits, more on a wide image. */
+    fun tagFontSize(imageWidth: Int): Int = (imageWidth / 70).coerceIn(14, 22)
 
     /** The marked copy saved as `<name>-marks.jpg` beside [shot]'s file, or null when nothing could be drawn or written. */
     fun render(shot: Shot, marks: List<Mark>): String? = runCatching {
@@ -252,9 +272,9 @@ internal object MarkImage {
             g.drawImage(src, 0, 0, null)
             val sx = src.width / shot.cssWidth.toDouble()
             val sy = src.height / shot.cssHeight.toDouble()
-            val font = Font(Font.SANS_SERIF, Font.BOLD, (src.width / 110).coerceIn(9, 14))
-            g.font = font
+            g.font = Font(Font.SANS_SERIF, Font.BOLD, tagFontSize(src.width))
             val fm = g.fontMetrics
+            val placed = mutableListOf<java.awt.geom.Rectangle2D.Double>()
             marks.forEachIndexed { i, m ->
                 val x = m.rect.left * sx
                 val y = m.rect.top * sy
@@ -262,17 +282,23 @@ internal object MarkImage {
                 val h = (m.rect.bottom - m.rect.top) * sy
                 val colour = if (m.disabled) GREY else OUTLINES[i % OUTLINES.size]
                 g.color = colour
-                g.stroke = BasicStroke(if (m.disabled) 1f else 1.5f)
+                g.stroke = BasicStroke(1.2f)
                 g.draw(java.awt.geom.Rectangle2D.Double(x, y, w, h))
-                // The number in a pill on the top-left corner, white on the outline's colour, kept inside the image.
                 val text = m.number
-                val pw = fm.stringWidth(text) + 6
-                val ph = fm.height
-                val px = x.coerceIn(0.0, (src.width - pw).toDouble().coerceAtLeast(0.0))
-                val py = (y - ph + 2).coerceIn(0.0, (src.height - ph).toDouble().coerceAtLeast(0.0))
-                g.fill(RoundRectangle2D.Double(px, py, pw.toDouble(), ph.toDouble(), 6.0, 6.0))
+                val pw = (fm.stringWidth(text) + 8).toDouble()
+                val ph = (fm.height + 4).toDouble()
+                // Outside the top-left corner when there is room, else inside it; shifted sideways or down until it covers no other tag.
+                val tries = buildList {
+                    add(x to y - ph); add(x to y)
+                    for (k in 1..6) { add(x + k * (pw + 2) to y - ph); add(x + k * (pw + 2) to y) }
+                    add(x - pw - 2 to y - ph); add(x - pw - 2 to y); add(x to y + h); add(x to y - 2 * ph)
+                }
+                fun fit(p: Pair<Double, Double>) = java.awt.geom.Rectangle2D.Double(p.first.coerceIn(0.0, (src.width - pw).coerceAtLeast(0.0)), p.second.coerceIn(0.0, (src.height - ph).coerceAtLeast(0.0)), pw, ph)
+                val box = tries.map(::fit).firstOrNull { c -> placed.none { it.intersects(c.x - 1, c.y - 1, c.width + 2, c.height + 2) } } ?: fit(tries.first())
+                placed += box
+                g.fill(RoundRectangle2D.Double(box.x, box.y, box.width, box.height, 6.0, 6.0))
                 g.color = Color.WHITE
-                g.drawString(text, (px + 3).toFloat(), (py + fm.ascent - 1).toFloat())
+                g.drawString(text, (box.x + 4).toFloat(), (box.y + 2 + fm.ascent).toFloat())
             }
         } finally {
             g.dispose()
