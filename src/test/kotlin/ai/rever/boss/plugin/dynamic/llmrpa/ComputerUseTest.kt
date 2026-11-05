@@ -2980,7 +2980,7 @@ class ComputerUseTest {
         assertTrue(tool.readOnly)
         suspend fun call(raw: String) = tool.handler.call(ai.rever.boss.plugin.api.McpToolArgs(emptyMap(), raw))
         val schema = json(tool.inputSchema)
-        assertEquals(setOf("run_id", "limit", "include_activity"), schema["properties"]!!.jsonObject.keys)
+        assertEquals(setOf("run_id", "limit", "include_activity", "full"), schema["properties"]!!.jsonObject.keys)
         assertFalse(schema["additionalProperties"]!!.jsonPrimitive.content.toBoolean())
 
         // Nothing yet.
@@ -2993,21 +2993,26 @@ class ComputerUseTest {
         var liveText = ""
         browser.onAction = { type, _ -> if (type == "scroll_by") liveText = kotlinx.coroutines.runBlocking { call("{}").text } }
         val report = flow(browser, FakeTabs(), mutableListOf(), log = store).runComputerUse(UseRequest("find x"), run)
-        // While it ran: the live run, with its activity cut to a count.
+        // While it ran: the live run, compact.
         val live = json(liveText)["live"]!!.jsonObject
         assertEquals(run.id, live["run_id"]!!.jsonPrimitive.content)
         assertEquals("running", live["status"]!!.jsonPrimitive.content)
-        assertTrue("activity_count" in live && "activity" !in live)
+        assertTrue("activity" !in live && "steps" !in live)
 
-        // One run by id: full record; activity on request.
-        val one = json(call("""{"run_id":"${run.id}"}""").text)
+        // One run by id: compact by default.
+        val compact = json(call("""{"run_id":"${run.id}"}""").text)
+        assertEquals(setOf("run_id", "status", "steps_count", "seconds", "last_step", "cost"), compact.keys)
+        assertEquals("done", compact["status"]!!.jsonPrimitive.content)
+        assertEquals("SCROLL_DOWN", compact["last_step"]!!.jsonObject["op"]!!.jsonPrimitive.content)
+        // full: the report as browser_use returned it, and the record; activity on request.
+        val one = json(call("""{"run_id":"${run.id}","full":true}""").text)
         // A finished run reads exactly as browser_use returned it, with the log's detail under "record".
         assertEquals("done", one["status"]!!.jsonPrimitive.content)
         assertEquals(report.runId, one["run_id"]!!.jsonPrimitive.content)
         assertEquals(report.toJson().keys, one.keys - "record")
         assertTrue("steps" in one && "activity" !in one)
         assertTrue("activity_count" in one["record"]!!.jsonObject && "activity" !in one["record"]!!.jsonObject && "report" !in one["record"]!!.jsonObject)
-        assertTrue("activity" in json(call("""{"run_id":"${run.id}","include_activity":true}""").text)["record"]!!.jsonObject)
+        assertTrue("activity" in json(call("""{"run_id":"${run.id}","include_activity":true,"full":true}""").text)["record"]!!.jsonObject)
         // Without an id: nothing live now, and the run listed.
         val list = json(call("""{"limit":3}""").text)
         assertTrue(list["live"] is kotlinx.serialization.json.JsonNull)

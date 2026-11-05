@@ -68,6 +68,10 @@ internal class AgentLoop(
         var pageText: String? = null
         var content: String? = null
         var marks: List<Mark> = emptyList()
+        /** Popup windows that errored or closed: never switched to again (a target=_blank page arrives as a tab instead). */
+        val dead = HashSet<String>()
+        /** The last action clicked a text field. */
+        var clickedField = false
         /** What the executor itself learned about the last action (a field's value), put in front of what the next look shows. */
         var fieldNote: String? = null
         var fieldChanged = false
@@ -77,7 +81,7 @@ internal class AgentLoop(
         val tools = RecordingTools(rawTools, run.log, clock, run.secrets)
         val mem = run.agent ?: AgentMemory().also { run.agent = it }
         run.inputs.putAll(req.inputs)
-        run.inputs.filterKeys(Cu::secretName).values.filter { it.isNotBlank() }.forEach { if (it !in tools.secrets) tools.secrets.add(it) }
+        run.inputs.filterKeys(AgentPrompt::secretInput).values.filter { it.isNotBlank() }.forEach { if (it !in tools.secrets) tools.secrets.add(it) }
         req.reply?.trim()?.takeIf { it.isNotEmpty() }?.let { reply ->
             val pending = mem.pendingConfirm
             if (pending != null && CONFIRM.matches(reply)) mem.confirmed += pending
@@ -151,7 +155,8 @@ internal class AgentLoop(
         st.known = runCatching { tabs.snapshot() }.getOrDefault(emptyMap())
 
         val steps = run.steps.value.toMutableList()
-        fun publish() { run.steps.value = steps.toList(); runLog?.update(run) }
+        // What the person and callers read has secret input values masked (by input name, never by scanning text).
+        fun publish() { run.steps.value = steps.map { maskStep(it, run.secrets) }; runLog?.update(run) }
         var taken = 0
         var misses = 0
         var lastStepIndex = -1
@@ -196,6 +201,7 @@ internal class AgentLoop(
                         val result = when {
                             url != st.url -> listOfNotNull(st.fieldNote, "now on '${shot.title.orEmpty().take(60)}' (${host(url)})").joinToString("; ")
                             parts.isNotEmpty() -> parts.joinToString("; ")
+                            st.clickedField -> "$NOTHING; if the field is focused, type now"
                             else -> NOTHING
                         }
                         val changed = contentChanged || scrolled || states.isNotEmpty() || st.fieldChanged
@@ -206,7 +212,7 @@ internal class AgentLoop(
                         pendingDone?.let { if (changed && !fieldWrong) return Outcome(UseStatus.DONE, answer = it.ifBlank { null }) }
                     }
                     pendingDone = null
-                    st.fieldNote = null; st.fieldChanged = false
+                    st.fieldNote = null; st.fieldChanged = false; st.clickedField = false
                     st.marks = look.marks
                     st.shot = shot; st.url = url; st.title = shot.title; st.pageText = text; st.content = shot.contentHash
                     run.pageUrl.value = url
@@ -240,7 +246,15 @@ internal class AgentLoop(
             }
             val a = decision.action
             when (a) {
-                is AgentAction.Done -> return Outcome(UseStatus.DONE, answer = a.result.ifBlank { null })
+                is AgentAction.Done -> {
+                    // An answer that says it is not from the pages is sent back once.
+                    if (AgentPrompt.ungrounded(a.result) && !mem.groundingAsked) {
+                        mem.groundingAsked = true
+                        mem.turns += AgentTurn("done", null, NOT_DONE, "done.result must come only from pages you saw in this run; keep browsing, or say you could not find it. Never answer from memory.")
+                        continue
+                    }
+                    return Outcome(UseStatus.DONE, answer = a.result.ifBlank { null })
+                }
                 is AgentAction.AskUser -> return Outcome(UseStatus.NEEDS_INPUT, "The agent needs your input", a.question, a.options)
                 else -> Unit
             }
@@ -254,6 +268,9 @@ internal class AgentLoop(
             misses = 0
             taken++
             // A failed action has no page change to wait for: its result is the error.
+            // A popup that answers "no open popup window" is gone: dropped at once, no retrying it.
+            val t = act.tab
+            if (t != null && isPopup(t) && act.error != null && DEAD_POPUP.containsMatchIn(act.error)) popBack(run, st)?.let { note -> st.fieldNote = note }
             // A switch to a new tab or popup is part of what the action did: it leads the next result.
             act.popup?.let { p -> st.fieldNote = listOfNotNull(st.fieldNote, p).joinToString("; ") }
             mem.turns += AgentTurn(act.desc, act.target.takeIf { act.op != VisionOp.FIND }, act.result ?: if (act.error != null) "failed" else null, act.error, act.changed)
@@ -303,8 +320,10 @@ internal class AgentLoop(
         suspend fun snapshot() = runCatching { tabs.snapshot() }.getOrDefault(emptyMap()).also { if (it.isNotEmpty()) st.known = it }
 
         // The confirm guard: an action the model marked irreversible, or a click whose wording pays or orders, asks first unless the person confirmed it.
-        fun guard(label: String, context: String, irreversible: Boolean): Act? {
-            if (!(irreversible || AgentPrompt.isPayment(label, context)) || label in mem.confirmed) return null
+        fun guard(label0: String, context: String, irreversible: Boolean, fallback: String = "this action"): Act? {
+            if (!(irreversible || AgentPrompt.isPayment(label0, context))) return null
+            val label = AgentPrompt.confirmLabel(label0, context, fallback)
+            if (label in mem.confirmed) return null
             mem.pendingConfirm = label
             val why = if (irreversible) "which cannot be undone" else "which may pay or place an order"
             return Act(VisionOp.CLICK, "click", label, notRun = true, ask = Outcome(UseStatus.NEEDS_INPUT, "About to '${label.take(80)}', $why",
@@ -314,8 +333,11 @@ internal class AgentLoop(
         return when (a) {
             is AgentAction.Click -> {
                 val m = mark(a.element) ?: return Act(VisionOp.CLICK, "click", a.element, error = noMark(a.element), notRun = true)
-                guard(m.label, m.context, a.irreversible)?.let { return it }
+                guard(m.label, m.context, a.irreversible, "the ${m.role.ifBlank { m.tag }.ifBlank { "element" }} ${m.hrefHost?.let { "to $it" } ?: "under the pointer"}")?.let { return it }
+                // A click on the field that already has focus does nothing: say so, so the model types instead of clicking again.
+                if (m.focused && m.editable) return Act(VisionOp.CLICK, "click", m.short, tab, result = "the field is already focused; type now")
                 val t = checkNotNull(tab)
+                st.clickedField = m.editable
                 val before = snapshot()
                 val r = tools.invoke(ToolNames.STEP, Cu.step(t, "click_at", "${m.centreX.roundToInt()},${m.centreY.roundToInt()}", pointer, element = m.id))
                 val e = err(r)
@@ -336,7 +358,7 @@ internal class AgentLoop(
                     error = "only text the person gave goes into a password, code or card field: type a named input as {{name}}, or ask_user")
                 val value = Cu.fillInputs(a.text, run.inputs) ?: return Act(VisionOp.TYPE_TEXT, "type", label, notRun = true,
                     error = "unknown input in '${a.text.take(60)}'; the inputs are: ${run.inputs.keys.joinToString().ifEmpty { "none" }}")
-                val private = privateField || PLACEHOLDER_SECRET.findAll(a.text).any { Cu.secretName(it.groupValues[1]) }
+                val private = privateField || PLACEHOLDER_SECRET.findAll(a.text).any { AgentPrompt.secretInput(it.groupValues[1]) }
                 if (private && value !in tools.secrets) tools.secrets.add(value)
                 val desc = "type '${if (private) a.text.takeIf { PLACEHOLDER_SECRET.matches(it.trim()) } ?: Secrets.MASK else a.text.take(80)}'${if (a.submit) " and Enter" else ""}"
                 if (a.irreversible) guard("$desc into $label", "", true)?.let { return it }
@@ -540,7 +562,8 @@ internal class AgentLoop(
     private fun followPopups(run: UseRun, st: St, tools: RecordingTools): String? {
         var note: String? = null
         for (e in tools.drainPopupEvents()) {
-            if (e.id.substringBefore("#popup-") !in st.owned) continue
+            if (e.id.substringBefore("#popup-") !in st.owned || e.id in st.dead) continue
+            if (!e.open && e.id != st.tab) { st.dead += e.id; st.owned -= e.id; continue }
             if (e.open && e.id !in st.owned) {
                 st.stack.addLast(checkNotNull(st.tab))
                 take(run, st, e.id, "popup_window", e.title)
@@ -552,9 +575,13 @@ internal class AgentLoop(
         return note
     }
 
+    /** Leaves the popup being driven for good: back to where it came from, else to the first tab of the run. */
     private fun popBack(run: UseRun, st: St): String? {
         val popup = st.tab ?: return null
-        val back = st.stack.removeLastOrNull() ?: return null
+        st.dead += popup
+        var back: String? = null
+        while (back == null) { val c = st.stack.removeLastOrNull() ?: break; if (c in st.owned && c !in st.dead) back = c }
+        back = back ?: st.owned.firstOrNull { !isPopup(it) && it != popup } ?: return null
         st.owned -= popup; st.tab = back; run.tabId = back
         return "Popup closed, back on ${st.known[back]?.let { "'${it.take(60)}'" } ?: "the page before"}"
     }
@@ -563,14 +590,19 @@ internal class AgentLoop(
         if (i in steps.indices) steps[i] = steps[i].let { it.copy(popup = listOfNotNull(it.popup, note).joinToString("; ")) }
     }
 
-    private fun finish(req: AgentRequest, run: UseRun, llm: UseLlm, st: St, o: Outcome): UseReport {
+    private fun finish(req: AgentRequest, run: UseRun, llm: UseLlm, st: St, o0: Outcome): UseReport {
         run.phase.value = UsePhase.REPORTING
+        fun m(s: String?) = s?.let { Secrets.mask(it, run.secrets) }
+        val o = Outcome(o0.status, m(o0.error), m(o0.question), o0.options.map { m(it)!! }, m(o0.answer))
+        st.pageText = m(st.pageText)
         val steps = run.steps.value
         val url = st.url
         val title = st.title?.ifBlank { null }
         url?.takeIf { !st.pageText.isNullOrBlank() }?.let { u ->
             if (run.snapshotted.add(u.substringBefore('#')) && run.store.add(CollectedItem(steps.size, u, title.orEmpty(), st.pageText.orEmpty(), st.shot?.path, auto = true))) run.collected.value = run.store.list
         }
+        val collected = run.store.list.map { it.copy(text = m(it.text)!!, title = m(it.title)!!) }
+        run.collected.value = collected
         run.priorMs += clock() - st.segmentStart
         val seconds = run.priorMs / 1000.0
         val options = o.options.mapIndexed { i, s -> ChoiceOption("${i + 1}", s) }
@@ -580,7 +612,7 @@ internal class AgentLoop(
             pageText = st.pageText?.take(UseReport.PAGE_TEXT_MAX), steps = steps, seconds = seconds, jevCalls = run.log.jevCalls, llmCalls = run.log.llmCalls,
             toolCalls = run.log.toolCalls, costUsd = run.log.jevCost.takeIf { run.log.jevCalls > 0 }, llmTokens = run.log.llmTokens.takeIf { it > 0 },
             jevModel = req.jevModel, llmModel = llm.label, confidences = emptyList(), screenshotPath = st.image ?: st.shot?.path, error = o.error,
-            tabId = st.tab, blocker = blocker, collected = run.store.list, pagesVisited = run.visited.toList(), answer = o.answer, extract = o.answer != null,
+            tabId = st.tab, blocker = blocker, collected = collected, pagesVisited = run.visited.toList(), answer = o.answer, extract = o.answer != null,
             runId = run.id, tabs = run.tabsUsed.map { t -> t.copy(title = t.title.ifBlank { st.known[t.tabId].orEmpty() }) },
         )
         run.report.value = report
@@ -590,8 +622,15 @@ internal class AgentLoop(
     }
 
     companion object {
+        fun maskStep(s: UseStep, secrets: Collection<String>): UseStep {
+            if (secrets.isEmpty()) return s
+            fun m(t: String?) = t?.let { Secrets.mask(it, secrets) }
+            return s.copy(text = m(s.text), note = m(s.note), result = m(s.result), target = m(s.target), thought = m(s.thought), action = m(s.action), popup = m(s.popup), dialog = m(s.dialog))
+        }
+
         const val NOTHING = "nothing changed"
         const val NOT_DONE = "not done"
+        private val DEAD_POPUP = Regex("""(?i)no open popup|popup( window)? (is )?closed|TAB_NOT_FOUND|not found""")
         const val FIELD_MISMATCH = "field value doesn't match"
         const val MAX_MISSES = 3
         private const val NO_BROWSER_NOTE = "NO_BROWSER"

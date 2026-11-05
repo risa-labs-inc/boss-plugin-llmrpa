@@ -243,7 +243,7 @@ class AgentLoopTest {
         assertEquals("true", typed.single()["allow_sensitive"]!!.jsonPrimitive.content)
         requests.forEach { r -> assertFalse("hunter2" in r.messages.single().text); assertFalse("hunter2" in r.system) }
         assertTrue("- password (private: value hidden)" in requests[0].messages.single().text)
-        assertTrue("- email = a@b.c" in requests[0].messages.single().text)
+        assertTrue("- email (private: value hidden)" in requests[0].messages.single().text)
         assertTrue("only text the person gave" in requests[2].messages.single().text)
         assertEquals(Secrets.MASK, report.steps.single().text)
         assertFalse("hunter2" in report.toJson().toString())
@@ -540,7 +540,7 @@ class AgentLoopTest {
 
     @Test
     fun `an action the model marks irreversible asks first, adding to a cart does not`() = runTest {
-        val b = Browser().apply { elements = "[" + el("m1", "button", "Send") + "," + el("m2", "button", "Add to cart") + "," + el("m3", "link", "Proceed to checkout") + "]" }
+        val b = Browser().apply { elements = "[" + el("m1", "button", "Send") + "," + el("m2", "button", "Add to cart") + "," + el("m3", "link", "Pay now") + "]" }
         val run = UseRun("send it")
         say("""{"type":"click","element":"m2"}""", """{"type":"click","element":"m1","irreversible":true}""")
         val first = loop(b).run(AgentRequest("send it", tabId = "t1"), run)
@@ -549,7 +549,7 @@ class AgentLoopTest {
         assertEquals(1, b.actions("click_at").size) // the cart click went through unasked
         say("""{"type":"click","element":"m1","irreversible":true}""", """{"type":"click","element":"m3"}""")
         val second = loop(b).run(AgentRequest("send it", resume = true, reply = "Confirm"), run)
-        assertEquals("About to 'Proceed to checkout'. Confirm?", second.blocker!!.question) // the wording backstop
+        assertEquals("About to 'Pay now'. Confirm?", second.blocker!!.question) // the wording backstop
         assertEquals(2, b.actions("click_at").size)
         // Enter and typing can be irreversible too.
         say("""{"type":"key","key":"Enter","irreversible":true}""")
@@ -557,8 +557,9 @@ class AgentLoopTest {
         say("""{"type":"type","element":"m1","text":"hi","submit":true,"irreversible":true}""")
         assertEquals(UseStatus.NEEDS_INPUT, loop(b).run(AgentRequest("x", tabId = "t1")).status)
         assertTrue(b.actions("key").isEmpty() && b.actions("type_text").isEmpty())
-        listOf("Checkout", "Check out", "Pay now", "Submit order", "Complete order", "Confirm and pay", "Buy now", "Place order").forEach { assertTrue(AgentPrompt.isPayment(it), it) }
-        listOf("Add to cart", "View cart", "Payment options", "Next").forEach { assertFalse(AgentPrompt.isPayment(it), it) }
+        listOf("Pay", "Pay now", "Pay ₹470", "Submit payment", "Confirm and pay", "Buy now", "Place order", "Place your order").forEach { assertTrue(AgentPrompt.isPayment(it), it) }
+        // The model judges these: a review page often follows.
+        listOf("Checkout", "Check out", "Proceed to checkout", "Add to cart", "View cart", "Payment options", "Next", "Save contact", "Book").forEach { assertFalse(AgentPrompt.isPayment(it), it) }
         assertTrue("\"irreversible\":true" in AgentPrompt.system("Jev"))
     }
 
@@ -622,5 +623,109 @@ class AgentLoopTest {
         assertEquals("t2", report.tabId)
         assertEquals(listOf("given", "popup"), report.tabs.map { it.kind })
         assertEquals(listOf("t1", "t2"), tabs.released.sorted())
+    }
+
+    // ---- dead popups, confirm labels, masking by input name, grounding, focused clicks, compact status ----
+
+    @Test
+    fun `a popup that answers no open popup window is dropped at once and never switched to again`() = runTest {
+        val b = Browser()
+        var clicks = 0
+        val wrapped = object : ToolInvoker by b {
+            override suspend fun invoke(toolName: String, arguments: JsonElement): ToolReply {
+                val o = arguments.jsonObject
+                val type = o["action"]?.jsonObject?.get("type")?.jsonPrimitive?.content
+                if (type == "click_at") { clicks++; b.popupsJson = """[{"id":"t1#popup-$clicks","url":"https://x.example.com/","title":"Popup","open":true}]""" }
+                if (type == "look" && o["tab_id"]!!.jsonPrimitive.content.contains("#popup-")) return ToolReply("""{"ok":false,"error":"No open popup window t1#popup-1"}""", false)
+                if (type == "look" && clicks == 2) b.popupsJson = """[{"id":"t1#popup-1","url":"https://x.example.com/","title":"Popup","open":true}]"""
+                return b.invoke(toolName, arguments)
+            }
+        }
+        say("""{"type":"click","element":"m2"}""", """{"type":"click","element":"m2"}""", """{"type":"done","result":"ok"}""")
+        val report = AgentLoop(wrapped, { gateway }, Tabs(), openWaitsMs = listOf(0), settleMs = 0, popupRecheckMs = 0).run(AgentRequest("x", tabId = "t1"))
+        assertEquals(UseStatus.DONE, report.status, report.error)
+        val popupLooks = b.calls.count { it.first == ToolNames.STEP && it.second["tab_id"]!!.jsonPrimitive.content.contains("#popup-") }
+        assertEquals(0, popupLooks) // the wrapper answered them; the real browser saw none
+        assertEquals("t1", b.actions("look").last()["tab_id"]!!.jsonPrimitive.content)
+        assertEquals(3, requests.size) // one call per step: no loop over the dead popups
+    }
+
+    @Test
+    fun `the confirm question names the element, its context or a short description, never empty`() = runTest {
+        val icon = el("m1", "button", "", "Order #4411") + "," + el("m2", "button", "", "")
+        val b = Browser().apply { elements = "[$icon]" }
+        say("""{"type":"click","element":"m1","irreversible":true}""")
+        assertEquals("About to 'Order #4411'. Confirm?", loop(b).run(AgentRequest("x", tabId = "t1")).blocker!!.question)
+        say("""{"type":"click","element":"m2","irreversible":true}""")
+        assertEquals("About to 'the button under the pointer'. Confirm?", loop(b).run(AgentRequest("x", tabId = "t1")).blocker!!.question)
+        say("""{"type":"click_point","description":"the small red trash icon at the right end of the third row in the grid of saved addresses","irreversible":true}""")
+        val q = loop(b).run(AgentRequest("x", tabId = "t1")).blocker!!.question!!
+        assertEquals("About to 'the small red trash icon at the right end of the third row'. Confirm?", q)
+        val sys = AgentPrompt.system("Jev")
+        assertTrue("spends money, places an order or pays; sends or publishes something to other people; or deletes or cancels data that cannot be restored" in sys)
+        assertTrue("NOT irreversible: saving a form or settings, going to the next step, adding to a cart, booking or checking out when a review page still follows" in sys)
+    }
+
+    @Test
+    fun `secret input values are masked by input name in everything read back, task text is left as written`() = runTest {
+        val b = Browser()
+        say("""{"type":"type","element":"m1","text":"{{phone}}"}""", """{"type":"ask_user","question":"An OTP was sent to +91 7693814008. What is the code?","options":["I will type it"]}""")
+        val task = "Log in with {{phone}}, mail ops@acme.test, code 4321"
+        val run = UseRun(task)
+        val report = loop(b).run(AgentRequest(task, tabId = "t1", inputs = mapOf("phone" to "7693814008", "city" to "Pune")), run)
+        assertEquals("An OTP was sent to +91 ${Secrets.MASK}. What is the code?", report.blocker!!.question)
+        val out = report.toJson().toString()
+        assertFalse("7693814008" in out, out)
+        assertTrue("ops@acme.test" in report.task && "4321" in report.task) // not inputs: left alone
+        assertEquals("7693814008", b.value(b.actions("type_text").single())) // the page still gets it
+        assertTrue("- phone (private: value hidden)" in requests[0].messages.single().text)
+        assertTrue("- city = Pune" in requests[0].messages.single().text)
+        assertTrue(AgentPrompt.secretInput("phone") && AgentPrompt.secretInput("email") && AgentPrompt.secretInput("otp_code"))
+        assertFalse(AgentPrompt.secretInput("city") || AgentPrompt.secretInput("reply"))
+    }
+
+    @Test
+    fun `an answer from memory is sent back once with the grounding rule`() = runTest {
+        say("""{"type":"done","result":"Paris, from background knowledge, not verified"}""", """{"type":"done","result":"Paris, as the article says"}""")
+        val report = loop(Browser()).run(AgentRequest("capital of France", tabId = "t1"))
+        assertEquals("Paris, as the article says", report.answer)
+        assertTrue("done.result must come only from pages you saw in this run" in requests[1].messages.single().text)
+        assertTrue("done.result must come only from pages you saw in this run. If you did not see it, keep browsing or say you could not find it. Never answer from memory." in AgentPrompt.system("Jev"))
+        // Only once: a second ungrounded answer ends the run as it is.
+        requests.clear()
+        say("""{"type":"done","result":"from memory: 42"}""", """{"type":"done","result":"from memory: 42"}""")
+        assertEquals("from memory: 42", loop(Browser()).run(AgentRequest("x", tabId = "t1")).answer)
+        assertEquals(2, requests.size)
+    }
+
+    @Test
+    fun `a click on the field that already has focus is not sent and tells the model to type`() = runTest {
+        val b = Browser().apply { frozen = true; elements = "[" + el("m1", "textbox", "Phone", editable = true).dropLast(1) + ""","focused":true}]""" }
+        say("""{"type":"click","element":"m1"}""", """{"type":"click","element":"m1"}""", """{"type":"click","element":"m1"}""", """{"type":"type","element":"m1","text":"x"}""", """{"type":"done","result":"ok"}""")
+        val report = loop(b).run(AgentRequest("x", tabId = "t1"))
+        assertEquals(UseStatus.DONE, report.status, report.error) // three clicks are not a repeat stop
+        assertTrue(b.actions("click_at").isEmpty())
+        assertTrue("1. click on textbox 'Phone' -> the field is already focused; type now" in requests[1].messages.single().text)
+        // A field the look does not report as focused: the click goes out, and an unchanged page hints to type.
+        requests.clear()
+        val b2 = Browser().apply { frozen = true }
+        say("""{"type":"click","element":"m1"}""", """{"type":"done","result":"ok"}""")
+        loop(b2).run(AgentRequest("x", tabId = "t1"))
+        assertTrue("-> nothing changed; if the field is focused, type now" in requests[1].messages.single().text)
+    }
+
+    @Test
+    fun `browser_use_status is compact for an agent run that asks`() = runTest {
+        val store = RunLogStore(java.nio.file.Files.createTempDirectory("runs").toFile())
+        say("""{"type":"click","element":"m2"}""", """{"type":"ask_user","question":"Which size?","options":["S","M"]}""")
+        val run = UseRun("buy a shirt")
+        AgentLoop(Browser(), { gateway }, Tabs(), openWaitsMs = listOf(0), settleMs = 0, runLog = store, popupRecheckMs = 0).run(AgentRequest("buy a shirt", tabId = "t1"), run)
+        val c = LlmrpaMcpToolProvider.compactStatus(store.read(run.id)!!, running = false)
+        assertEquals("needs_input", c["status"]!!.jsonPrimitive.content)
+        assertEquals("Which size?", c["blocker"]!!.jsonObject["question"]!!.jsonPrimitive.content)
+        assertEquals(2, (c["blocker"]!!.jsonObject["options"] as kotlinx.serialization.json.JsonArray).size)
+        assertEquals("button 'Add'", c["last_step"]!!.jsonObject["target"]!!.jsonPrimitive.content)
+        assertEquals(1, c["steps_count"]!!.jsonPrimitive.content.toInt())
+        assertTrue(c.toString().length < 800, c.toString())
     }
 }

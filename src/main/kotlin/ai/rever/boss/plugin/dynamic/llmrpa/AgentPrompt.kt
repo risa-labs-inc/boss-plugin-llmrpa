@@ -42,6 +42,8 @@ internal class AgentMemory {
     val confirmed = mutableSetOf<String>()
     /** The label the payment guard asked about, until the person answers. */
     var pendingConfirm: String? = null
+    /** An ungrounded done.result was sent back once. */
+    var groundingAsked = false
 }
 
 /** The agent's prompt, the per-step state text and the reply parser. Nothing here acts. */
@@ -68,7 +70,7 @@ Reply with only JSON: {"thought":"<one short sentence>","action":{...}} where ac
 {"type":"wait","ms":1000}
 {"type":"ask_user","question":"...","options":["...","..."]}
 {"type":"done","result":"the answer, or what was achieved, taken from the page"}
-click, type, key and click_point take "irreversible":true for an action that places an order, pays, checks out, submits a form that commits something, sends a message or deletes; the person is asked first. Ordinary navigation and adding to a cart are not irreversible.
+click, type, key and click_point take "irreversible":true only for an action that spends money, places an order or pays; sends or publishes something to other people; or deletes or cancels data that cannot be restored. The person is asked first. NOT irreversible: saving a form or settings, going to the next step, adding to a cart, booking or checking out when a review page still follows.
 When the action is the last one the task needs, add "then":"done" and "result":"..." beside "action": if it succeeds and changes the page, the run ends with that result without another turn.
 Rules:
 - Refer to elements by id (m12 is the mark numbered 12). Use click_point only for a target that has no mark (a canvas, an unlabeled icon). After click_point on a field that has no mark, type without an element: the text goes into the focused field.
@@ -79,6 +81,7 @@ Rules:
 - A menu that opens on mouse-over needs hover first; then click the item that appears.
 - find works like Ctrl+F: it looks for the text on the whole page and scrolls the nearest match into view. Use it to reach something not on screen instead of scrolling blindly.
 - Each step's result says what changed, including how far a scroll moved; "Visible now" says what the screen shows.
+- done.result must come only from pages you saw in this run. If you did not see it, keep browsing or say you could not find it. Never answer from memory.
 - For information tasks, read and scroll as needed, then done with the answer taken from the page.
 - Don't repeat an action that changed nothing: try something else, or ask.
 - A pending browser dialog must be answered with answer_dialog before anything else.
@@ -94,7 +97,7 @@ Rules:
         appendLine("Task: $task")
         if (inputs.isNotEmpty()) {
             appendLine("Inputs (type them as {{name}}):")
-            inputs.forEach { (k, v) -> appendLine("- $k" + if (Cu.secretName(k)) " (private: value hidden)" else " = ${v.take(200)}") }
+            inputs.forEach { (k, v) -> appendLine("- $k" + if (secretInput(k)) " (private: value hidden)" else " = ${v.take(200)}") }
         }
         if (url == null) appendLine("Page: none open yet. Start with navigate.")
         else appendLine("Page: ${title.orEmpty().take(120)} | $url")
@@ -248,10 +251,25 @@ Rules:
     // ---- the only enforced guardrails ----
 
     /** The wording backstop behind the model's own `irreversible` flag. */
-    private val PAYMENT = Regex("""(?i)\b(pay(\s+now|\s+₹|\s+\$|\s+rs)?|place\s+(your\s+)?order|confirm\s+(and\s+pay|order|payment|purchase)|check\s?out(\s+and\s+pay)?|buy\s+now|complete\s+(purchase|order|payment)|submit\s+(payment|order)|make\s+payment|proceed\s+to\s+(pay|checkout))\b""")
+    private val PAYMENT = Regex("""(?i)\b(pay(\s+now|\s+₹|\s+\$|\s+rs)?|place\s+(your\s+)?order|buy\s+now|confirm\s+and\s+pay|submit\s+payment)\b""")
 
     /** Whether a click on [label] (with [context]) would pay or place an order. */
     fun isPayment(label: String, context: String = ""): Boolean = PAYMENT.containsMatchIn(label) || (label.length <= 3 && PAYMENT.containsMatchIn(context))
+
+    private val PERSONAL = Regex("""(?i)phone|mobile|\btel\b|e-?mail|address|birth|\bdob\b|aadhaar|\bpan\b|passport|account""")
+
+    /** An input whose value never appears in anything the person or a caller reads back: by its NAME (secret or personal data), never by scanning text. */
+    fun secretInput(name: String): Boolean = Cu.secretName(name) || PERSONAL.containsMatchIn(name)
+
+    private val UNGROUNDED = Regex("""(?i)background knowledge|from memory|not verified""")
+
+    /** A done result that says it did not come from the pages. */
+    fun ungrounded(result: String): Boolean = UNGROUNDED.containsMatchIn(result)
+
+    /** The name the confirm question uses: the element's own label, else its context, else the description cut to 60; never empty. */
+    fun confirmLabel(label: String?, context: String? = null, fallback: String = "this action"): String =
+        (listOf(label, context).firstNotNullOfOrNull { it?.replace(Regex("\\s+"), " ")?.trim()?.takeIf(String::isNotEmpty) } ?: fallback.trim().ifEmpty { "this action" })
+            .let { if (it.length <= 60) it else it.take(60).substringBeforeLast(' ').ifEmpty { it.take(60) } }
 
     private val PRIVATE_FIELD = Regex("""(?i)pass(word|code)?|\bpin\b|\botp\b|one[- ]?time|verification|security code|\bcvv\b|\bcvc\b|card\s*(number|no)|expiry|\bssn\b""")
 

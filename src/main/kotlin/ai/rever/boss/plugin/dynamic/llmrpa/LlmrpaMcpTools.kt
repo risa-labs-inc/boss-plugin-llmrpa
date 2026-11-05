@@ -123,7 +123,8 @@ internal class LlmrpaMcpToolProvider(
             name = BROWSER_USE_STATUS,
             description =
                 "Read the log of browser_use and Jev-tab runs (they are kept in ~/.boss/cache/llmrpa/runs, the newest 50). A browser_use call that returned status running is read here: " +
-                    "with its run_id you get {status:\"running\", steps so far} while it goes on, then the final report in browser_use's shape, plus the detailed log under \"record\" " +
+                    "with its run_id you get a compact {run_id, status, steps_count, seconds, last_step {op, target, result}, answer or blocker {question, options}, error, cost}; " +
+                    "full: true returns the final report in browser_use's shape plus the detailed log under \"record\" " +
                     "(task, plan, input names, status, every step with its tab, screenshot, consult, popup and dialog notes, the report, tool-call counts and cost). " +
                     "Without: the live run, if any, and a list of the last runs. Use it to see where a run stopped or went wrong. Private text is masked; no image data is stored, only screenshot paths.",
             inputSchema = BROWSER_USE_STATUS_SCHEMA,
@@ -131,16 +132,18 @@ internal class LlmrpaMcpToolProvider(
             handler = McpToolHandler { args ->
                 val root = runCatching { Json.parseToJsonElement(args.raw.ifBlank { "{}" }) as JsonObject }.getOrNull()
                     ?: return@McpToolHandler McpToolResult("Arguments must be a JSON object", isError = true)
-                val unknown = root.keys - setOf("run_id", "limit", "include_activity")
-                if (unknown.isNotEmpty()) return@McpToolHandler McpToolResult("Unknown argument ${unknown.sorted().joinToString()}. Allowed: run_id, limit, include_activity", isError = true)
+                val unknown = root.keys - setOf("run_id", "limit", "include_activity", "full")
+                if (unknown.isNotEmpty()) return@McpToolHandler McpToolResult("Unknown argument ${unknown.sorted().joinToString()}. Allowed: run_id, limit, include_activity, full", isError = true)
+                val full = (root["full"] as? JsonPrimitive)?.booleanOrNull ?: false
                 val limit = ((root["limit"] as? JsonPrimitive)?.intOrNull ?: 5).coerceIn(1, 50)
                 val withActivity = (root["include_activity"] as? JsonPrimitive)?.booleanOrNull ?: false
                 val id = (root["run_id"] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }
                 if (id != null) {
                     val rec = runLog.read(id) ?: return@McpToolHandler McpToolResult(
                         "No run '$id'. Recent runs: ${runLog.list(10).joinToString { (it["run_id"] as? JsonPrimitive)?.content.orEmpty() }.ifEmpty { "none" }}", isError = true)
-                    // A run still going: where it is. A finished one: the report exactly as browser_use returns it, with the log's detail under "record".
+                    // By default a few hundred bytes: where the run is and what it needs. full: the report and the whole record.
                     val liveRun = runLog.liveRuns().firstOrNull { it.id == id }
+                    if (!full) return@McpToolHandler McpToolResult(compactStatus(rec, liveRun != null).toString())
                     val report = (rec["report"] as? JsonObject)
                     val head = when {
                         liveRun != null -> UseReport.running(liveRun)
@@ -154,7 +157,7 @@ internal class LlmrpaMcpToolProvider(
                 } else {
                     val live = runLog.liveRuns().lastOrNull()?.let { runLog.record(it) }
                     McpToolResult(buildJsonObject {
-                        if (live != null) put("live", statusRecord(live, withActivity)) else put("live", kotlinx.serialization.json.JsonNull)
+                        if (live != null) put("live", if (full) statusRecord(live, withActivity) else compactStatus(live, true)) else put("live", kotlinx.serialization.json.JsonNull)
                         put("runs", buildJsonArray { runLog.list(limit).forEach { add(it) } })
                     }.toString())
                 }
@@ -264,7 +267,34 @@ internal class LlmrpaMcpToolProvider(
         internal const val BROWSER_USE_STATUS_SCHEMA = """{"type":"object","additionalProperties":false,"properties":{""" +
             """"run_id":{"type":"string","description":"The run_id browser_use returned; omit to see the live run and the latest runs"},""" +
             """"limit":{"type":"integer","minimum":1,"maximum":50,"default":5,"description":"How many recent runs to list"},""" +
-            """"include_activity":{"type":"boolean","default":false,"description":"Add every tool call (rpa_step, jev_decide, gateway chat) with timing, result and cost"}}}"""
+            """"full":{"type":"boolean","default":false,"description":"Return the whole report and record. Default: compact {run_id, status, steps_count, seconds, last_step, answer or blocker, cost}"},""" +
+            """"include_activity":{"type":"boolean","default":false,"description":"With full: add every tool call (rpa_step, jev_decide, gateway chat) with timing, result and cost"}}}"""
+
+        /** A poll's answer: where the run is and what it needs, without the steps, page text and activity. */
+        internal fun compactStatus(rec: JsonObject, running: Boolean): JsonObject = buildJsonObject {
+            fun f(o: JsonObject?, k: String) = o?.get(k)?.takeIf { it !is kotlinx.serialization.json.JsonNull }
+            val report = rec["report"] as? JsonObject
+            put("run_id", rec["run_id"] ?: JsonPrimitive(""))
+            put("status", if (running) JsonPrimitive((rec["status"] as? JsonPrimitive)?.content?.takeIf { it == "waiting" } ?: "running") else rec["status"] ?: JsonPrimitive("unknown"))
+            put("steps_count", rec["steps_count"] ?: JsonPrimitive(0))
+            put("seconds", rec["seconds"] ?: JsonPrimitive(0))
+            ((rec["steps"] as? kotlinx.serialization.json.JsonArray)?.lastOrNull() as? JsonObject)?.let { s ->
+                put("last_step", buildJsonObject { listOf("op", "target", "result").forEach { k -> f(s, k)?.let { put(k, it) } } })
+            }
+            f(report, "answer")?.let { put("answer", it) }
+            (report?.get("blocker") as? JsonObject)?.let { b ->
+                put("blocker", buildJsonObject {
+                    (f(b, "question") ?: f(b, "reason"))?.let { put("question", it) }
+                    f(b, "options")?.let { put("options", it) }
+                })
+            }
+            f(report, "error")?.let { put("error", it) }
+            put("cost", buildJsonObject {
+                f(rec, "cost_usd")?.let { put("usd", it) }
+                f(report, "llm_tokens")?.let { put("llm_tokens", it) }
+                f(rec, "llm_calls")?.let { put("llm_calls", it) }
+            })
+        }
 
         /** A run's record with the activity list cut to its count unless [withActivity]. */
         internal fun statusRecord(rec: JsonObject, withActivity: Boolean): JsonObject = buildJsonObject {
