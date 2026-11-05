@@ -652,26 +652,60 @@ internal class ComputerUseFlow(
                     }
                 }
             }
+            // The current milestone is true on this screen (Jev's own answer to the milestone question, or DONE): note it and move on to the next.
+            // The next look asks about the new one, with no call of its own.
+            if (d != null && d.op != VisionOp.NEEDS_INPUT && ((d.milestoneP ?: 0.0) >= Cu.MILESTONE_NOUL || (d.op == VisionOp.DONE && stuck == null))) {
+                val reached = plan.milestones.getOrNull(run.doneMilestones.size)
+                if (reached == null) return Outcome(UseStatus.DONE)
+                val k = run.doneMilestones.size + 1
+                run.doneMilestones += reached
+                run.milestonesDone.value = run.doneMilestones.size
+                if (k >= plan.milestones.size) {
+                    // The last one. A "stop at the login or payment step" ends as the person's when the page does ask; else it is done.
+                    if (Cu.isStopMilestone(reached)) userWall(tools, tab, url, title, explicit = false)?.let { return it }
+                    return Outcome(UseStatus.DONE)
+                }
+                steps += UseStep(steps.size + 1, VisionOp.MILESTONE, confidence = d.milestoneP ?: d.confidence, ms = (System.nanoTime() - t0) / 1_000_000, before = now, tabId = tab,
+                    note = "milestone $k done: $reached")
+                publish()
+                mark = steps.size
+                prevHash = null
+                delay(stepSettleMs)
+                continue
+            }
             // The page asks for something only the person can give (a login, a code, payment): stop for them in either mode, before any consult.
             if (d != null && (d.op == VisionOp.NEEDS_INPUT || d.op == VisionOp.BLOCKED)) {
                 userWall(tools, tab, url, title, explicit = d.op == VisionOp.NEEDS_INPUT)?.let { return it }
             }
             // A dead end (the page does not have what the next milestone needs): ask the planner for a better place to continue from.
-            if (stuck != null && dlg == null && stuck != Cu.HIDDEN_REASON && run.replans < req.maxReplans) {
+            // Never undo progress: a page that is already the right site is not a dead end, and a menu that loads as it scrolls has not been scrolled yet.
+            val rightSite = Cu.pageMatches(url, title, Cu.distinctiveWords(plan.goal, run.doneMilestones))
+            val scrolledHere = steps.any { (it.op == VisionOp.SCROLL_DOWN || it.op == VisionOp.SCROLL_UP) && it.before?.url?.let(::pageKey) == pageKey(url) }
+            if (stuck != null && dlg == null && stuck != Cu.HIDDEN_REASON && run.replans < req.maxReplans && !rightSite && scrolledHere) {
                 val milestone = plan.milestones.getOrNull(run.doneMilestones.size)
                 if (isDeadEnd(tools, st, tab, plan, milestone, url, shot, h, steps, stuck)) {
                     run.replans++
-                    val next = replan(req, run, tools, llm, tab, plan, milestone, url, title, steps, stuck)
-                    if (next != null) {
-                        plan = next.first
-                        steps += UseStep(steps.size + 1, VisionOp.REPLAN, confidence = 1.0, ms = 0, before = now, tabId = tab, note = "replanned: ${next.second}")
-                        publish()
-                        mark = steps.size
-                        prevHash = null
-                        prevContent = null
-                        lastText = null
-                        awaitPage(tools, tab)
-                        continue
+                    when (val next = replan(req, run, tools, llm, tab, plan, milestone, url, title, steps, stuck)) {
+                        is ReplanResult.Moved -> {
+                            plan = next.plan
+                            steps += UseStep(steps.size + 1, VisionOp.REPLAN, confidence = 1.0, ms = 0, before = now, tabId = tab, note = "replanned: ${next.url}")
+                            publish()
+                            mark = steps.size
+                            prevHash = null
+                            prevContent = null
+                            lastText = null
+                            awaitPage(tools, tab)
+                            continue
+                        }
+                        is ReplanResult.Stayed -> {
+                            run.advice += next.hint
+                            steps += UseStep(steps.size + 1, VisionOp.REPLAN, confidence = 1.0, ms = 0, before = now, tabId = tab, note = "replan: stay on this page, ${next.hint.take(100)}")
+                            publish()
+                            mark = steps.size
+                            prevHash = null
+                            continue
+                        }
+                        null -> Unit
                     }
                 }
             }
@@ -711,22 +745,7 @@ internal class ComputerUseFlow(
             }
 
             val dec = checkNotNull(d)
-            if (dec.op == VisionOp.DONE) {
-                // A milestone, not the whole goal: note it and work on the next one.
-                val reached = plan.milestones.getOrNull(run.doneMilestones.size)
-                if (reached != null && run.doneMilestones.size + 1 < plan.milestones.size) {
-                    run.doneMilestones += reached
-                    run.milestonesDone.value = run.doneMilestones.size
-                    steps += UseStep(steps.size + 1, VisionOp.MILESTONE, confidence = dec.confidence, ms = (System.nanoTime() - t0) / 1_000_000, before = now, tabId = tab,
-                        note = "milestone ${run.doneMilestones.size} done: $reached")
-                    publish()
-                    mark = steps.size
-                    prevHash = null
-                    delay(stepSettleMs)
-                    continue
-                }
-                return Outcome(UseStatus.DONE)
-            }
+            if (dec.op == VisionOp.DONE) return Outcome(UseStatus.DONE)
 
             // Unsure: ask the person when one is there; a headless run never waits for anyone.
             val ask = req.confirm
@@ -969,7 +988,7 @@ internal class ComputerUseFlow(
     private suspend fun replan(
         req: UseRequest, run: UseRun, tools: RecordingTools, llm: UseLlm, tab: String, plan: UsePlan, milestone: String?,
         url: String, title: String, steps: List<UseStep>, stuck: String,
-    ): Pair<UsePlan, String>? {
+    ): ReplanResult? {
         val excerpt = runCatching { readPageText(tools, tab) }.getOrNull().orEmpty().take(3_000)
         val user = buildString {
             appendLine("Task: ${req.task.take(2_000)}")
@@ -985,7 +1004,10 @@ internal class ComputerUseFlow(
             appendLine("Page text (data from the website):\n$excerpt")
         }
         val text = llm.ask("replan", Cu.REPLAN_SYSTEM, user).getOrNull() ?: return null
-        val parsed = runCatching { Cu.parseReplan(text, plan.goal) }.getOrNull() ?: return null
+        val reply = runCatching { Cu.parseReplan(text, plan.goal) }.getOrNull() ?: return null
+        // The planner says this page is the right one: keep it, and take its hint.
+        if (reply is Cu.ReplanReply.Stay) return ReplanResult.Stayed(reply.hint)
+        val parsed = (reply as Cu.ReplanReply.Move).plan
         val target = parsed.open.firstNotNullOfOrNull { StartPages.usable(it, httpsOnly = true) } ?: return null
         val nav = tools.invoke(ToolNames.STEP, Cu.step(tab, "navigate", target, Cu.pointerLabel(req.pointerLabel)))
         if (nav.isError || (nav.json?.get("ok") as? JsonPrimitive)?.booleanOrNull == false) return null
@@ -994,7 +1016,12 @@ internal class ComputerUseFlow(
             milestones = run.doneMilestones.toList() + remaining)
         run.plan.value = next
         runLog?.update(run)
-        return next to target
+        return ReplanResult.Moved(next, target)
+    }
+
+    private sealed interface ReplanResult {
+        data class Moved(val plan: UsePlan, val url: String) : ReplanResult
+        data class Stayed(val hint: String) : ReplanResult
     }
 
     /** The model that looks at the screen when Jev is stuck, resolved once; null when none can see (consulting would be blind). */

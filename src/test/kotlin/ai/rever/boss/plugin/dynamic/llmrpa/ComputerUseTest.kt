@@ -301,6 +301,10 @@ class ComputerUseTest {
         val deadTabs = mutableSetOf<String>()
         var jevDelayMs = 0L
         var modalLabel: String? = null
+        /** Jev's answer to the milestone question per decision call, in order (null = not given). */
+        var milestoneScript: List<Double?> = emptyList()
+        var currentUrlOverride: String? = null
+        var currentTitle = "S"
         /** One entry per screenshot call, in order: (revealed, visible) as the engine reports them; none = the plain reply. */
         val screenshotFlags = ArrayDeque<Pair<Boolean?, Boolean?>>()
         var pageTextFn: (() -> String)? = null
@@ -321,7 +325,7 @@ class ComputerUseTest {
             return when (toolName) {
                 ToolNames.OBSERVE -> if (tabArg in observeFailsFor) ToolReply("""{"error":{"code":"NO_BROWSER","message":"observe does not work on popup windows"}}""", true)
                     else if (strictDialogs && dialog != null) { refused += "observe"; ToolReply("""{"ok":false,"error":"A browser dialog is waiting","dialog":$dialog}""", false) }
-                    else ToolReply("""{"tab_id":"$tabArg","url":"$pageUrl","title":"S"${modalLabel?.let { ""","modal":{"label":"$it"}""" }.orEmpty()},"elements":$elements}""", false)
+                    else ToolReply("""{"tab_id":"$tabArg","url":"${currentUrlOverride ?: pageUrl}","title":"$currentTitle"${modalLabel?.let { ""","modal":{"label":"$it"}""" }.orEmpty()},"elements":$elements}""", false)
                 ToolNames.STEP -> {
                     val action = a["action"]!!.jsonObject
                     val actionType = action["type"]!!.jsonPrimitive.content
@@ -368,14 +372,14 @@ class ComputerUseTest {
                         val op = script[jevCalls.coerceAtMost(script.lastIndex)]
                         jevCalls++
                         val p = when { op.endsWith("@low") -> 0.3; op.endsWith("@mid") -> 0.55; else -> 0.9 }
-                        ToolReply(reply(op.removeSuffix("@low").removeSuffix("@mid"), p), false)
+                        ToolReply(reply(op.removeSuffix("@low").removeSuffix("@mid"), p, milestoneScript.getOrNull(jevCalls - 1)), false)
                     }
                 }
                 else -> ToolReply("unknown", true)
             }
         }
-        private fun reply(op: String, p: Double) =
-            """{"response":{"answers":{"operation":{"type":"choice","choice":"$op","probabilities":{"$op":$p}},""" +
+        private fun reply(op: String, p: Double, milestone: Double? = null) =
+            """{"response":{"answers":{${milestone?.let { """"milestone":{"type":"noul","noul":$it},""" }.orEmpty()}"operation":{"type":"choice","choice":"$op","probabilities":{"$op":$p}},""" +
                 """"target":{"type":"box","box":{"top":0.2,"bottom":0.3,"left":0.4,"right":0.6},"confidence":0.8},"scroll":{"type":"choice","choice":"small"}},"usage":{"cost":0.01}}}"""
         fun stepTypes() = calls.filter { it.first == ToolNames.STEP }.map { it.second["action"]!!.jsonObject["type"]!!.jsonPrimitive.content }
         fun stepArgs(type: String) = calls.filter { it.first == ToolNames.STEP && it.second["action"]!!.jsonObject["type"]!!.jsonPrimitive.content == type }.map { it.second }
@@ -2206,12 +2210,12 @@ class ComputerUseTest {
     }
 
     private val googleUrl = "https://www.google.com/search?q=Magnolia+Bakery+Gurgaon+zomato+order+online"
-    private fun replanReply() = """{"open":[{"url":"$googleUrl"}],"milestones":["Magnolia Bakery's Zomato page is open","Tres Leches is in the cart"],"jev_goal":"Order Tres Leches from Magnolia Bakery"}"""
+    private fun replanReply(url: String = googleUrl) = """{"open":[{"url":"$url"}],"milestones":["Magnolia Bakery's Zomato page is open","Tres Leches is in the cart"],"jev_goal":"Order Tres Leches from Magnolia Bakery"}"""
 
     @Test
     fun `a dead end asks the planner for a better start, navigates there, and goes on with the new milestones`() = runTest {
         replanReplies = ArrayDeque(listOf(replanReply()))
-        val browser = FakeBrowser(tmp(), listOf("BLOCKED", "DONE", "DONE")).also { it.pageTextFn = { "Bharat Baker's\nKesari Nandan" } }
+        val browser = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "BLOCKED", "DONE", "DONE")).also { it.pageTextFn = { "Bharat Baker's\nKesari Nandan" } }
         val requests = mutableListOf<AiRequest>()
         val run = UseRun("Order tres leches from Magolia bakery on zomato")
         val report = flow(browser, FakeTabs(), requests, plan = milestonePlan).runComputerUse(UseRequest("Order tres leches from Magolia bakery on zomato", maxSteps = 10), run)
@@ -2236,20 +2240,22 @@ class ComputerUseTest {
 
     @Test
     fun `replans are capped by max_replans`() = runTest {
-        replanReplies = ArrayDeque(listOf(replanReply(), replanReply(), replanReply()))
+        val elsewhere = "https://www.bing.com/search?q=cake+shop"
+        replanReplies = ArrayDeque(listOf(replanReply(elsewhere), replanReply(elsewhere), replanReply(elsewhere)))
         val requests = mutableListOf<AiRequest>()
-        val browser = FakeBrowser(tmp(), listOf("BLOCKED")).also { it.pageTextFn = { "wrong page" } }
+        val loop = listOf("SCROLL_DOWN", "BLOCKED", "SCROLL_DOWN", "BLOCKED", "SCROLL_DOWN", "BLOCKED")
+        val browser = FakeBrowser(tmp(), loop).also { it.pageTextFn = { "wrong page" } }
         val report = flow(browser, FakeTabs(), requests, plan = milestonePlan).runComputerUse(UseRequest("t", maxSteps = 20))
         assertEquals(2, requests.count { it.system.startsWith("A browser agent, Jev, is stuck") }) // the default of 2
         assertEquals(UseStatus.NEEDS_INPUT, report.status)
         assertEquals(2, report.steps.count { it.op == VisionOp.REPLAN })
-        replanReplies = ArrayDeque(listOf(replanReply()))
+        replanReplies = ArrayDeque(listOf(replanReply(elsewhere)))
         val none = mutableListOf<AiRequest>()
-        flow(FakeBrowser(tmp(), listOf("BLOCKED")), FakeTabs(), none, plan = milestonePlan).runComputerUse(UseRequest("t", maxReplans = 0))
+        flow(FakeBrowser(tmp(), listOf("SCROLL_DOWN", "BLOCKED")), FakeTabs(), none, plan = milestonePlan).runComputerUse(UseRequest("t", maxReplans = 0))
         assertEquals(0, none.count { it.system.startsWith("A browser agent, Jev, is stuck") })
         val one = mutableListOf<AiRequest>()
-        replanReplies = ArrayDeque(listOf(replanReply(), replanReply()))
-        flow(FakeBrowser(tmp(), listOf("BLOCKED")), FakeTabs(), one, plan = milestonePlan).runComputerUse(UseRequest("t", maxReplans = 1, maxSteps = 20))
+        replanReplies = ArrayDeque(listOf(replanReply(elsewhere), replanReply(elsewhere)))
+        flow(FakeBrowser(tmp(), listOf("SCROLL_DOWN", "BLOCKED", "SCROLL_DOWN", "BLOCKED")), FakeTabs(), one, plan = milestonePlan).runComputerUse(UseRequest("t", maxReplans = 1, maxSteps = 20))
         assertEquals(1, one.count { it.system.startsWith("A browser agent, Jev, is stuck") })
         assertEquals(2, BrowserUseArgs.parse("""{"task":"t"}""").getOrThrow().maxReplans)
         assertEquals(5, BrowserUseArgs.parse("""{"task":"t","max_replans":99}""").getOrThrow().maxReplans)
@@ -2269,20 +2275,20 @@ class ComputerUseTest {
         flow(ask, FakeTabs(), r2, plan = milestonePlan).runComputerUse(UseRequest("t"))
         assertEquals(0, r2.count { it.system.startsWith("A browser agent, Jev, is stuck") })
         // The milestone's phrases are on the page: this is not a dead end.
-        val here = FakeBrowser(tmp(), listOf("BLOCKED")).also { it.locateReply = { """{"ok":true,"located":{"found":true,"count":1,"in_view":true}}""" } }
+        val here = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "BLOCKED")).also { it.locateReply = { """{"ok":true,"located":{"found":true,"count":1,"in_view":true}}""" } }
         val r3 = mutableListOf<AiRequest>()
         flow(here, FakeTabs(), r3, plan = milestonePlan).runComputerUse(UseRequest("t"))
         assertEquals(0, r3.count { it.system.startsWith("A browser agent, Jev, is stuck") })
         // A planner that gives nothing usable leaves the run to stop as before (and still spent the call).
         replanReplies = ArrayDeque(listOf("sorry", "{\"open\":[{\"url\":\"http://insecure.com/\"}]}"))
-        val bad = FakeBrowser(tmp(), listOf("BLOCKED"))
+        val bad = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "BLOCKED"))
         val r4 = mutableListOf<AiRequest>()
         val stopped = flow(bad, FakeTabs(), r4, plan = milestonePlan).runComputerUse(UseRequest("t", maxSteps = 20))
         assertEquals(UseStatus.NEEDS_INPUT, stopped.status)
         assertEquals(0, bad.stepArgs("navigate").size)
         assertEquals(1, r4.count { it.system.startsWith("A browser agent, Jev, is stuck") }) // one unusable answer, and the run stops as it would have
         // An address that is not https is refused too.
-        val insecure = FakeBrowser(tmp(), listOf("BLOCKED"))
+        val insecure = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "BLOCKED"))
         replanReplies = ArrayDeque(listOf("{\"open\":[{\"url\":\"http://insecure.com/\"}]}"))
         flow(insecure, FakeTabs(), mutableListOf(), plan = milestonePlan).runComputerUse(UseRequest("t", maxReplans = 1))
         assertEquals(0, insecure.stepArgs("navigate").size)
@@ -2291,6 +2297,141 @@ class ComputerUseTest {
         val r5 = mutableListOf<AiRequest>()
         flow(nothing, FakeTabs(), r5, plan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"find the thing","type_values":[]}""").runComputerUse(UseRequest("t"))
         assertEquals(0, r5.count { it.system.startsWith("A browser agent, Jev, is stuck") })
+    }
+
+    // ---- milestones checked at every look; a replan never undoes progress ----
+
+    private val orderPlan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"Order Tres Leches from Magnolia Bakery","milestones":["A Magnolia Bakery Zomato order page is open","Tres Leches is visible on the menu","Tres Leches is in the cart","Stop at the login or payment step"],"type_values":[]}"""
+
+    @Test
+    fun `every look asks whether the current milestone is true, at 0_7 it is reached and the next one is asked next`() = runTest {
+        val browser = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "SCROLL_DOWN", "SCROLL_DOWN", "SCROLL_DOWN", "DONE")).also {
+            // call 1: not yet; call 2: reached (0.8); call 3: not yet (0.4) for the next one; call 4: 0.69 is not enough; call 5: DONE
+            it.milestoneScript = listOf(0.3, 0.8, 0.4, 0.69, null)
+        }
+        val report = flow(browser, FakeTabs(), mutableListOf(), plan = orderPlan).runComputerUse(UseRequest("order a cake", maxSteps = 12))
+        assertEquals(UseStatus.DONE, report.status, report.error)
+        // Each call carried the question for the milestone then current.
+        val asked = browser.jevArgs.map { it["questions"]!!.jsonObject["milestone"]!!.jsonObject["instructions"]!!.jsonPrimitive.content }
+        assertTrue(asked[0].contains("'A Magnolia Bakery Zomato order page is open'"))
+        assertTrue(asked[1].contains("'A Magnolia Bakery Zomato order page is open'"))
+        assertTrue(asked[2].contains("'Tres Leches is visible on the menu'"), asked[2]) // re-asked about the next one on the next look
+        assertEquals("noul", browser.jevArgs[0]["questions"]!!.jsonObject["milestone"]!!.jsonObject["type"]!!.jsonPrimitive.content)
+        assertEquals(setOf("true", "false"), browser.jevArgs[0]["questions"]!!.jsonObject["milestone"]!!.jsonObject["criteria"]!!.jsonObject.keys)
+        val notes = report.steps.filter { it.op == VisionOp.MILESTONE }.map { it.note }
+        // The first by Jev's own answer, the next two by DONE, which stays an alternative way to advance; the last one ends the run.
+        assertEquals(listOf("milestone 1 done: A Magnolia Bakery Zomato order page is open", "milestone 2 done: Tres Leches is visible on the menu", "milestone 3 done: Tres Leches is in the cart"), notes)
+        assertEquals(7, browser.jevCalls)
+        // No call of its own: the same number of calls as without it (one per look).
+        assertEquals(browser.jevCalls, browser.jevArgs.size)
+        // The question is asked of nothing when there are no milestones.
+        val plain = FakeBrowser(tmp(), listOf("DONE"))
+        flow(plain, FakeTabs(), mutableListOf()).runComputerUse(UseRequest("t"))
+        assertNull(plain.jevArgs.single()["questions"]!!.jsonObject["milestone"])
+    }
+
+    @Test
+    fun `a last milestone that says to stop at the login ends as the person's when the page asks, else done`() = runTest {
+        val twoStep = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"Order a cake","milestones":["Tres Leches is in the cart","Stop at the login or payment step"],"type_values":[]}"""
+        val wall = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "SCROLL_DOWN")).also {
+            it.milestoneScript = listOf(0.9, 0.95); it.modalLabel = "Login"; it.pageTextFn = { "Login\nPhone number\nSend one time password" }
+        }
+        val r = flow(wall, FakeTabs(), mutableListOf(), plan = twoStep).runComputerUse(UseRequest("t", maxSteps = 8))
+        assertEquals(UseStatus.NEEDS_INPUT, r.status)
+        assertTrue(r.blocker!!.question!!.contains("is asking you to"))
+        assertEquals(listOf(true, true), r.toJson()["milestones"]!!.jsonArray.map { it.jsonObject["done"]!!.jsonPrimitive.content.toBoolean() })
+        // The page shows no wall: the aim is reached, so the run is done.
+        val none = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "SCROLL_DOWN")).also { it.milestoneScript = listOf(0.9, 0.95) }
+        assertEquals(UseStatus.DONE, flow(none, FakeTabs(), mutableListOf(), plan = twoStep).runComputerUse(UseRequest("t", maxSteps = 8)).status)
+        // An ordinary last milestone is done when reached.
+        val ordinary = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"g","milestones":["Page open","Item visible"],"type_values":[]}"""
+        val o = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "SCROLL_DOWN")).also { it.milestoneScript = listOf(0.9, 0.9) }
+        assertEquals(UseStatus.DONE, flow(o, FakeTabs(), mutableListOf(), plan = ordinary).runComputerUse(UseRequest("t", maxSteps = 8)).status)
+        assertTrue(Cu.isStopMilestone("Stop at the login or payment step"))
+        assertTrue(Cu.isStopMilestone("stop before ordering"))
+        assertFalse(Cu.isStopMilestone("Tres Leches is in the cart"))
+    }
+
+    @Test
+    fun `the words that say which site the run is on are the goal's and the reached milestones' proper nouns`() {
+        val w = Cu.distinctiveWords("Order Tres Leches from Magnolia Bakery", listOf("A Zomato order page is open"))
+        assertTrue(w.containsAll(setOf("magnolia", "bakery", "tres", "leches", "zomato")), w.toString())
+        assertFalse("order" in w) // the first word of the goal is a verb, not a name
+        assertTrue(Cu.pageMatches("https://www.zomato.com/ncr/magnolia-bakery-6-golf-course-road-gurgaon/order", "Order online", w))
+        assertTrue(Cu.pageMatches("https://x.com/", "Magnolia Bakery menu", w))
+        assertFalse(Cu.pageMatches("https://www.google.com/search?q=cake", "cake - Google Search", w))
+    }
+
+    private val lazyUrl = "https://www.zomato.com/ncr/magnolia-bakery-6-golf-course-road-gurgaon/order"
+
+    @Test
+    fun `regression, the right page with a lazy menu is never left, no replan and no navigate away`() = runTest {
+        // Run f5bd: on the bakery's order page the menu loads as it scrolls, "Tres Leches" is not on the page yet, Jev's confidence drops.
+        replanReplies = ArrayDeque(listOf(replanReply(), replanReply()))
+        val browser = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "BLOCKED@low")).also {
+            it.currentUrlOverride = lazyUrl; it.urlByTab["t1"] = lazyUrl; it.currentTitle = "Magnolia Bakery - Order online"
+            it.pageTextFn = { "Bestsellers\nBrownies" }
+        }
+        val requests = mutableListOf<AiRequest>()
+        val report = flow(browser, FakeTabs(), requests, plan = orderPlan).runComputerUse(UseRequest("order tres leches from magolia bakery on zomato", maxSteps = 12))
+        assertEquals(0, requests.count { it.system.startsWith("A browser agent, Jev, is stuck") })
+        assertEquals(0, browser.stepArgs("navigate").size)
+        assertEquals(UseStatus.NEEDS_INPUT, report.status)
+        assertTrue(report.steps.none { it.op == VisionOp.REPLAN })
+        // With a consult available it asks for a hint instead of leaving.
+        consultReplies = ArrayDeque(listOf("""{"hint":"scroll the menu, it loads as you scroll"}"""))
+        val b2 = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "BLOCKED", "DONE")).also { it.currentUrlOverride = lazyUrl; it.urlByTab["t1"] = lazyUrl; it.pageTextFn = { "Bestsellers" } }
+        val r2 = mutableListOf<AiRequest>()
+        flow(b2, FakeTabs(), r2, plan = orderPlan).runComputerUse(UseRequest("t", onStuck = OnStuck.CONSULT, maxSteps = 12))
+        assertEquals(1, r2.count { it.system.startsWith("You help a browser agent") })
+        assertEquals(0, b2.stepArgs("navigate").size)
+        // The title alone is enough.
+        val b3 = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "BLOCKED")).also { it.currentTitle = "Magnolia Bakery"; it.pageTextFn = { "x" } }
+        val r3 = mutableListOf<AiRequest>()
+        flow(b3, FakeTabs(), r3, plan = orderPlan).runComputerUse(UseRequest("t", maxSteps = 12))
+        assertEquals(0, r3.count { it.system.startsWith("A browser agent, Jev, is stuck") })
+    }
+
+    @Test
+    fun `not on this page alone is not enough, the run must have scrolled on the page first`() = runTest {
+        replanReplies = ArrayDeque(listOf(replanReply()))
+        val b = FakeBrowser(tmp(), listOf("BLOCKED"))
+        val r = mutableListOf<AiRequest>()
+        flow(b, FakeTabs(), r, plan = orderPlan).runComputerUse(UseRequest("t"))
+        assertEquals(0, r.count { it.system.startsWith("A browser agent, Jev, is stuck") }) // not a step of scrolling yet
+        // After scrolling here, on a page that is not the right site, the same words do ask the planner.
+        val scrolled = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "BLOCKED", "DONE", "DONE", "DONE", "DONE"))
+        val r2 = mutableListOf<AiRequest>()
+        flow(scrolled, FakeTabs(), r2, plan = orderPlan).runComputerUse(UseRequest("t"))
+        assertEquals(1, r2.count { it.system.startsWith("A browser agent, Jev, is stuck") })
+    }
+
+    @Test
+    fun `the planner may answer stay with a hint, which keeps the page and becomes advice`() = runTest {
+        replanReplies = ArrayDeque(listOf("""{"stay":true,"hint":"scroll the menu or use the page's search box"}"""))
+        val browser = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "BLOCKED", "DONE", "DONE", "DONE", "DONE"))
+        val requests = mutableListOf<AiRequest>()
+        val report = flow(browser, FakeTabs(), requests, plan = orderPlan).runComputerUse(UseRequest("t", maxSteps = 12))
+        assertEquals(1, requests.count { it.system.startsWith("A browser agent, Jev, is stuck") })
+        assertEquals(0, browser.stepArgs("navigate").size)
+        val step = report.steps.first { it.op == VisionOp.REPLAN }
+        assertTrue(step.note!!.startsWith("replan: stay on this page, scroll the menu"))
+        // Jev's next look has the hint as advice.
+        assertTrue(browser.jevArgs.last()["state"]!!.jsonObject["advice"]!!.jsonArray.any { it.jsonPrimitive.content.contains("scroll the menu") })
+        // The reply forms and the prompt that offers them.
+        assertEquals(Cu.ReplanReply.Stay("keep going"), Cu.parseReplan("""{"stay":true,"hint":"keep going"}""", "g"))
+        assertTrue(Cu.parseReplan("""{"stay":true}""", "g") is Cu.ReplanReply.Stay)
+        assertTrue(Cu.parseReplan(replanReply(), "g") is Cu.ReplanReply.Move)
+        assertTrue(runCatching { Cu.parseReplan("""{"open":[]}""", "g") }.isFailure)
+        assertTrue(Cu.REPLAN_SYSTEM.contains("{\"stay\":true,\"hint\":\"...\"}"))
+        assertTrue(Cu.REPLAN_SYSTEM.contains("If the current page is already the right site or page, answer stay with a hint, e.g. scroll the menu"))
+    }
+
+    @Test
+    fun `milestones describe states, not UI mechanics`() {
+        assertTrue(Cu.PLAN_SYSTEM.contains("Describe states, not UI mechanics"))
+        assertTrue(Cu.PLAN_SYSTEM.contains("\"Tres Leches is visible on the menu\", not \"Tres Leches appears after typing it in Search within menu\""))
+        assertTrue(Cu.REPLAN_SYSTEM.contains("Describe states, not UI mechanics"))
     }
 
     // ---- popup windows that are not tabs ----
