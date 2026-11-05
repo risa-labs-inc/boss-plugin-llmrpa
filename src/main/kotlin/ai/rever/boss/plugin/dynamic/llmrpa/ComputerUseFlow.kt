@@ -541,7 +541,6 @@ internal suspend fun readPageText(tools: ToolInvoker, tab: String): String? {
         }
     }
     textOf(tools.invoke(ToolNames.STEP, Cu.step(tab, "page_text")))?.let { return it.take(UseReport.PAGE_TEXT_MAX) }
-    textOf(tools.invoke(ToolNames.STEP, Cu.step(tab, "run_script", "return document.body.innerText")))?.let { return it.take(UseReport.PAGE_TEXT_MAX) }
     val obs = tools.invoke(ToolNames.OBSERVE, buildJsonObject { put("tab_id", tab) })
     val page = obs.json?.let(PageSnapshot::parse) ?: return null
     return (listOf(page.title) + page.elements.mapNotNull { it.label }).joinToString("\n").take(UseReport.PAGE_TEXT_MAX)
