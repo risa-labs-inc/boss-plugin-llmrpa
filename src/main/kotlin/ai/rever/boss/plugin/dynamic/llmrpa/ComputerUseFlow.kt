@@ -389,9 +389,57 @@ internal class UseRun(val task: String, val startedAt: Long = System.currentTime
     internal val navTexts = mutableListOf<String>()
 }
 
-/** The navigator's plan for one page: the steps, where the run is in them, and what changes the page enough to plan again. */
-internal class PagePlanState(val key: String, val labels: Set<String>, val steps: List<Cu.PageStep>, val milestoneCheck: String?, var index: Int = 0) {
-    val next: Cu.PageStep? get() = steps.getOrNull(index)
+/** One step of a page plan with the element it named as it looked when planned (ids are per look, so the element is found again by role, label and context). */
+internal class PlannedStep(val step: Cu.PageStep, val role: String?, val label: String?, val context: String?, var done: Boolean = false)
+
+/**
+ * The navigator's plan for one page: the steps (each done once that element was clicked or typed into by any path), and what it was made for: the
+ * milestone, the scroll position and the elements on screen. It goes stale when those change ([fresh]), and is then made again.
+ */
+internal class PagePlanState(
+    val key: String, val labels: Set<String>, val steps: List<PlannedStep>, val milestoneCheck: String?,
+    val milestoneAt: Int, val scrollAt: Double?, val madeAtStep: Int,
+) {
+    private fun same(p: PlannedStep, m: Mark) = p.role == m.role && p.label.equals(m.label, true)
+
+    /** The element of [p] in the current [marks]: the same role, label and context, else the only one with that role and label. */
+    fun resolve(p: PlannedStep, marks: List<Mark>): Mark? {
+        if (p.role == null) return null
+        val like = marks.filter { same(p, it) }
+        // A different context is a different item (another card's ADD): only a plan with no context takes the one element of that kind.
+        return like.firstOrNull { it.context == p.context } ?: if (p.context.isNullOrBlank()) like.singleOrNull() else null
+    }
+
+    /** The first step not done whose element is on screen now and usable (disabled, covered and missing ones are skipped), numbered, with the element's current id. */
+    fun next(marks: List<Mark>): Pair<Int, Cu.PageStep>? {
+        steps.forEachIndexed { i, p ->
+            if (p.done) return@forEachIndexed
+            if (p.role == null) return i + 1 to p.step
+            val m = resolve(p, marks)?.takeIf { !it.covered && !it.disabled } ?: return@forEachIndexed
+            return i + 1 to p.step.copy(element = m.id)
+        }
+        return null
+    }
+
+    /** An action was done on [mark] (or none): the step for that element, by role and label, is done whoever acted; else the first not-done step with no element and the same op. */
+    fun consume(op: VisionOp, mark: Mark?) {
+        if (mark != null) {
+            val hit = steps.firstOrNull { !it.done && it.role != null && same(it, mark) && it.context == mark.context && it.step.op == op }
+                ?: steps.firstOrNull { !it.done && it.role != null && same(it, mark) && it.step.op == op }
+            if (hit != null) { hit.done = true; return }
+        }
+        steps.firstOrNull { !it.done && it.role == null && it.step.op == op }?.done = true
+    }
+
+    private fun planned() = steps.filter { it.role != null }
+
+    /** Whether the plan still fits: made for the milestone now current, the view within a screen of where it was planned, and at least half its elements still on screen. */
+    fun fresh(milestones: Int, scrollY: Double?, cssHeight: Int, marks: List<Mark>): Boolean {
+        if (milestones != milestoneAt) return false
+        if (scrollY != null && scrollAt != null && cssHeight > 0 && Math.abs(scrollY - scrollAt) >= cssHeight) return false
+        val els = planned()
+        return els.isEmpty() || els.count { resolve(it, marks) != null } * 2 >= els.size
+    }
 }
 
 private data class Outcome(val status: UseStatus, val error: String? = null, val question: String? = null, val options: List<ChoiceOption> = emptyList())
@@ -727,7 +775,7 @@ internal class ComputerUseFlow(
                     val marked = if (marks.isNotEmpty()) renderMarks(run, shot, marks) else null
                     // The navigator plans each new page once (a changed address or a mostly different set of elements), not each step.
                     if (req.pagePlans && look != null) {
-                        val pp = ensurePagePlan(req, run, llm, plan, url, title, shot, look, marks, marked)
+                        val pp = ensurePagePlan(req, run, llm, plan, url, title, shot, look, marks, marked, steps.size)
                         if (pp != null) {
                             if (plan.milestones.isEmpty() && pp.milestones.isNotEmpty()) {
                                 // A goal that came with no plan (the page was given): the navigator splits a multi-part goal into states Jev can check.
@@ -736,7 +784,7 @@ internal class ComputerUseFlow(
                             if (pp.read) return readPage(req, run, tools, st, tab, steps, plan)
                         }
                     }
-                    val pageStepState = run.pagePlan?.let { Cu.pageStepState(it.steps, it.index, it.milestoneCheck, marks) }
+                    val pageStepState = run.pagePlan?.let { pp -> pp.next(marks)?.let { (n, step) -> Cu.pageStepState(step, n, pp.steps.size, pp.milestoneCheck, marks) } }
                     // The person's answer to "which one do you want?" (the `choice` input: a number or a name): that element is clicked, found again in this look.
                     val userPick = req.inputs.entries.firstOrNull { it.key.equals(Cu.CHOICE_INPUT, ignoreCase = true) }?.value
                         ?.takeIf { !run.choiceDone && marks.isNotEmpty() }?.let { Marks.resolveChoice(it, marks, run.pendingOptions, lookPhrases) }
@@ -763,7 +811,9 @@ internal class ComputerUseFlow(
                     }
                     // The navigator's element for this step, when Jev is not sure of its own; Jev's strong pick stands, noted.
                     if (userPick == null) {
-                        val (followed, note) = Marks.followNavigator(checkNotNull(d), run.pagePlan?.next, marks)
+                        val pp = run.pagePlan
+                        val fresh = pp != null && pp.fresh(run.doneMilestones.size, shot.scrollY, shot.cssHeight, marks)
+                        val (followed, note) = Marks.followNavigator(checkNotNull(d), pp?.next(marks)?.second, marks, fresh)
                         d = followed; navNote = note
                     }
                     stuck = when {
@@ -931,7 +981,8 @@ internal class ComputerUseFlow(
                 ?: followPopups(run, st, tools, tab)
             steps += step.copy(index = steps.size + 1, ms = (System.nanoTime() - t0) / 1_000_000, before = now, tabId = actedOn, screenshotPath = shot.path, box = dec.box, popup = change?.second, note = withAuto(listOfNotNull(step.note, navNote).joinToString("; ").ifEmpty { null }, tools))
             // The navigator's step is done when the run did that operation; the next is the one Jev is shown next.
-            if (!step.failed && !step.refused) run.pagePlan?.let { pp -> if (pp.next?.op == dec.op) pp.index++ }
+            // Whoever acted (Jev or the navigator's step), the plan step for that element is done and never offered again.
+            if (!step.failed && !step.refused) run.pagePlan?.consume(dec.op, dec.mark)
             lateCheck = change == null && (dec.op == VisionOp.CLICK || dec.op == VisionOp.PRESS_ENTER || dec.op == VisionOp.TYPE_TEXT)
             if (change != null) { tab = change.first; st.tab = tab; run.tabId = tab; prevHash = null; prevContent = null; lookText = null; mark = steps.size }
             publish()
@@ -1101,12 +1152,16 @@ internal class ComputerUseFlow(
      * A failed call leaves an empty plan for the page, so it is not retried every step.
      */
     private suspend fun ensurePagePlan(
-        req: UseRequest, run: UseRun, llm: UseLlm, plan: UsePlan, url: String, title: String, shot: Shot, look: Look, marks: List<Mark>, markedPath: String?,
+        req: UseRequest, run: UseRun, llm: UseLlm, plan: UsePlan, url: String, title: String, shot: Shot, look: Look, marks: List<Mark>, markedPath: String?, stepCount: Int,
     ): Cu.PagePlan? {
         val labels = marks.map { "${it.role}|${it.label.lowercase()}" }.toSet()
         val key = pageKey(url)
         val cur = run.pagePlan
-        if (cur != null && cur.key == key && !Cu.majorChange(cur.labels, labels)) return null
+        if (cur != null && cur.key == key) {
+            // The same page: planned again when a milestone advanced, the view moved a screen, or most of the plan's elements are gone; but not within 2 steps of the last time.
+            val stale = !cur.fresh(run.doneMilestones.size, shot.scrollY, shot.cssHeight, marks) || Cu.majorChange(cur.labels, labels)
+            if (!stale || stepCount - cur.madeAtStep < PAGE_PLAN_MIN_STEPS) return null
+        }
         val milestone = plan.milestones.getOrNull(run.doneMilestones.size)
         val text = (look.pageText ?: run.pageTextNow).orEmpty().take(3_000)
         val user = buildString {
@@ -1127,15 +1182,15 @@ internal class ComputerUseFlow(
         }
         val image = if (markedPath != null && llm.sees()) runCatching { File(markedPath).readBytes() }.getOrNull() else null
         val parsed = llm.ask("page plan", Cu.PAGE_PLAN_SYSTEM, user, image).getOrNull()?.let { runCatching { Cu.parsePagePlan(it) }.getOrNull() }
-        val ids = marks.map { it.id }.toSet()
-        // An element that is not on the page is dropped (the step stays, Jev finds the element itself); typed text for a private field is never kept.
+        // Each step keeps its element as it looks now (role, label, context): ids belong to one look. An element that is not on the page is dropped (the step
+        // stays, Jev finds the element itself); typed text for a private field is never kept.
         val steps = parsed?.steps.orEmpty().map { s ->
-            val el = s.element?.takeIf { it in ids }
-            val private = el != null && marks.firstOrNull { it.id == el }?.let { Regex(Cu.SENSITIVE_LABEL).containsMatchIn(it.label) } == true
-            s.copy(element = el, text = s.text.takeIf { !private })
+            val m = s.element?.let { id -> marks.firstOrNull { it.id == id } }
+            val private = m != null && Regex(Cu.SENSITIVE_LABEL).containsMatchIn(m.label)
+            PlannedStep(s.copy(element = m?.id, text = s.text.takeIf { !private }), m?.role, m?.label, m?.context)
         }
-        steps.mapNotNull { it.text }.filter { it !in run.navTexts }.forEach { run.navTexts += it }
-        run.pagePlan = PagePlanState(key, labels, steps, parsed?.milestoneCheck)
+        steps.mapNotNull { it.step.text }.filter { it !in run.navTexts }.forEach { run.navTexts += it }
+        run.pagePlan = PagePlanState(key, labels, steps, parsed?.milestoneCheck, run.doneMilestones.size, shot.scrollY, stepCount)
         return parsed
     }
 
@@ -1641,6 +1696,8 @@ internal class ComputerUseFlow(
         private const val NO_BROWSER_NOTE = "NO_BROWSER"
         private const val MAX_CONSULT_ELEMENTS = 80
         const val WRITTEN_BY_MODEL = "written by the model"
+        /** A page plan is not made again within this many steps of the last one (a new address is the exception). */
+        const val PAGE_PLAN_MIN_STEPS = 2
         /** Read mode's one scroll: far more than any page is tall, so it lands at the bottom. */
         const val READ_SCROLL_PX = 100_000
 

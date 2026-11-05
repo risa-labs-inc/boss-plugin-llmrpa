@@ -316,6 +316,11 @@ class ComputerUseTest {
         var realImages = false
         /** The `elements` a look returns (a JSON array), and the options each look was asked with. */
         var lookElements = "[]"
+        /** The elements of look number n (from 1), when they change as the run goes; else [lookElements]. */
+        var lookElementsFn: ((Int) -> String)? = null
+        var looks = 0
+        /** Called at each look with its number, before the reply is built. */
+        var onLook: ((Int) -> Unit)? = null
         val lookArgs = mutableListOf<JsonObject>()
         /** Which mark Jev picks for click_target / type_target when those questions are asked; null = NONE. */
         var clickPick: String? = null
@@ -363,6 +368,8 @@ class ComputerUseTest {
                         "look" -> if (!lookSupported) ToolReply("""{"ok":false,"error":"Unknown action type look"}""", false) else {
                             val opts = kotlinx.serialization.json.Json.parseToJsonElement(action["value"]!!.jsonPrimitive.content).jsonObject
                             lookArgs += opts
+                            looks++
+                            onLook?.invoke(looks)
                             val b = kotlinx.serialization.json.Json.parseToJsonElement(screenshotText(pageUrl, dlg)).jsonObject
                             val located = buildJsonObject {
                                 (opts["locate"] as? JsonArray).orEmpty().forEach { ph ->
@@ -374,7 +381,7 @@ class ComputerUseTest {
                             val look = buildJsonObject {
                                 put("screenshot", b["screenshot"]!!)
                                 put("located", located)
-                                put("elements", kotlinx.serialization.json.Json.parseToJsonElement(lookElements))
+                                put("elements", kotlinx.serialization.json.Json.parseToJsonElement(lookElementsFn?.invoke(looks) ?: lookElements))
                                 if (opts["page_text"]?.jsonPrimitive?.content == "true") put("page_text", JsonPrimitive(pageTextFn?.invoke() ?: pageTexts[pageUrl] ?: if (pageUrl == "https://sample.com/") "Best: A, B, C" else "Text of $pageUrl"))
                             }
                             ToolReply(JsonObject(b - "screenshot" + ("look" to look)).toString(), false)
@@ -3738,13 +3745,13 @@ class ComputerUseTest {
         // What Jev is shown: the step, its element as the option text, and no typed text for a private field.
         val marks = Marks.parseMarks(json("""{"e":$menuElements}""")["e"]!!.jsonArray) + Mark("m9", "textbox", "input", "Password", null, Cu.Rect(0.0, 0.0, 9.0, 9.0), false, false, "", true, null)
         val steps = listOf(Cu.PageStep(VisionOp.CLICK, "m1", null, "add it"), Cu.PageStep(VisionOp.TYPE_TEXT, "m9", "hunter2", null), Cu.PageStep(VisionOp.TYPE_TEXT, "m3", "Palo Alto", null))
-        val first = Cu.pageStepState(steps, 0, "cart shows it", marks)!!
+        val first = Cu.pageStepState(steps[0], 1, 3, "cart shows it", marks)!!
         assertEquals(1, first["next"]!!.jsonObject["step"]!!.jsonPrimitive.content.toInt()); assertEquals(3, first["next"]!!.jsonObject["of"]!!.jsonPrimitive.content.toInt())
         assertEquals("[1] button 'ADD' — Eggless Classic Tres Leches ₹470", first["next"]!!.jsonObject["element"]!!.jsonPrimitive.content)
         assertEquals("cart shows it", first["milestone_check"]!!.jsonPrimitive.content)
-        assertNull(Cu.pageStepState(steps, 1, null, marks)!!["next"]!!.jsonObject["text"]) // a private field's text is never shown
-        assertEquals("Palo Alto", Cu.pageStepState(steps, 2, null, marks)!!["next"]!!.jsonObject["text"]!!.jsonPrimitive.content)
-        assertNull(Cu.pageStepState(steps, 3, null, marks))
+        assertNull(Cu.pageStepState(steps[1], 2, 3, null, marks)!!["next"]!!.jsonObject["text"]) // a private field's text is never shown
+        assertEquals("Palo Alto", Cu.pageStepState(steps[2], 3, 3, null, marks)!!["next"]!!.jsonObject["text"]!!.jsonPrimitive.content)
+        assertNull(Cu.pageStepState(null, 4, 3, null, marks))
         assertTrue(Cu.decideArgs("m", "g", "u", "t", emptyList(), "/x.jpg", pagePlan = first)["questions"]!!.jsonObject["operation"]!!.jsonObject["instructions"]!!.jsonPrimitive.content.contains("a suggestion from a helper"))
         assertNull(Cu.decideArgs("m", "g", "u", "t", emptyList(), "/x.jpg")["state"]!!.jsonObject["page_plan"])
         // A page is planned again when the address changes or most elements differ, not for a few new ones.
@@ -3814,16 +3821,20 @@ class ComputerUseTest {
         // The navigator has the authority: Jev's 85%-sure pick of another element is noted, not followed.
         assertEquals("m1", strong.stepArgs("click_at").single()["action"]!!.jsonObject["element"]!!.jsonPrimitive.content)
         assertTrue(rs.steps.first { it.op == VisionOp.CLICK }.note!!.contains("followed the navigator's button 'ADD'; Jev preferred button 'ADD' (85% sure)"), rs.steps.first { it.op == VisionOp.CLICK }.note)
+        // 0.9 or more for a different mark: Jev is followed, and the note says which.
+        val (sure, rj) = run(0.92)
+        assertEquals("m2", sure.stepArgs("click_at").single()["action"]!!.jsonObject["element"]!!.jsonPrimitive.content)
+        assertTrue(rj.steps.first { it.op == VisionOp.CLICK }.note!!.contains("followed Jev's button 'ADD' (92% sure); the navigator suggested button 'ADD'"), rj.steps.first { it.op == VisionOp.CLICK }.note)
         val (weak, rw) = run(0.4)
         assertEquals("m1", weak.stepArgs("click_at").single()["action"]!!.jsonObject["element"]!!.jsonPrimitive.content)
         assertTrue(rw.steps.first { it.op == VisionOp.CLICK }.note!!.contains("followed the navigator's"))
         // The rule on its own: the same pick, other operations and disabled targets are left alone.
         val marks = Marks.parseMarks(json("""{"e":$threeItems}""")["e"]!!.jsonArray)
         val d = VisionDecision(VisionOp.CLICK, 0.9, null, null, null, 0.0, clickChoice = "m2", mark = marks[1], markP = 0.4)
-        assertEquals(d, Marks.followNavigator(d, Cu.PageStep(VisionOp.CLICK, "m2", null, null), marks).first)
-        assertNull(Marks.followNavigator(d, Cu.PageStep(VisionOp.CLICK, "m1", null, null), marks.map { if (it.id == "m1") it.copy(disabled = true) else it }).second)
-        assertNull(Marks.followNavigator(d, Cu.PageStep(VisionOp.TYPE_TEXT, "m1", null, null), marks).second)
-        assertNull(Marks.followNavigator(d, Cu.PageStep(VisionOp.CLICK, null, null, null), marks).second)
+        assertEquals(d, Marks.followNavigator(d, Cu.PageStep(VisionOp.CLICK, "m2", null, null), marks, true).first)
+        assertNull(Marks.followNavigator(d, Cu.PageStep(VisionOp.CLICK, "m1", null, null), marks.map { if (it.id == "m1") it.copy(disabled = true) else it }, true).second)
+        assertNull(Marks.followNavigator(d, Cu.PageStep(VisionOp.TYPE_TEXT, "m1", null, null), marks, true).second)
+        assertNull(Marks.followNavigator(d, Cu.PageStep(VisionOp.CLICK, null, null, null), marks, true).second)
     }
 
     @Test
@@ -3910,5 +3921,92 @@ class ComputerUseTest {
         assertNull(Cu.wallKind(null, listOf(e("Search", "textbox", editable = true)), "Enter the verification code"))
         assertEquals("enter a verification code", Cu.wallKind(null, listOf(e("Enter OTP", "textbox", editable = true)), "We sent a verification code to your phone"))
         assertEquals("enter payment details", Cu.wallKind(null, listOf(e("Card number", "textbox", editable = true)), "Pay now\nCard number"))
+    }
+
+    private fun el(id: String, role: String, label: String, context: String = "", x: Int = 900, y: Int = 300, covered: Boolean = false, disabled: Boolean = false) =
+        """{"id":"$id","role":"$role","tag":"${if (role == "button") "button" else "a"}","label":"$label","rect":{"x":$x,"y":$y,"w":80,"h":32},"disabled":$disabled,"covered":$covered,"context":"$context","editable":false}"""
+
+    @Test
+    fun `run e35a, a step consumed earlier is not offered again, so the ADD is clicked and not Order Online`() = runTest {
+        // Look 1: the page plan says click "Order Online". Jev does. Look 2: the menu is open; the header still has the "Order Online" link.
+        val look1 = "[" + el("m1", "link", "Order Online") + "," + el("m2", "link", "Menu", x = 700) + "]"
+        val look2 = "[" + el("m1", "button", "ADD", "Classic Tres Leches ₹450") + "," + el("m2", "link", "Order Online", x = 100, y = 20) + "]"
+        val b = looking(listOf("CLICK", "CLICK", "DONE")) { lookElementsFn = { n -> if (n == 1) look1 else look2 }; clickPick = "m1"; boxJson = boxOnM1 }
+        navigatorReplies = ArrayDeque(listOf("""{"page_steps":[{"op":"CLICK","element":"m1","why":"open Order Online"}],"milestone_check":"the menu shows ADD buttons"}"""))
+        val requests = mutableListOf<AiRequest>()
+        val report = flow(b, FakeTabs(), requests, plan = "{}").runComputerUse(UseRequest("Add Classic Tres Leches", url = "https://sample.com/", planWithLlm = false, pagePlans = true, maxSteps = 6))
+        assertEquals(UseStatus.DONE, report.status, report.error)
+        assertEquals(1, requests.count { it.system.startsWith("You navigate") })
+        // Step 1 followed the plan (Jev agreed); step 2 had nothing from the plan: the Order Online step was consumed, so Jev's ADD is clicked, with no navigator note.
+        assertNull(b.jevArgs[1]["state"]!!.jsonObject["page_plan"]) // nothing left of the plan to show Jev
+        val clicks = report.steps.filter { it.op == VisionOp.CLICK }
+        assertEquals(2, clicks.size)
+        assertNull(clicks[1].note, clicks[1].note)
+        assertEquals("button 'ADD'", clicks[1].target)
+        assertEquals("m1", b.stepArgs("click_at")[1]["action"]!!.jsonObject["element"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `a plan step whose element is gone, disabled or covered is skipped, and done steps are never offered`() {
+        val marks = Marks.parseMarks(json("""{"e":[${el("m5", "button", "ADD", "Classic ₹450")},${el("m6", "link", "Menu")}]}""")["e"]!!.jsonArray)
+        fun planned(role: String?, label: String?, op: VisionOp = VisionOp.CLICK, context: String? = "") = PlannedStep(Cu.PageStep(op, if (role != null) "m1" else null, null, null), role, label, context)
+        val pp = PagePlanState("k", emptySet(), listOf(planned("link", "Order Online"), planned("button", "ADD", context = "Classic ₹450"), planned(null, null, VisionOp.SCROLL_DOWN)), null, 0, 0.0, 0)
+        // Order Online is not on screen now: skipped; the ADD is found again by role, label and context, under its new id.
+        assertEquals(2 to "m5", pp.next(marks)!!.let { it.first to it.second.element })
+        // Done by anyone (Jev's own click on that element): never again.
+        pp.consume(VisionOp.CLICK, marks[0])
+        assertEquals(3, pp.next(marks)!!.first)
+        // Disabled or covered: skipped too, falling to the step with no element or to Jev alone.
+        val pp2 = PagePlanState("k", emptySet(), listOf(planned("button", "ADD", context = "Classic ₹450")), null, 0, 0.0, 0)
+        assertNull(pp2.next(marks.map { it.copy(disabled = true) }))
+        assertNull(pp2.next(marks.map { it.copy(covered = true) }))
+        assertNull(pp2.next(emptyList()))
+        // The same label and role consume the step even when the context differs (another card's ADD), but the exact one goes first.
+        val two = PagePlanState("k", emptySet(), listOf(planned("button", "ADD", context = "Eggless ₹470"), planned("button", "ADD", context = "Classic ₹450")), null, 0, 0.0, 0)
+        two.consume(VisionOp.CLICK, marks[0])
+        assertEquals(listOf(false, true), two.steps.map { it.done })
+    }
+
+    @Test
+    fun `a plan goes stale when a milestone advances, the view moves a screen, or half its elements are gone`() {
+        val marks = Marks.parseMarks(json("""{"e":[${el("m1", "button", "ADD", "A")},${el("m2", "button", "ADD", "B")},${el("m3", "link", "Menu")}]}""")["e"]!!.jsonArray)
+        fun ps(role: String, label: String, context: String) = PlannedStep(Cu.PageStep(VisionOp.CLICK, "m1", null, null), role, label, context)
+        val pp = PagePlanState("k", emptySet(), listOf(ps("button", "ADD", "A"), ps("button", "ADD", "B"), ps("link", "Menu", ""), ps("link", "Order Online", "")), null, 1, 100.0, 0)
+        assertTrue(pp.fresh(1, 150.0, 780, marks))
+        assertFalse(pp.fresh(2, 150.0, 780, marks)) // a milestone advanced
+        assertFalse(pp.fresh(1, 880.0, 780, marks)) // a screen scrolled
+        assertTrue(pp.fresh(1, 879.0, 780, marks))
+        assertFalse(pp.fresh(1, 100.0, 780, marks.take(1))) // 1 of 4 planned elements left
+        assertTrue(pp.fresh(1, null, 780, marks)) // no scroll information: not a reason
+        // A plan with no elements stays fresh.
+        assertTrue(PagePlanState("k", emptySet(), emptyList(), null, 0, null, 0).fresh(0, 5000.0, 780, emptyList()))
+    }
+
+    @Test
+    fun `the page plan is made again when a milestone advances or the view moves, but never within 2 steps of the last one`() = runTest {
+        // A milestone advance: planned at look 1 (step 0); after the milestone credit and a scroll, look 2 is 2 steps on: planned again.
+        val plan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"g","milestones":["The menu is open","The list is shown"],"type_values":[]}"""
+        navigatorReplies = ArrayDeque(listOf("""{"page_steps":[]}""", """{"page_steps":[]}""", """{"page_steps":[]}"""))
+        val requests = mutableListOf<AiRequest>()
+        val b = looking(listOf("SCROLL_DOWN", "SCROLL_DOWN", "SCROLL_DOWN")) { lookElements = menuElements; milestoneScript = listOf(0.9, null, null) }
+        flow(b, FakeTabs(), requests, plan = plan).runComputerUse(UseRequest("t", url = "https://sample.com/", pagePlans = true, maxSteps = 4))
+        assertEquals(2, requests.count { it.system.startsWith("You navigate") })
+        // The view moved a screen: scrolls of 390 px, so after two of them (780) it is stale; planned again at look 3.
+        navigatorReplies = ArrayDeque(listOf("""{"page_steps":[]}""", """{"page_steps":[]}"""))
+        val r2 = mutableListOf<AiRequest>()
+        val scrolled = looking(listOf("SCROLL_DOWN", "SCROLL_DOWN", "SCROLL_DOWN")) { lookElements = menuElements; reportScroll = true }
+        flow(scrolled, FakeTabs(), r2, plan = "{}").runComputerUse(UseRequest("t", url = "https://sample.com/", planWithLlm = false, pagePlans = true, maxSteps = 3))
+        assertEquals(2, r2.count { it.system.startsWith("You navigate") })
+        // Most elements gone after one step: stale, but only 1 step since the plan, so not yet; planned at the look after (2 steps on).
+        val a = "[" + (1..4).joinToString(",") { el("m$it", "button", "ADD$it", "Item $it", y = 100 * it) } + "]"
+        val c = "[" + (1..4).joinToString(",") { el("m$it", "link", "Other$it", "", y = 100 * it) } + "]"
+        navigatorReplies = ArrayDeque(listOf("""{"page_steps":[]}""", """{"page_steps":[]}"""))
+        val r3 = mutableListOf<AiRequest>()
+        val seen = mutableListOf<Int>()
+        val limited = looking(listOf("SCROLL_DOWN", "SCROLL_DOWN", "DONE")) { lookElementsFn = { n -> if (n == 1) a else c }; onLook = { _ -> seen += r3.count { it.system.startsWith("You navigate") } } }
+        flow(limited, FakeTabs(), r3, plan = "{}").runComputerUse(UseRequest("t", url = "https://sample.com/", planWithLlm = false, pagePlans = true, maxSteps = 5))
+        // At the start of each look: none yet, then the first plan, then still the first (look 2 was stale but one step on), then the second only at look 3's own planning.
+        assertEquals(listOf(0, 1, 1), seen)
+        assertEquals(2, r3.count { it.system.startsWith("You navigate") })
     }
 }

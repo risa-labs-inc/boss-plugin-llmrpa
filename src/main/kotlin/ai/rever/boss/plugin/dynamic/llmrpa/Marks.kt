@@ -246,17 +246,21 @@ internal object Marks {
     }
 
     /**
-     * The navigator planned [step] for this page (an element, by mark id): it is followed unless the element is missing, disabled or covered (Jev grounds the
-     * step and verifies the page; it does not overrule the plan). When Jev was sure of another element (click_target 0.7+) the note says so. Only for the same
-     * operation.
+     * The navigator's next [step] for this page (an element, by its id in this look; the caller drops steps whose element is gone, disabled or covered): it is
+     * followed when it is [fresh] (made for the milestone and view now current), unless Jev is 0.9+ sure of a different mark for the same operation. A stale plan
+     * is never followed: Jev is. The note says which was followed.
      */
-    fun followNavigator(d: VisionDecision, step: Cu.PageStep?, marks: List<Mark>): Pair<VisionDecision, String?> {
+    fun followNavigator(d: VisionDecision, step: Cu.PageStep?, marks: List<Mark>, fresh: Boolean): Pair<VisionDecision, String?> {
         if (step?.element == null || step.op != d.op || (d.op != VisionOp.CLICK && d.op != VisionOp.TYPE_TEXT)) return d to null
         val nav = marks.firstOrNull { it.id == step.element && !it.covered && !it.disabled } ?: return d to null
         if (d.mark?.id == nav.id) return d to null
-        val note = if ((d.markP ?: 0.0) >= 0.7) "followed the navigator's ${nav.short}; Jev preferred ${d.mark?.short ?: "its box"} (${(100 * (d.markP ?: 0.0)).toInt()}% sure)"
-        else "followed the navigator's ${nav.short}"
-        return d.copy(mark = nav, boxDisagreed = false) to note
+        val jev = d.mark?.short ?: "its box"
+        val pct = (100 * (d.markP ?: 0.0)).toInt()
+        return when {
+            !fresh -> d to "followed Jev's $jev; the navigator's plan is out of date (it suggested ${nav.short})"
+            d.mark != null && (d.markP ?: 0.0) >= 0.9 -> d to "followed Jev's $jev ($pct% sure); the navigator suggested ${nav.short}"
+            else -> d.copy(mark = nav, boxDisagreed = false) to "followed the navigator's ${nav.short}" + if ((d.markP ?: 0.0) >= 0.7) "; Jev preferred $jev ($pct% sure)" else ""
+        }
     }
 
     private val REFUSAL = Regex("""(?i)\bis (disabled|covered by\b.*)""")

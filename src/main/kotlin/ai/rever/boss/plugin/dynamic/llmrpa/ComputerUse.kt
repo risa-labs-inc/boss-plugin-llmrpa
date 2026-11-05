@@ -1205,11 +1205,11 @@ Reply with only JSON: {"page_steps":[{"op":"CLICK|TYPE_TEXT|PRESS_ENTER|SCROLL_D
     }
 
     /** The navigator's next step as Jev sees it in `state.page_plan`: the step, its element as the option text, a typed text (never for a private field) and what to check. */
-    fun pageStepState(steps: List<PageStep>, index: Int, check: String?, marks: List<Mark>): JsonObject? {
-        val step = steps.getOrNull(index) ?: return null
+    fun pageStepState(step: PageStep?, number: Int, of: Int, check: String?, marks: List<Mark>): JsonObject? {
+        step ?: return null
         return buildJsonObject {
             putJsonObject("next") {
-                put("step", index + 1); put("of", steps.size); put("op", step.op.name)
+                put("step", number); put("of", of); put("op", step.op.name)
                 val mark = step.element?.let { id -> marks.firstOrNull { it.id == id } }
                 mark?.let { put("element", Marks.optionText(it)) }
                 if (mark == null || !Regex(SENSITIVE_LABEL).containsMatchIn(mark.label)) step.text?.let { put("text", it) }
