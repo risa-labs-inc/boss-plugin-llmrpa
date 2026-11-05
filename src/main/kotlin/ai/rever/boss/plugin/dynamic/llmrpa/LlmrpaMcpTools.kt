@@ -92,18 +92,22 @@ internal class LlmrpaMcpToolProvider(
                     "It never waits for a person. When it is stuck (no progress, Jev blocked or unsure) it stops with status needs_input and a blocker, leaving the tab open: " +
                     "call it again with the same tab_id, task and inputs (named values such as phone or code) to continue where it stopped; with on_stuck consult it asks the planner chat model what to do first. " +
                     "Information on the pages it passes is saved in collected[]. " +
-                    "Returns JSON {ok, status (done|needs_input|blocked|budget|error), summary (built from the steps, not a model's opinion), url, title, tab_id, page_text, collected[] (text saved from pages), pages_visited[], blocker {reason, question, url, title, tab_id, screenshot_path, step} when it stopped, answer (only with extract), steps, seconds, jev_calls, " +
+                    "A long task does not block the call: after wait_s (default 45 s) it returns {ok:false, status:\"running\", run_id, tab_id, steps so far} and the run goes on in the background; poll browser_use_status with run_id until it returns the final report. " +
+                    "Returns JSON {ok, status (done|needs_input|blocked|budget|error|running), run_id, summary (built from the steps, not a model's opinion), url, title, tab_id, page_text, collected[] (text saved from pages), pages_visited[], blocker {reason, question, url, title, tab_id, screenshot_path, step} when it stopped, answer (only with extract), steps, seconds, jev_calls, " +
                     "llm_calls, tool_calls, cost_usd, confidences, screenshot_path}; ok only means Jev reached its goal, so read the answer from page_text yourself.",
             inputSchema = BROWSER_USE_SCHEMA,
             readOnly = false,
             handler = McpToolHandler { args ->
                 val a = BrowserUseArgs.parse(args.raw).getOrElse { return@McpToolHandler McpToolResult(it.message ?: "Invalid arguments", isError = true) }
-                val timeoutMs = a.timeoutS * 1000L
                 val result = if (a.mode == "dom") {
-                    headless.browserUseDom(a.task, a.tabId, a.newTab, a.url, a.model, a.maxSteps.coerceAtMost(50), timeoutMs, a.includeText, a.displayName).map { it.toString() }
+                    headless.browserUseDomWaiting(a).map { it.toString() }
                 } else {
-                    headless.browserUse(a)
-                        .map { it.toJson(a.includeText).toString() }
+                    headless.browserUse(a).map { o ->
+                        when (o) {
+                            is HeadlessRunner.UseOutcome.Finished -> o.report.toJson(a.includeText).toString()
+                            is HeadlessRunner.UseOutcome.Running -> UseReport.running(o.run).toString()
+                        }
+                    }
                 }
                 result.fold(
                     onSuccess = { McpToolResult(it) },
@@ -114,7 +118,8 @@ internal class LlmrpaMcpToolProvider(
         McpToolDefinition(
             name = BROWSER_USE_STATUS,
             description =
-                "Read the log of browser_use and Jev-tab runs (they are kept in ~/.boss/cache/llmrpa/runs, the newest 50). With run_id: that run's record, live if it is still running " +
+                "Read the log of browser_use and Jev-tab runs (they are kept in ~/.boss/cache/llmrpa/runs, the newest 50). A browser_use call that returned status running is read here: " +
+                    "with its run_id you get {status:\"running\", steps so far} while it goes on, then the final report in browser_use's shape, plus the detailed log under \"record\" " +
                     "(task, plan, input names, status, every step with its tab, screenshot, consult, popup and dialog notes, the report, tool-call counts and cost). " +
                     "Without: the live run, if any, and a list of the last runs. Use it to see where a run stopped or went wrong. Private text is masked; no image data is stored, only screenshot paths.",
             inputSchema = BROWSER_USE_STATUS_SCHEMA,
@@ -130,7 +135,18 @@ internal class LlmrpaMcpToolProvider(
                 if (id != null) {
                     val rec = runLog.read(id) ?: return@McpToolHandler McpToolResult(
                         "No run '$id'. Recent runs: ${runLog.list(10).joinToString { (it["run_id"] as? JsonPrimitive)?.content.orEmpty() }.ifEmpty { "none" }}", isError = true)
-                    McpToolResult(statusRecord(rec, withActivity).toString())
+                    // A run still going: where it is. A finished one: the report exactly as browser_use returns it, with the log's detail under "record".
+                    val liveRun = runLog.liveRuns().firstOrNull { it.id == id }
+                    val report = (rec["report"] as? JsonObject)
+                    val head = when {
+                        liveRun != null -> UseReport.running(liveRun)
+                        report != null -> report
+                        else -> null
+                    }
+                    McpToolResult(if (head == null) statusRecord(rec, withActivity).toString() else buildJsonObject {
+                        head.forEach { (k, v) -> put(k, v) }
+                        put("record", statusRecord(JsonObject(rec.filterKeys { it != "report" }), withActivity))
+                    }.toString())
                 } else {
                     val live = runLog.liveRuns().lastOrNull()?.let { runLog.record(it) }
                     McpToolResult(buildJsonObject {
@@ -270,7 +286,8 @@ internal class LlmrpaMcpToolProvider(
             """"plan":{"type":"boolean","description":"Ask the planner chat model for the goal and page first. Default: false when url or tab_id is given (the task is the goal), true otherwise"},""" +
             """"llm_typing":{"type":"boolean","default":true,"description":"Let the planner chat model write text for a field when nothing from the task fits (never for password, PIN or card fields)"},""" +
             """"max_steps":{"type":"integer","minimum":1,"maximum":60,"default":25},""" +
-            """"timeout_s":{"type":"integer","minimum":10,"maximum":600,"default":180},""" +
+            """"timeout_s":{"type":"integer","minimum":10,"maximum":600,"default":180,"description":"The run's own time limit"},""" +
+            """"wait_s":{"type":"integer","minimum":5,"maximum":600,"default":45,"description":"How long this call waits; a run still going then returns status running with its run_id (poll browser_use_status) and continues in the background"},""" +
             """"include_text":{"type":"boolean","default":true,"description":"Include the final page's text (up to 20000 characters) as page_text"}""" +
             """},"required":["task"]}"""
 
@@ -406,10 +423,12 @@ internal data class BrowserUseArgs(
     val plan: Boolean?,
     val maxSteps: Int,
     val timeoutS: Int,
+    /** How long the call waits for the run before returning status running. */
+    val waitS: Int,
     val includeText: Boolean,
 ) {
     companion object {
-        private val KEYS = setOf("task", "url", "tab_id", "new_tab", "mode", "model", "planner_model", "display_name", "llm_typing", "on_stuck", "consult_below", "max_consults", "inputs", "extract", "plan", "max_steps", "timeout_s", "include_text")
+        private val KEYS = setOf("task", "url", "tab_id", "new_tab", "mode", "model", "planner_model", "display_name", "llm_typing", "on_stuck", "consult_below", "max_consults", "inputs", "extract", "plan", "max_steps", "timeout_s", "wait_s", "include_text")
 
         fun parse(raw: String): Result<BrowserUseArgs> = runCatching {
             val root = Json.parseToJsonElement(raw.ifBlank { "{}" }) as? JsonObject ?: error("Arguments must be a JSON object")
@@ -447,7 +466,7 @@ internal data class BrowserUseArgs(
                 onStuck = if (stuck == "consult") OnStuck.CONSULT else OnStuck.RETURN, consultBelow = dbl("consult_below", 0.5, 0.0, 1.0),
                 maxConsults = int("max_consults", 5, 0, 10), inputs = inputs, extract = bool("extract", false),
                 plan = if (root["plan"] == null) null else bool("plan", false),
-                maxSteps = int("max_steps", 25, 1, 60), timeoutS = int("timeout_s", 180, 10, 600), includeText = bool("include_text", true),
+                maxSteps = int("max_steps", 25, 1, 60), timeoutS = int("timeout_s", 180, 10, 600), waitS = int("wait_s", 45, 5, 600), includeText = bool("include_text", true),
             )
         }
     }

@@ -585,9 +585,9 @@ class LlmrpaComponent(
     val plannerModel: StateFlow<ModelOption?> = _plannerModel
     fun selectPlanner(option: ModelOption?) { _plannerModel.value = option }
 
-    private val _pointerLabel = MutableStateFlow("Jev")
+    private val _pointerLabel = MutableStateFlow(Cu.DEFAULT_POINTER_LABEL)
     val pointerLabel: StateFlow<String> = _pointerLabel
-    fun setPointerLabel(label: String) { _pointerLabel.value = label.take(24) }
+    fun setPointerLabel(label: String) { _pointerLabel.value = label.take(Cu.POINTER_LABEL_MAX) }
 
     private var useJob: Job? = null
     val isUsing: Boolean get() = useJob?.isActive == true
@@ -640,7 +640,7 @@ class LlmrpaComponent(
 
     private fun baseRequest(run: UseRun, tabId: String?, resume: Boolean, advice: List<String>) = UseRequest(
         task = run.task, tabId = tabId, jevModel = _jevModelId.value, llm = _plannerModel.value,
-        pointerLabel = _pointerLabel.value.ifBlank { "Jev" }, llmTyping = _llmTyping.value,
+        pointerLabel = Cu.pointerLabel(_pointerLabel.value), llmTyping = _llmTyping.value,
         onStuck = if (_consultWhenStuck.value) OnStuck.CONSULT else OnStuck.RETURN,
         inputs = run.inputs.toMap(), extract = _extract.value, resume = resume, advice = advice,
         // The panel plans only when no tab is targeted.
@@ -771,7 +771,7 @@ class LlmrpaComponent(
                     claim = { tabLocks.tryAcquire(it, TabLocks.Owner.PANEL) })
             } ?: return Blocker.TAB.detail
         }
-        val r = TaskRunner(tools, decider, tab?.tabId, instruction, baseLimits.copy(maxSteps = _maxSteps.value), newTab = opener, pointerLabel = _pointerLabel.value.ifBlank { "Jev" }) { asker.ask(it) }
+        val r = TaskRunner(tools, decider, tab?.tabId, instruction, baseLimits.copy(maxSteps = _maxSteps.value), newTab = opener, pointerLabel = Cu.pointerLabel(_pointerLabel.value)) { asker.ask(it) }
         // After the runner is built, as in HeadlessRunner, so nothing can throw between taking and handing over the lock.
         tab?.let { t -> tabLocks.tryAcquire(t.tabId, TabLocks.Owner.PANEL)?.let { return it } }
         _errorMessage.value = null

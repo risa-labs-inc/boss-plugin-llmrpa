@@ -4,6 +4,7 @@ import ai.rever.boss.plugin.api.ActiveTabData
 import ai.rever.boss.plugin.api.AiGatewayAPI
 import ai.rever.boss.plugin.api.LlmProvider
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.async
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -75,6 +76,8 @@ class HeadlessRunner(
     // No default, for the same reason: a forgotten one would leave Jev runs with no log to debug from.
     internal val runLog: RunLogStore,
     private val timeLimitMs: Long = TIME_LIMIT_MS,
+    /** Where `browser_use` runs live: the plugin's own, so a caller that stops waiting (an MCP timeout, a cancelled call) never stops the run. */
+    internal val runScope: kotlinx.coroutines.CoroutineScope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + Dispatchers.Default),
     private val limits: RunLimits = RunLimits(),
 ) {
     /** [newTab] or a [startUrl] opens a page in a new tab first; otherwise the focused or named tab. */
@@ -85,7 +88,7 @@ class HeadlessRunner(
         model: String?,
         newTab: Boolean = false,
         startUrl: String? = null,
-        pointerLabel: String = "Jev",
+        pointerLabel: String = Cu.DEFAULT_POINTER_LABEL,
         show: Boolean = false,
     ): Result<RunState> = try {
         executeUnguarded(instruction, tabId, maxSteps, model, newTab || startUrl != null, startUrl, pointerLabel, show)
@@ -137,7 +140,7 @@ class HeadlessRunner(
         val decider = if (option.kind == ModelOption.Kind.DECISION) JevDecider(tools, option) else ChatDecider(gateway, option)
         val opener = if (tab == null) NewTab(if (show) ({ u, t -> openTab(u, t)?.also { id -> runCatching { reveal(id) } } }) else openTab, claim = { locks.tryAcquire(it, TabLocks.Owner.HEADLESS) }, startUrl = start) else null
         // Built before the lock, so a constructor that throws cannot leave the tab held.
-        val runner = TaskRunner(tools, decider, tab?.tabId, instruction, limits.copy(maxSteps = maxSteps), newTab = opener, pointerLabel = pointerLabel.ifBlank { "Jev" }) { Answer.Stop }
+        val runner = TaskRunner(tools, decider, tab?.tabId, instruction, limits.copy(maxSteps = maxSteps), newTab = opener, pointerLabel = Cu.pointerLabel(pointerLabel)) { Answer.Stop }
         tab?.let { t -> locks.tryAcquire(t.tabId, TabLocks.Owner.HEADLESS)?.let { return Result.failure(IllegalStateException(it)) } }
         if (show) tab?.let { t -> runCatching { reveal(t.tabId) } }
         return try {
@@ -154,7 +157,14 @@ class HeadlessRunner(
      * choosing, never waiting for a person. [model] is the Jev model, [planner] a chat model id (default:
      * the one selected in Settings).
      */
-    internal suspend fun browserUse(a: BrowserUseArgs): Result<UseReport> = try {
+    /** What `browser_use` hands back: the report, or the run still going after the wait. */
+    internal sealed interface UseOutcome {
+        data class Finished(val report: UseReport) : UseOutcome
+        data class Running(val run: UseRun) : UseOutcome
+    }
+
+    /** Waits up to `wait_s` for the run; if it is still going it is left running and its id is returned to poll. */
+    internal suspend fun browserUse(a: BrowserUseArgs): Result<UseOutcome> = try {
         browserUseUnguarded(a, a.newTab || (a.url != null && a.tabId == null))
     } catch (e: CancellationException) {
         throw e
@@ -162,7 +172,7 @@ class HeadlessRunner(
         Result.failure(IllegalStateException("The run failed: ${e.message ?: e::class.simpleName}", e))
     }
 
-    private suspend fun browserUseUnguarded(a: BrowserUseArgs, newTab: Boolean): Result<UseReport> {
+    private suspend fun browserUseUnguarded(a: BrowserUseArgs, newTab: Boolean): Result<UseOutcome> {
         if (!tools.has(ToolNames.OBSERVE) || !tools.has(ToolNames.STEP)) {
             return Result.failure(IllegalStateException("RPA Engine with rpa_observe and rpa_step is not installed"))
         }
@@ -180,22 +190,37 @@ class HeadlessRunner(
             openWaitsMs = limits.openWaitsMs, settleMs = limits.navSettleMs, stepSettleMs = limits.stepSettleMs, runLog = runLog)
         val request = UseRequest(
             task = a.task, url = page, tabId = tab?.tabId, jevModel = a.model ?: Cu.VISION_DEFAULT_MODEL, llm = llm,
-            pointerLabel = a.displayName.ifBlank { "Jev" }, llmTyping = a.llmTyping,
+            pointerLabel = Cu.pointerLabel(a.displayName), llmTyping = a.llmTyping,
             onStuck = a.onStuck, consultBelow = a.consultBelow, maxConsults = a.maxConsults, inputs = a.inputs, extract = a.extract,
             maxSteps = a.maxSteps, timeoutMs = a.timeoutS * 1000L, confirm = null,
             // A caller that names the page needs no plan; `plan` forces one either way.
             planWithLlm = a.plan ?: (page == null && tab == null),
         )
-        return Result.success(flow.runComputerUse(request))
+        val run = UseRun(a.task)
+        // In the plugin's scope, not this call's: stopping to wait does not stop the run.
+        val job = runScope.async { flow.runComputerUse(request, run) }
+        val report = withTimeoutOrNull(a.waitS * 1000L) { job.await() }
+        return Result.success(if (report != null) UseOutcome.Finished(report) else UseOutcome.Running(run))
     }
 
     /** `browser_use` in `dom` mode: the text-list runner of `llmrpa_execute`, returned in the same JSON shape. */
+    /** As [browserUseDom], but only waits `wait_s`: a longer run goes on in the background and its record is read with `browser_use_status`. */
+    internal suspend fun browserUseDomWaiting(a: BrowserUseArgs): Result<kotlinx.serialization.json.JsonObject> {
+        val id = RunLogStore.newId()
+        val job = runScope.async {
+            browserUseDom(a.task, a.tabId, a.newTab, a.url, a.model, a.maxSteps.coerceAtMost(50), a.timeoutS * 1000L, a.includeText, a.displayName, runId = id)
+        }
+        return withTimeoutOrNull(a.waitS * 1000L) { job.await() } ?: Result.success(buildJsonObject {
+            put("ok", false); put("status", "running"); put("mode", "dom"); put("run_id", id)
+            put("summary", "Still running; poll browser_use_status with run_id")
+        })
+    }
+
     suspend fun browserUseDom(
         task: String, tabId: String?, newTab: Boolean, url: String?, model: String?, maxSteps: Int, timeoutMs: Long, includeText: Boolean,
-        pointerLabel: String = "Jev",
+        pointerLabel: String = Cu.DEFAULT_POINTER_LABEL, runId: String = RunLogStore.newId(),
     ): Result<kotlinx.serialization.json.JsonObject> {
         val started = System.currentTimeMillis()
-        val runId = RunLogStore.newId()
         fun logRecord(status: String, extra: kotlinx.serialization.json.JsonObject? = null) = buildJsonObject {
             put("run_id", runId); put("mode", "dom"); put("task", task); put("status", status)
             put("started_at", java.time.Instant.ofEpochMilli(started).toString()); put("started_at_ms", started)

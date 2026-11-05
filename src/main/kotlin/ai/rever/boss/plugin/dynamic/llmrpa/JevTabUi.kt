@@ -181,7 +181,7 @@ private fun ModelRow(component: LlmrpaComponent, enabled: Boolean) {
         OutlineButton("Answer with LLM: ${if (extract) "on" else "off"}", { component.setExtract(!extract) }, enabled = enabled, tone = Tone.NEUTRAL)
         OutlineButton("LLM typing: ${if (llmTyping) "on" else "off"}", { component.setLlmTyping(!llmTyping) }, enabled = enabled, tone = Tone.NEUTRAL)
         Box {
-            OutlineButton("Pointer: ${pointer.ifBlank { "Jev" }}", { menu = "pointer" }, enabled = enabled, tone = Tone.NEUTRAL, trailing = "▾")
+            OutlineButton("Pointer: ${Cu.pointerLabel(pointer)}", { menu = "pointer" }, enabled = enabled, tone = Tone.NEUTRAL, trailing = "▾")
             if (menu == "pointer") RpaMenu(onDismiss = { menu = null }, width = 240) {
                 MenuHeading("Label on the page pointer", "both modes")
                 MenuSearch(pointer, component::setPointerLabel, "Pointer label")

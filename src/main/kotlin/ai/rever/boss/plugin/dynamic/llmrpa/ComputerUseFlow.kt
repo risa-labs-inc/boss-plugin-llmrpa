@@ -77,6 +77,16 @@ internal class RecordingTools(
     private val dialogs = java.util.concurrent.ConcurrentHashMap<String, Cu.DialogInfo>()
     fun dialogFor(tabId: String): Cu.DialogInfo? = dialogs[tabId]
 
+    /** Dialogs RPA Engine answered by itself (`dialog_auto` in a result), as step notes waiting for the next step. */
+    private val autoNotes = java.util.concurrent.ConcurrentLinkedQueue<String>()
+    fun drainAutoNotes(): List<String> = generateSequence { autoNotes.poll() }.toList()
+
+    /** A popup window (a pseudo tab id `<tab>#popup-<n>`) that opened or closed, as `popups` in a result said. */
+    data class PopupEvent(val id: String, val url: String, val title: String, val open: Boolean)
+    private val popupSeen = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+    private val popupEvents = java.util.concurrent.ConcurrentLinkedQueue<PopupEvent>()
+    fun drainPopupEvents(): List<PopupEvent> = generateSequence { popupEvents.poll() }.toList()
+
     override fun has(toolName: String) = inner.has(toolName)
     override fun inputSchema(toolName: String) = inner.inputSchema(toolName)
 
@@ -99,6 +109,21 @@ internal class RecordingTools(
         if (tool == ToolNames.STEP && reply != null && !reply.isError) {
             val tab = ((args as? JsonObject)?.get("tab_id") as? JsonPrimitive)?.content
             if (tab != null) Cu.parseDialog(reply.json)?.let { dialogs[tab] = it } ?: dialogs.remove(tab)
+            (reply.json?.get("popups") as? JsonArray)?.forEach { e ->
+                val o = e as? JsonObject ?: return@forEach
+                fun f(k: String) = (o[k] as? JsonPrimitive)?.contentOrNull
+                val id = f("id") ?: return@forEach
+                val open = (o["open"] as? JsonPrimitive)?.booleanOrNull ?: true
+                val was = popupSeen.put(id, open)
+                // Listed open again and again is one opening; a close is told once, and only for a window seen open.
+                if ((open && was != true) || (!open && was == true)) popupEvents += PopupEvent(id, f("url").orEmpty(), f("title").orEmpty(), open)
+            }
+            (reply.json?.get("dialog_auto") as? JsonArray)?.forEach { e ->
+                val o = e as? JsonObject
+                fun f(k: String) = (o?.get(k) as? JsonPrimitive)?.contentOrNull
+                autoNotes += if (o != null) "Dialog '${f("message").orEmpty().replace(Regex("\\s+"), " ").take(60)}' (${f("type") ?: "dialog"}) was answered automatically: ${f("answer") ?: f("action") ?: "handled"}"
+                else "A dialog was answered automatically: ${(e as? JsonPrimitive)?.contentOrNull.orEmpty().take(60)}"
+            }
         }
         runCatching {
             val ms = (System.nanoTime() - started) / 1_000_000
@@ -241,7 +266,7 @@ internal data class UseRequest(
     val jevModel: String = Cu.VISION_DEFAULT_MODEL,
     /** The planner, typist and consultant; null = the active chat model. */
     val llm: ModelOption? = null,
-    val pointerLabel: String = "Jev",
+    val pointerLabel: String = Cu.DEFAULT_POINTER_LABEL,
     /** May the planner chat model write text for a field when no text from the request fits? Never for a private field. */
     val llmTyping: Boolean = true,
     /** What to do when the run is stuck: stop and say so, or ask the chat model what to do. */
@@ -297,6 +322,8 @@ internal class UseRun(val task: String, val startedAt: Long = System.currentTime
     internal val store = CollectedStore()
     internal val visited = mutableListOf<PageVisit>()
     internal val snapshotted = mutableSetOf<String>()
+    /** Page states (address and content hash) whose text was saved while passing. */
+    internal val contentSeen = mutableSetOf<String>()
     internal val advice = mutableListOf<String>()
     internal var tabId: String? = null
     internal var priorMs = 0L
@@ -373,8 +400,8 @@ internal class ComputerUseFlow(
 
     /** Tells RPA Engine the run is over on every tab it touched (it puts the host's dialog handlers back), then gives the tabs back. */
     private suspend fun endComputerUse(tools: RecordingTools, st: FlowState) {
-        st.touched.forEach { id -> runCatching { tools.invoke(ToolNames.STEP, Cu.step(id, "cu_end")) } }
-        st.owned.forEach(tabs::release)
+        st.touched.filter { !isPopupId(it) }.forEach { id -> runCatching { tools.invoke(ToolNames.STEP, Cu.step(id, "cu_end")) } }
+        st.owned.filter { !isPopupId(it) }.forEach(tabs::release)
     }
 
     private class FlowState(val segmentStart: Long) {
@@ -389,6 +416,12 @@ internal class ComputerUseFlow(
         val stack = ArrayDeque<String>()
         /** The drivable tabs as last seen (id to title). */
         var known: Map<String, String> = emptyMap()
+        /** False once `locate_text` proves unsupported, so older engines are not asked every step. */
+        var locateWorks = true
+        /** The last screenshot that was taken, for a dialog decision (the engine refuses new ones while a dialog waits). */
+        var lastShotObj: Shot? = null
+        /** locate_text answers by page state and phrase. */
+        val located = HashMap<String, Cu.Located>()
     }
 
     private suspend fun execute(req: UseRequest, run: UseRun, tools: RecordingTools, llm: UseLlm, st: FlowState): Outcome {
@@ -480,6 +513,7 @@ internal class ComputerUseFlow(
         var mark = steps.size
         var consults = 0
         var prevHash: String? = null
+        var prevContent: String? = null
         var failures = 0
         run.advice += req.advice
         while (true) {
@@ -489,14 +523,37 @@ internal class ComputerUseFlow(
                 if (steps.isNotEmpty()) steps[steps.lastIndex] = steps.last().let { it.copy(popup = listOfNotNull(it.popup, note).joinToString("; ")) }
                 mark = steps.size; publish()
             }
+            // A popup window that closed since the last call: back to where it came from.
+            followPopups(run, st, tools, tab)?.let { (t, note) ->
+                tab = t; st.tab = t; run.tabId = t; prevHash = null; prevContent = null
+                if (steps.isNotEmpty()) steps[steps.lastIndex] = steps.last().let { it.copy(popup = listOfNotNull(it.popup, note).joinToString("; ")) }
+                mark = steps.size; publish()
+            }
             val shotReply = tools.invoke(ToolNames.STEP, Cu.step(tab, "screenshot"))
+            // A call on a popup window that fails means it is gone.
+            if (isPopupId(tab) && (shotReply.isError || ((shotReply.json?.get("ok") as? JsonPrimitive)?.booleanOrNull == false && tools.dialogFor(tab) == null))) {
+                val back = popBackFromPopup(run, st, tab)
+                if (back != null) {
+                    if (steps.isNotEmpty()) steps[steps.lastIndex] = steps.last().let { it.copy(popup = listOfNotNull(it.popup, back.second).joinToString("; ")) }
+                    tab = back.first; st.tab = tab; run.tabId = tab; prevHash = null; prevContent = null; mark = steps.size; publish()
+                    continue
+                }
+            }
             if (shotReply.isError) return Outcome(UseStatus.ERROR, noBrowser(shotReply))
-            val shot = shotReply.json?.let(Cu::parseShot)
-                ?: return Outcome(UseStatus.ERROR, "The screenshot failed: ${shotReply.json?.get("error")?.let { (it as? JsonPrimitive)?.contentOrNull } ?: "RPA Engine returned no image (does it support the screenshot action?)"}")
-            st.lastShot = shot.path
-            val h = runCatching { hash(shot.path) }.getOrDefault(shot.path + steps.size)
-            if (prevHash != null && steps.isNotEmpty()) { steps[steps.lastIndex] = steps.last().let { it.copy(changed = h != prevHash, scrolledTo = if (it.op == VisionOp.SCROLL_DOWN || it.op == VisionOp.SCROLL_UP) shot.position else null) }; publish() }
-            prevHash = h
+            val fresh = shotReply.json?.let(Cu::parseShot)
+            // While a dialog waits, RPA Engine refuses every verb (the screenshot too) and attaches the dialog: the answer comes
+            // next, judged on the last screenshot taken.
+            val waiting = tools.dialogFor(tab) != null
+            val shot = fresh ?: if (waiting) (st.lastShotObj ?: Shot("", 0, 0, 1120, 780, 1.0)) else
+                return Outcome(UseStatus.ERROR, "The screenshot failed: ${shotReply.json?.get("error")?.let { (it as? JsonPrimitive)?.contentOrNull } ?: "RPA Engine returned no image (does it support the screenshot action?)"}")
+            val h: String
+            if (fresh != null) {
+                st.lastShot = shot.path
+                st.lastShotObj = shot
+                h = runCatching { hash(shot.path) }.getOrDefault(shot.path + steps.size)
+                if (prevHash != null && steps.isNotEmpty()) { steps[steps.lastIndex] = steps.last().let { it.copy(changed = h != prevHash, scrolledTo = if (it.op == VisionOp.SCROLL_DOWN || it.op == VisionOp.SCROLL_UP) shot.position else null) }; publish() }
+                prevHash = h
+            } else h = prevHash ?: ""
             if (steps.size >= req.maxSteps) return Outcome(UseStatus.BUDGET, "Stopped at ${req.maxSteps} steps")
 
             // A browser dialog is open over the page: the next decision is its answer. The page cannot be read while it waits.
@@ -508,10 +565,21 @@ internal class ComputerUseFlow(
             }
             val now = Seen(url, shot.scrollY, h, shot.contentHash)
 
+            // The content changed after an action (a scroll that loaded more, a click that opened a panel): save what is on the page, so the
+            // collected text covers everything the run passed, even when Jev never picks COLLECT.
+            if (dlg == null && fresh != null && shot.contentHash != null) {
+                if (steps.isNotEmpty() && prevContent != null && shot.contentHash != prevContent && run.contentSeen.add("${pageKey(url)}|${shot.contentHash}")) {
+                    val text = runCatching { readPageText(tools, tab) }.getOrNull().orEmpty()
+                    if (run.store.add(CollectedItem(steps.size, url, title, text, shot.path, auto = true))) run.collected.value = run.store.list
+                }
+                prevContent = shot.contentHash
+            }
+
             // Stuck before asking Jev again: the page is where it was.
             var stuck: String? = if (dlg != null) null else Cu.noProgress(steps.drop(mark), now)
             var d: VisionDecision? = null
             var dd: DialogDecision? = null
+            var targets: List<Cu.Target> = emptyList()
             var t0 = System.nanoTime()
             if (stuck == null) {
                 t0 = System.nanoTime()
@@ -519,7 +587,8 @@ internal class ComputerUseFlow(
                     dd = dialogDecision(req, tools, plan, dlg, shot, url, title, steps, run).getOrElse { return Outcome(UseStatus.ERROR, "Jev could not decide: ${it.message}") }
                     if (dd.viaJev && dd.confidence < req.consultBelow) stuck = "Jev is only ${TaskRunner.pct(dd.confidence)} sure how to answer the ${dlg.type} dialog"
                 } else {
-                    val reply = tools.invoke(ToolNames.JEV_DECIDE, Cu.decideArgs(req.jevModel, plan.goal, url, title, steps.map(Cu::recentAction), shot.path, run.advice.toList(), shot.position))
+                    targets = locateTargets(tools, st, tab, plan.goal, url, shot, h)
+                    val reply = tools.invoke(ToolNames.JEV_DECIDE, Cu.decideArgs(req.jevModel, plan.goal, url, title, steps.map(Cu::recentAction), shot.path, run.advice.toList(), shot.position, targets, run.store.info(), req.pointerLabel))
                     if (reply.isError) return Outcome(UseStatus.ERROR, "Jev could not decide: ${reply.errorMessage}")
                     d = runCatching { Cu.parseDecision(reply.json ?: error("Jev returned no JSON")) }
                         .getOrElse { return Outcome(UseStatus.ERROR, "Jev could not decide: ${it.message}") }
@@ -552,7 +621,7 @@ internal class ComputerUseFlow(
 
             if (dlg != null) {
                 val step = answerDialog(req, tools, llm, tab, plan, dlg, checkNotNull(dd), url, title, steps)
-                steps += step.copy(index = steps.size + 1, ms = (System.nanoTime() - t0) / 1_000_000, before = now, tabId = tab, screenshotPath = shot.path)
+                steps += step.copy(index = steps.size + 1, ms = (System.nanoTime() - t0) / 1_000_000, before = now, tabId = tab, screenshotPath = shot.path.ifEmpty { null }, note = withAuto(step.note, tools))
                 publish()
                 if (step.note == NO_BROWSER_NOTE) return Outcome(UseStatus.ERROR, NO_BROWSER_HINT)
                 delay(stepSettleMs)
@@ -577,11 +646,12 @@ internal class ComputerUseFlow(
             }
             val tabBefore = runCatching { tabs.snapshot() }.getOrDefault(emptyMap()).also { if (it.isNotEmpty()) st.known = it }
             val actedOn = tab
-            val step = act(req, tools, llm, run, tab, plan, dec, shot, url, title, steps)
+            val step = act(req, tools, llm, run, tab, plan, dec, shot, url, title, steps, targets)
             // A click or Enter may open a popup, or close the one being driven; look for a moment.
             val change = followTabs(tools, run, st, tab, tabBefore, allowNew = true, wait = dec.op == VisionOp.CLICK || dec.op == VisionOp.PRESS_ENTER)
-            steps += step.copy(index = steps.size + 1, ms = (System.nanoTime() - t0) / 1_000_000, before = now, tabId = actedOn, screenshotPath = shot.path, box = dec.box, popup = change?.second)
-            if (change != null) { tab = change.first; st.tab = tab; run.tabId = tab; prevHash = null; mark = steps.size }
+                ?: followPopups(run, st, tools, tab)
+            steps += step.copy(index = steps.size + 1, ms = (System.nanoTime() - t0) / 1_000_000, before = now, tabId = actedOn, screenshotPath = shot.path, box = dec.box, popup = change?.second, note = withAuto(step.note, tools))
+            if (change != null) { tab = change.first; st.tab = tab; run.tabId = tab; prevHash = null; prevContent = null; mark = steps.size }
             publish()
             if (step.note == NO_BROWSER_NOTE) return Outcome(UseStatus.ERROR, NO_BROWSER_HINT)
             if (step.failed) { if (++failures >= 2) return Outcome(UseStatus.ERROR, "Two actions failed in a row: ${step.note}") } else failures = 0
@@ -614,7 +684,7 @@ internal class ComputerUseFlow(
                         return id to "Switched to popup '${now[id].orEmpty().take(60)}'"
                     }
                 }
-                if (current !in now) {
+                if (current !in now && !isPopupId(current)) {
                     var back: String? = null
                     while (back == null) { val c = st.stack.removeLastOrNull() ?: break; if (c in now) back = c }
                     if (back != null) {
@@ -629,6 +699,40 @@ internal class ComputerUseFlow(
         }
     }
 
+    // ---- popup windows (pseudo tabs) ----
+
+    /**
+     * Popup windows that BOSS opens as separate windows are not tabs; RPA Engine gives them ids `<tab>#popup-<n>` and lists them in
+     * `popups` on every result. One opened from a tab this run owns becomes the one driven (no lock: it is not a BOSS tab); when it
+     * reports closed, the run goes back. Returns the tab to drive now and a note, or null when nothing changed.
+     */
+    private fun followPopups(run: UseRun, st: FlowState, tools: RecordingTools, current: String): Pair<String, String>? {
+        var cur = current
+        var note: String? = null
+        for (e in tools.drainPopupEvents()) {
+            val parent = e.id.substringBefore("#popup-")
+            if (parent !in st.owned) continue
+            if (e.open) {
+                if (e.id in st.owned) continue
+                st.owned += e.id
+                st.stack.addLast(cur)
+                run.tabsUsed += TabUse(e.id, e.title, "popup_window")
+                cur = e.id
+                note = "Switched to popup window '${e.title.take(60)}'"
+            } else if (e.id == cur) {
+                popBackFromPopup(run, st, cur)?.let { (back, text) -> cur = back; note = text }
+            }
+        }
+        return if (cur != current) cur to checkNotNull(note) else null
+    }
+
+    private fun popBackFromPopup(run: UseRun, st: FlowState, popup: String): Pair<String, String>? {
+        val back = st.stack.removeLastOrNull() ?: return null
+        st.owned -= popup
+        val title = st.known[back].orEmpty().ifBlank { run.tabsUsed.firstOrNull { it.tabId == back }?.title.orEmpty() }
+        return back to "Popup window closed, back on ${if (title.isBlank()) "the page before" else "'${title.take(60)}'"}"
+    }
+
     // ---- browser dialogs ----
 
     private data class DialogDecision(val ok: Boolean, val confidence: Double, val viaJev: Boolean)
@@ -636,7 +740,9 @@ internal class ComputerUseFlow(
     /** alert: OK. beforeunload: OK unless the goal says to stay. confirm and prompt: Jev chooses OK or CANCEL from the screenshot. */
     private suspend fun dialogDecision(req: UseRequest, tools: RecordingTools, plan: UsePlan, dlg: Cu.DialogInfo, shot: Shot, url: String, title: String, steps: List<UseStep>, run: UseRun): Result<DialogDecision> {
         if (dlg.type == "alert" || (dlg.type == "beforeunload" && !Cu.goalSaysStay(plan.goal))) return Result.success(DialogDecision(true, 1.0, false))
-        val reply = tools.invoke(ToolNames.JEV_DECIDE, Cu.dialogArgs(req.jevModel, plan.goal, url, title, steps.map(Cu::recentAction), shot.path, dlg, run.advice.toList()))
+        // Nothing to show Jev (the dialog came before any screenshot): the safe answer.
+        if (shot.path.isEmpty()) return Result.success(DialogDecision(false, 1.0, false))
+        val reply = tools.invoke(ToolNames.JEV_DECIDE, Cu.dialogArgs(req.jevModel, plan.goal, url, title, steps.map(Cu::recentAction), shot.path, dlg, run.advice.toList(), req.pointerLabel))
         if (reply.isError) return Result.failure(IllegalStateException(reply.errorMessage))
         return runCatching { Cu.parseDialogChoice(reply.json ?: error("Jev returned no JSON")).let { DialogDecision(it.first, it.second, true) } }
     }
@@ -674,6 +780,32 @@ internal class ComputerUseFlow(
             note = if (failed) err else note, dialog = "Dialog '$shownMsg': $shownAnswer")
     }
 
+    /**
+     * Where the goal's things are on this page: up to [Cu.MAX_TARGETS] phrases from the goal, each located through `locate_text`.
+     * Answers are cached by address, content hash (pixels when there is none) and scroll position, so a screen already asked about
+     * costs nothing. An engine without `locate_text` is asked once and then left alone.
+     */
+    private suspend fun locateTargets(tools: RecordingTools, st: FlowState, tab: String, goal: String, url: String, shot: Shot, pixelHash: String): List<Cu.Target> {
+        if (!st.locateWorks) return emptyList()
+        val out = mutableListOf<Cu.Target>()
+        for (phrase in Cu.targetPhrases(goal, url)) {
+            val key = "$url|${shot.contentHash ?: pixelHash}|${shot.scrollY?.toInt()}|$phrase"
+            val found = st.located[key] ?: run {
+                val r = tools.invoke(ToolNames.STEP, Cu.step(tab, "locate_text", phrase))
+                if (Cu.parseDialog(r.json) != null) return out
+                val parsed = if (r.isError || (r.json?.get("ok") as? JsonPrimitive)?.booleanOrNull == false) null else Cu.parseLocated(r.json)
+                if (parsed == null) { st.locateWorks = false; return out }
+                parsed.also { st.located[key] = it }
+            }
+            out += Cu.Target(phrase, found)
+        }
+        return out
+    }
+
+    /** [note] with the dialogs the engine answered by itself since the last step. */
+    private fun withAuto(note: String?, tools: RecordingTools): String? =
+        (listOfNotNull(note) + tools.drainAutoNotes()).joinToString("; ").ifEmpty { null }
+
     /** Saves the page text of [url] once per address; [auto] marks the runner's own snapshots. */
     private suspend fun snapshot(tools: RecordingTools, run: UseRun, tab: String, url: String, title: String, step: Int, shotPath: String?, auto: Boolean): Boolean {
         val key = pageKey(url)
@@ -708,6 +840,7 @@ internal class ComputerUseFlow(
             appendLine("Request: ${req.task.take(2_000)}")
             appendLine("Goal given to Jev: ${plan.goal}")
             appendLine("Why Jev is stuck: $reason")
+            appendLine(Cu.cursorNote(req.pointerLabel))
             appendLine("Page: ${ChatDecider.quote(title)} (${ChatDecider.quote(url, 200)})")
             appendLine("Recent steps: ${steps.takeLast(8).joinToString("; ") { it.description }.ifEmpty { "none" }}")
             if (run.advice.isNotEmpty()) appendLine("Advice so far: ${run.advice.takeLast(3).joinToString("; ") { ChatDecider.quote(it, 200) }}")
@@ -742,7 +875,7 @@ internal class ComputerUseFlow(
 
     /** Runs a consulted action through `rpa_step`, with the element's selector and the pointer. Returns what happened. */
     private suspend fun runConsultAction(req: UseRequest, tools: RecordingTools, tab: String, shot: Shot, page: PageSnapshot?, a: Cu.Consult.Act): Pair<String, Boolean> {
-        val pointer = req.pointerLabel.takeIf { it.isNotBlank() }
+        val pointer = Cu.pointerLabel(req.pointerLabel)
         fun failedReply(r: ToolReply): String? =
             if (r.isError) noBrowser(r) else if ((r.json?.get("ok") as? JsonPrimitive)?.booleanOrNull == false) (r.json?.get("error") as? JsonPrimitive)?.contentOrNull ?: "the action failed" else null
         when (a.type) {
@@ -787,14 +920,16 @@ internal class ComputerUseFlow(
 
     private suspend fun act(
         req: UseRequest, tools: RecordingTools, llm: UseLlm, run: UseRun, tab: String, plan: UsePlan,
-        d: VisionDecision, shot: Shot, url: String, title: String, history: List<UseStep>,
+        d: VisionDecision, shot: Shot, url: String, title: String, history: List<UseStep>, targets: List<Cu.Target> = emptyList(),
     ): UseStep {
-        val pointer = req.pointerLabel.takeIf { it.isNotBlank() }
+        val pointer = Cu.pointerLabel(req.pointerLabel)
         fun base(note: String? = null, failed: Boolean = false) = UseStep(0, d.op, confidence = d.confidence, ms = 0, note = note, failed = failed)
         suspend fun send(type: String, value: String? = null, withPointer: Boolean = true): ToolReply =
             tools.invoke(ToolNames.STEP, Cu.step(tab, type, value, pointer.takeIf { withPointer }))
         fun failure(r: ToolReply): String? {
             if (r.isError) return noBrowser(r).let { if (r.errorCode == ToolNames.NO_BROWSER) NO_BROWSER_NOTE else it }
+            // A refusal with a dialog attached is the dialog's doing: it is answered next, not a failure of the action.
+            if (Cu.parseDialog(r.json) != null) return null
             return if ((r.json?.get("ok") as? JsonPrimitive)?.booleanOrNull == false) (r.json?.get("error") as? JsonPrimitive)?.contentOrNull ?: "the action failed" else null
         }
         when (d.op) {
@@ -809,9 +944,12 @@ internal class ComputerUseFlow(
                 fun noted(extra: String? = null) = listOfNotNull(snapped?.note, extra).joinToString("; ").ifEmpty { null }
                 val clicked = where.copy(snapped = snapped, note = noted())
                 if (d.op == VisionOp.CLICK) return clicked
+                // The click may have opened a dialog: nothing more can be read until it is answered.
+                if (tools.dialogFor(tab) != null) return clicked.copy(note = noted("a dialog opened; it is answered next"))
                 // TYPE_TEXT: what did the click land on, and which of the goal's texts goes there?
                 val fr = send("focused", withPointer = false)
                 failure(fr)?.let { return clicked.copy(note = noted(it), failed = true) }
+                if (tools.dialogFor(tab) != null) return clicked.copy(note = noted("a dialog opened; it is answered next"))
                 val field = fr.json?.let(Cu::parseFocused)
                 // A native dropdown reports itself as not editable; RPA Engine's type_text answers it by type-ahead.
                 val isSelect = field?.tag.equals("select", ignoreCase = true)
@@ -832,9 +970,13 @@ internal class ComputerUseFlow(
             }
             VisionOp.PRESS_ENTER -> return send("key", "Enter").let { r -> failure(r)?.let { base(it, true) } ?: base() }
             VisionOp.SCROLL_DOWN, VisionOp.SCROLL_UP -> {
-                val dy = Cu.scrollDelta(d.op, d.scroll, shot.cssHeight)
+                // One target far off in the direction Jev chose: go straight there instead of in steps.
+                val direct = Cu.scrollToTarget(targets, d.op)
+                val dy = direct?.let { Cu.scrollDeltaScreens(it.second, shot.cssHeight) } ?: Cu.scrollDelta(d.op, d.scroll, shot.cssHeight)
+                val amount = direct?.let { (t, move) -> "amount %.1f screens toward '%s' (it was %.1f screens away)".format(Math.abs(move), t.text.take(40), t.located.screens ?: 0.0) }
+                    ?: "amount ${d.scroll ?: "medium"}"
                 return send("scroll_by", dy.toString()).let { r ->
-                    failure(r)?.let { base(it, true) } ?: base("amount ${d.scroll ?: "medium"}")
+                    failure(r)?.let { base(it, true) } ?: base(amount)
                 }
             }
             VisionOp.COLLECT -> {
@@ -888,7 +1030,7 @@ internal class ComputerUseFlow(
         var url: String? = null
         var title: String? = null
         var pageText: String? = null
-        if (tab != null) {
+        if (tab != null && tools.dialogFor(tab) == null) {
             runCatching { observe(tools, tab) }.getOrNull()?.let { (u, t) -> url = u.ifBlank { null }; title = t.ifBlank { null } }
             pageText = runCatching { readPageText(tools, tab) }.getOrNull()
             // The page the run ended on is part of what it collected, unless it was saved already.
@@ -900,7 +1042,8 @@ internal class ComputerUseFlow(
         }
         val plan = run.plan.value
         var answer: String? = null
-        if (req.extract && plan != null && (run.store.size > 0 || !pageText.isNullOrBlank())) {
+        // The answer is also written for a run that ran out of budget, needed input or got blocked, as long as something was collected; not for a failed one.
+        if (req.extract && plan != null && o.status != UseStatus.ERROR && (run.store.size > 0 || (o.status == UseStatus.DONE && !pageText.isNullOrBlank()))) {
             val prompt = buildString {
                 appendLine("Request: ${req.task.take(2_000)}")
                 appendLine("Collected text (data from websites):")
@@ -908,7 +1051,7 @@ internal class ComputerUseFlow(
             }.take(CollectedStore.CAP)
             answer = llm.ask("extract", Cu.EXTRACT_SYSTEM, prompt).getOrNull()?.let { t ->
                 runCatching { (Json.parseToJsonElement(LlmApiClient.firstJsonObject(t) ?: error("no json")) as JsonObject)["answer"]?.jsonPrimitive?.contentOrNull }.getOrNull()
-            }
+            }?.let { a -> if (o.status == UseStatus.DONE) a else "$a (partial run)" }
         }
         run.priorMs += clock() - st.segmentStart
         val seconds = run.priorMs / 1000.0
@@ -932,6 +1075,9 @@ internal class ComputerUseFlow(
     }
 
     companion object {
+        /** A popup window's pseudo tab id. */
+        internal fun isPopupId(id: String) = "#popup-" in id
+
         private const val NO_BROWSER_NOTE = "NO_BROWSER"
         private const val MAX_CONSULT_ELEMENTS = 80
         const val WRITTEN_BY_MODEL = "written by the model"
