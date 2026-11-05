@@ -254,8 +254,9 @@ internal object Cu {
         explicit?.let { return it }
         api ?: return null
         val caps = runCatching { api.capabilities() }.getOrDefault(emptySet())
-        if (ai.rever.boss.plugin.api.AiGatewayAPI.CAPABILITY_VISION !in caps) return null
         val routes = ai.rever.boss.plugin.api.AiGatewayAPI.CAPABILITY_PROVIDER_OVERRIDE in caps
+        // CAPABILITY_VISION is about the active route only; with routing, a named vision model can still be asked.
+        if (ai.rever.boss.plugin.api.AiGatewayAPI.CAPABILITY_VISION !in caps && !routes) return null
         val active = runCatching { api.activeModel() }.getOrNull()?.let { ModelOption(ModelOption.Kind.CHAT, it.providerId, it.providerName, it.modelId) }
         val first = planner ?: active
         if (first != null && mayBeVision(first.providerName, first.modelId)) return first

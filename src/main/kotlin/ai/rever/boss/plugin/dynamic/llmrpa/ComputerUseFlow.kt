@@ -218,8 +218,17 @@ internal class UseLlm(
     val label: String get() = option?.let { modelLabel(it.providerName, it.modelId) }
         ?: runCatching { gateway()?.activeModel()?.let { modelLabel(it.providerName, it.modelId) } }.getOrNull() ?: "active model"
 
-    /** Whether the gateway can take a screenshot with the question. */
-    fun sees(): Boolean = runCatching { gateway()?.capabilities()?.contains(AiGatewayAPI.CAPABILITY_VISION) == true }.getOrDefault(false)
+    /**
+     * Whether this model gets the screenshot. The gateway's CAPABILITY_VISION describes its ACTIVE route (a selected CLI engine
+     * reports none), so a call routed to a named provider is judged by that model instead.
+     */
+    fun sees(): Boolean = runCatching {
+        val api = gateway() ?: return@runCatching false
+        val caps = api.capabilities()
+        val routed = option
+        if (routed != null && AiGatewayAPI.CAPABILITY_PROVIDER_OVERRIDE in caps) Cu.mayBeVision(routed.providerName, routed.modelId)
+        else AiGatewayAPI.CAPABILITY_VISION in caps
+    }.getOrDefault(false)
 
     suspend fun ask(purpose: String, system: String, user: String, image: ByteArray? = null): Result<String> {
         val first = askOnce(purpose, system, user, image)

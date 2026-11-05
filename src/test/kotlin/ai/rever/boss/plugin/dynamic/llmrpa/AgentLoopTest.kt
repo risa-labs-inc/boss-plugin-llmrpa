@@ -337,7 +337,7 @@ class AgentLoopTest {
 
     @Test
     fun `a gateway that cannot take images fails the run naming the setting`() = runTest {
-        caps = setOf(AiGatewayAPI.CAPABILITY_PROVIDER_OVERRIDE)
+        caps = emptySet()
         val report = loop(Browser()).run(AgentRequest("x", tabId = "t1"))
         assertEquals(UseStatus.ERROR, report.status)
         assertTrue(report.error!!.contains("agent_model") && report.error!!.contains("Model setting"), report.error)

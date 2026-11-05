@@ -763,8 +763,8 @@ class ComputerUseTest {
         val seen = mutableListOf<AiRequest>()
         flow(FakeBrowser(tmp(), listOf("BLOCKED")), FakeTabs(), seen).runComputerUse(UseRequest("t", onStuck = OnStuck.CONSULT))
         assertEquals(1, seen.single { it.system.startsWith("You help") }.messages.single().images.size)
-        // A gateway with no vision: a blind consult is no help, so there is none and the run returns.
-        gatewayCaps = setOf(AiGatewayAPI.CAPABILITY_PROVIDER_OVERRIDE)
+        // A gateway with no vision and no routing to another model: a blind consult is no help, so there is none.
+        gatewayCaps = emptySet()
         val blind = mutableListOf<AiRequest>()
         val r = try { flow(FakeBrowser(tmp(), listOf("BLOCKED")), FakeTabs(), blind).runComputerUse(UseRequest("t", onStuck = OnStuck.CONSULT)) } finally { gatewayCaps = defaultCaps }
         assertEquals(0, blind.count { it.system.startsWith("You help") })
@@ -2076,7 +2076,9 @@ class ComputerUseTest {
         assertEquals("gpt-4.1-mini", Cu.pickConsultModel(null, null, api(vision, cliActive, models))!!.modelId)
         // Nothing can see, the gateway cannot take images, or it can only route to the active model: nobody.
         assertNull(Cu.pickConsultModel(null, cliModel(), api(vision, cliActive, listOf(models[0]))))
-        assertNull(Cu.pickConsultModel(null, cliModel(), api(setOf(AiGatewayAPI.CAPABILITY_PROVIDER_OVERRIDE), cliActive, models)))
+        assertNull(Cu.pickConsultModel(null, cliModel(), api(emptySet(), cliActive, models)))
+        // A selected CLI engine reports no vision for the ACTIVE route, but routing can still reach a model that sees.
+        assertEquals("gpt-4.1-mini", Cu.pickConsultModel(null, cliModel(), api(setOf(AiGatewayAPI.CAPABILITY_PROVIDER_OVERRIDE), cliActive, models))!!.modelId)
         assertNull(Cu.pickConsultModel(null, cliModel(), api(setOf(AiGatewayAPI.CAPABILITY_VISION), cliActive, models)))
         assertNull(Cu.pickConsultModel(null, null, null))
         assertFalse(Cu.mayBeVision("Claude Code CLI", "Claude Code CLI"))
