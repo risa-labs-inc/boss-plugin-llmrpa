@@ -301,6 +301,8 @@ class ComputerUseTest {
         val deadTabs = mutableSetOf<String>()
         var jevDelayMs = 0L
         var modalLabel: String? = null
+        /** The dialog the screenshot result says is open (RPA Engine puts `modal` in it); observe may know nothing of it. */
+        var shotModalLabel: String? = null
         /** Jev's answer to the milestone question per decision call, in order (null = not given). */
         var milestoneScript: List<Double?> = emptyList()
         var currentUrlOverride: String? = null
@@ -341,7 +343,7 @@ class ComputerUseTest {
                         "cu_end" -> ToolReply("""{"ok":true}""", false)
                         "screenshot" -> {
                             val f = File(dir, "shot-${if (frozen) 0 else shots++}.jpg").also { it.writeText("shot ${if (frozen) 0 else shots}") }
-                            ToolReply("""{"ok":true,"screenshot":{"path":"${f.absolutePath}","width":560,"height":390,"css_width":1120,"css_height":780,"dpr":2${if (shotMeta) ""","url":"$pageUrl","title":"Shot title"""" else ""}${if (reportScroll) ""","scroll":{"x":0,"y":$scrollY,"max_y":5000}""" else ""}${contentHash?.invoke()?.let { ""","content_hash":"$it"""" }.orEmpty()}}${screenshotFlags.removeFirstOrNull()?.let { (r, v) -> listOfNotNull(r?.let { ""","revealed":$it""" }, v?.let { ""","visible":$it""" }).joinToString("") }.orEmpty()}$dlg}""", false)
+                            ToolReply("""{"ok":true,"screenshot":{"path":"${f.absolutePath}","width":560,"height":390,"css_width":1120,"css_height":780,"dpr":2${if (shotMeta) ""","url":"$pageUrl","title":"Shot title"""" else ""}${if (reportScroll) ""","scroll":{"x":0,"y":$scrollY,"max_y":5000}""" else ""}${contentHash?.invoke()?.let { ""","content_hash":"$it"""" }.orEmpty()}${shotModalLabel?.let { ""","modal":{"label":"$it"}""" }.orEmpty()}}${screenshotFlags.removeFirstOrNull()?.let { (r, v) -> listOfNotNull(r?.let { ""","revealed":$it""" }, v?.let { ""","visible":$it""" }).joinToString("") }.orEmpty()}$dlg}""", false)
                         }
                         "focused" -> ToolReply("""{"ok":true,"focused":$focused}""", false)
                         "page_text" -> ToolReply("""{"ok":true,"text":"${pageTextFn?.invoke() ?: pageTexts[pageUrl] ?: if (pageUrl == "https://sample.com/") "Best: A, B, C" else "Text of $pageUrl"}"}""", false)
@@ -2523,6 +2525,62 @@ class ComputerUseTest {
         assertTrue(p.contains("Magnolia Bakery's Order Online menu (with ADD buttons) is open"))
         assertTrue(p.contains("not just \"the restaurant page is open\""))
         assertTrue(Cu.REPLAN_SYSTEM.contains("the first one names the page where the action happens"))
+    }
+
+    // ---- done is never said over a login ----
+
+    private val stopPlan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"Order a cake","milestones":["Tres Leches is in the cart","Stop at the login or payment step"],"type_values":[]}"""
+
+    @Test
+    fun `the last stop-at-login milestone reads the screenshot's own dialog, so a login dialog is needs_input not done`() = runTest {
+        // The live miss: observe and the page text knew nothing of the dialog; only the screenshot said "Login" is open.
+        val b = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "SCROLL_DOWN")).also {
+            it.milestoneScript = listOf(0.9, 0.95); it.shotModalLabel = "Login"; it.pageTextFn = { "Your Order (1)\nSubtotal \u20B9500" }
+        }
+        val r = flow(b, FakeTabs(), mutableListOf(), plan = stopPlan).runComputerUse(UseRequest("order", maxSteps = 8))
+        assertEquals(UseStatus.NEEDS_INPUT, r.status)
+        val q = r.blocker!!.question!!
+        assertTrue(q.startsWith("sample.com is asking you to log in."), q)
+        assertTrue(q.contains("then reply 'continue'"))
+        // The login wording wins over the one-time password it mentions.
+        val otp = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "SCROLL_DOWN")).also {
+            it.milestoneScript = listOf(0.9, 0.95); it.shotModalLabel = "Login"; it.pageTextFn = { "Login\nPhone number\nSend One Time Password\nContinue with Email\nContinue with Google" }
+        }
+        val q2 = flow(otp, FakeTabs(), mutableListOf(), plan = stopPlan).runComputerUse(UseRequest("order", maxSteps = 8)).blocker!!.question!!
+        assertTrue(q2.contains("is asking you to log in."), q2)
+        assertFalse(q2.contains("verification code"))
+        assertEquals("log in", Cu.wallKind("Login", "Phone number\nSend One Time Password"))
+        assertEquals("log in", Cu.wallKind("Sign in to continue", "Enter OTP"))
+        assertEquals("enter a verification code", Cu.wallKind("Verify", "Enter the verification code"))
+        assertEquals("enter payment details", Cu.wallKind("Payment", "Card number\nCVV"))
+        // No dialog, no wall: the stop milestone is simply reached.
+        val calm = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "SCROLL_DOWN")).also { it.milestoneScript = listOf(0.9, 0.95); it.pageTextFn = { "Your Order (1)" } }
+        assertEquals(UseStatus.DONE, flow(calm, FakeTabs(), mutableListOf(), plan = stopPlan).runComputerUse(UseRequest("order", maxSteps = 8)).status)
+    }
+
+    @Test
+    fun `any done over an open login or payment dialog is needs_input`() = runTest {
+        // No milestones: Jev says DONE with a login dialog open.
+        val login = FakeBrowser(tmp(), listOf("DONE")).also { it.shotModalLabel = "Login"; it.pageTextFn = { "Login\nSend One Time Password" } }
+        val r = flow(login, FakeTabs(), mutableListOf()).runComputerUse(UseRequest("t"))
+        assertEquals(UseStatus.NEEDS_INPUT, r.status)
+        assertTrue(r.blocker!!.question!!.contains("is asking you to log in"))
+        // A payment dialog.
+        val pay = FakeBrowser(tmp(), listOf("DONE")).also { it.shotModalLabel = "Pay"; it.pageTextFn = { "Card number\nCVV" } }
+        assertTrue(flow(pay, FakeTabs(), mutableListOf()).runComputerUse(UseRequest("t")).blocker!!.question!!.contains("enter payment details"))
+        // Through an ordinary last milestone too (not only a stop one).
+        val ordinary = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"g","milestones":["Page open","Item in the cart"],"type_values":[]}"""
+        val m = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "SCROLL_DOWN")).also { it.milestoneScript = listOf(0.9, 0.9); it.shotModalLabel = "Sign in"; it.pageTextFn = { "Sign in\nEmail" } }
+        assertEquals(UseStatus.NEEDS_INPUT, flow(m, FakeTabs(), mutableListOf(), plan = ordinary).runComputerUse(UseRequest("t", maxSteps = 8)).status)
+        // A dialog that is not a wall (a cookie notice) does not stop a done.
+        val cookie = FakeBrowser(tmp(), listOf("DONE")).also { it.shotModalLabel = "Cookie settings"; it.pageTextFn = { "We use cookies" } }
+        assertEquals(UseStatus.DONE, flow(cookie, FakeTabs(), mutableListOf()).runComputerUse(UseRequest("t")).status)
+        // No dialog: done, as before.
+        assertEquals(UseStatus.DONE, flow(FakeBrowser(tmp(), listOf("DONE")), FakeTabs(), mutableListOf()).runComputerUse(UseRequest("t")).status)
+        // The result field is read from the screenshot, as an object or a string.
+        assertEquals("Login", Cu.parseShot(json("""{"screenshot":{"path":"/x","width":1,"height":1,"css_width":1,"css_height":1,"modal":{"label":"Login"}}}"""))!!.modal)
+        assertEquals("Login", Cu.parseShot(json("""{"modal":"Login","screenshot":{"path":"/x","width":1,"height":1,"css_width":1,"css_height":1}}"""))!!.modal)
+        assertNull(Cu.parseShot(json("""{"screenshot":{"path":"/x","width":1,"height":1,"css_width":1,"css_height":1}}"""))!!.modal)
     }
 
     // ---- popup windows that are not tabs ----

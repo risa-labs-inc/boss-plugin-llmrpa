@@ -64,6 +64,8 @@ internal data class Shot(
     val contentHash: String? = null,
     /** The page's address and title as the screenshot result reports them (RPA Engine 1.3.5+): no observe needed. */
     val url: String? = null, val title: String? = null,
+    /** The label of a dialog or overlay open over the page, as this screenshot's result says. */
+    val modal: String? = null,
 ) {
     val position: ScrollPos? get() = if (scrollY != null && maxScrollY != null) ScrollPos(scrollY, maxScrollY) else null
 }
@@ -149,6 +151,7 @@ internal object Cu {
 
     private val CODE_WORDS = Regex("(?i)one[- ]time password|\\botp\\b|verification code")
     private val PAYMENT_WORDS = Regex("(?i)card number|\\bcvv\\b|\\bcvc\\b|security code")
+    private val LOGIN_HEADING = Regex("(?i)\\b(log ?in|sign ?in)\\b")
     private val LOGIN_WORDS = Regex("(?i)log ?in|sign ?in|password|continue with (email|google|phone|apple)")
 
     /**
@@ -157,7 +160,10 @@ internal object Cu {
      */
     fun wallKind(modal: String?, text: String?): String? {
         val all = modal.orEmpty() + "\n" + text.orEmpty().take(20_000)
+        // A dialog (or the page's heading) that says Login or Sign in is a login, whatever else it mentions: its one-time-password step is part of logging in.
+        val heading = modal.orEmpty() + "\n" + text.orEmpty().lines().take(3).joinToString("\n")
         return when {
+            modal != null && LOGIN_HEADING.containsMatchIn(heading) -> "log in"
             CODE_WORDS.containsMatchIn(all) -> "enter a verification code"
             PAYMENT_WORDS.containsMatchIn(all) -> "enter payment details"
             modal != null && LOGIN_WORDS.containsMatchIn(all.take(6_000)) -> "log in"
@@ -383,6 +389,7 @@ internal object Cu {
             contentHash = (s["content_hash"] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() },
             url = ((s["url"] ?: reply["url"]) as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() },
             title = ((s["title"] ?: reply["title"]) as? JsonPrimitive)?.contentOrNull,
+            modal = ((s["modal"] ?: reply["modal"]).let { m -> (m as? JsonObject)?.get("label") ?: m } as? JsonPrimitive)?.takeIf { it.isString }?.content?.takeIf { it.isNotBlank() },
         )
     }
 

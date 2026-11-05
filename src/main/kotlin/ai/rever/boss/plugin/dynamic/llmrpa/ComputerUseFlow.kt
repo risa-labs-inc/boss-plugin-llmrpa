@@ -659,13 +659,15 @@ internal class ComputerUseFlow(
             // The next look asks about the new one, with no call of its own.
             if (d != null && d.op != VisionOp.NEEDS_INPUT && ((d.milestoneP ?: 0.0) >= Cu.MILESTONE_NOUL || (d.op == VisionOp.DONE && stuck == null))) {
                 val reached = plan.milestones.getOrNull(run.doneMilestones.size)
-                if (reached == null) return Outcome(UseStatus.DONE)
+                // Done is never said over an open login or payment dialog: that is the person's to deal with.
+                if (reached == null) return (if (shot.modal != null) userWall(tools, tab, url, title, explicit = false, shotModal = shot.modal) else null) ?: Outcome(UseStatus.DONE)
                 val k = run.doneMilestones.size + 1
                 run.doneMilestones += reached
                 run.milestonesDone.value = run.doneMilestones.size
                 if (k >= plan.milestones.size) {
                     // The last one. A "stop at the login or payment step" ends as the person's when the page does ask; else it is done.
-                    if (Cu.isStopMilestone(reached)) userWall(tools, tab, url, title, explicit = false)?.let { return it }
+                    // A stop-at-login milestone, or any dialog open over the page: read the screen as it is now (this screenshot's dialog, fresh text).
+                    if (Cu.isStopMilestone(reached) || shot.modal != null) userWall(tools, tab, url, title, explicit = false, shotModal = shot.modal)?.let { return it }
                     return Outcome(UseStatus.DONE)
                 }
                 steps += UseStep(steps.size + 1, VisionOp.MILESTONE, confidence = d.milestoneP ?: d.confidence, ms = (System.nanoTime() - t0) / 1_000_000, before = now, tabId = tab,
@@ -678,7 +680,7 @@ internal class ComputerUseFlow(
             }
             // The page asks for something only the person can give (a login, a code, payment): stop for them in either mode, before any consult.
             if (d != null && (d.op == VisionOp.NEEDS_INPUT || d.op == VisionOp.BLOCKED)) {
-                userWall(tools, tab, url, title, explicit = d.op == VisionOp.NEEDS_INPUT)?.let { return it }
+                userWall(tools, tab, url, title, explicit = d.op == VisionOp.NEEDS_INPUT, shotModal = shot.modal)?.let { return it }
             }
             // A dead end (the page does not have what the next milestone needs): ask the planner for a better place to continue from.
             // Never undo progress: a page that is already the right site is not a dead end, and a menu that loads as it scrolls has not been scrolled yet.
@@ -762,7 +764,7 @@ internal class ComputerUseFlow(
             }
 
             val dec = checkNotNull(d)
-            if (dec.op == VisionOp.DONE) return Outcome(UseStatus.DONE)
+            if (dec.op == VisionOp.DONE) return (if (shot.modal != null) userWall(tools, tab, url, title, explicit = false, shotModal = shot.modal) else null) ?: Outcome(UseStatus.DONE)
 
             // Unsure: ask the person when one is there; a headless run never waits for anyone.
             val ask = req.confirm
@@ -1092,8 +1094,9 @@ internal class ComputerUseFlow(
      * Whether the page is waiting on the person: Jev said so, or it is blocked while a login, a code or payment details are asked for (an open
      * dialog's label and the page text say which). Returns the stop, or null when it is an ordinary block.
      */
-    private suspend fun userWall(tools: RecordingTools, tab: String, url: String, title: String, explicit: Boolean): Outcome? {
-        val modal = runCatching { tools.invoke(ToolNames.OBSERVE, buildJsonObject { put("tab_id", tab) }).json?.let(PageSnapshot::parse)?.modal }.getOrNull()
+    private suspend fun userWall(tools: RecordingTools, tab: String, url: String, title: String, explicit: Boolean, shotModal: String? = null): Outcome? {
+        // The dialog this screenshot shows is what is open now; observe is the fallback (and may predate it).
+        val modal = shotModal ?: runCatching { tools.invoke(ToolNames.OBSERVE, buildJsonObject { put("tab_id", tab) }).json?.let(PageSnapshot::parse)?.modal }.getOrNull()
         val text = runCatching { readPageText(tools, tab) }.getOrNull()
         val kind = Cu.wallKind(modal, text)
         if (kind == null && !explicit) return null
