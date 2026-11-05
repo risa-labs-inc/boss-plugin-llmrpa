@@ -360,9 +360,13 @@ internal class UseRun(val task: String, val startedAt: Long = System.currentTime
     internal val tabsUsed = mutableListOf<TabUse>()
     /** Named values the person gave in replies, offered to Jev's text choice on a continued run. */
     internal val inputs = mutableMapOf<String, String>()
+    /** The labels of the candidates the run last asked "which one?" about, so a reply of "2" means the same one on a fresh look. */
+    internal var pendingOptions: List<String> = emptyList()
+    /** The person's choice has been acted on. */
+    internal var choiceDone = false
 }
 
-private data class Outcome(val status: UseStatus, val error: String? = null, val question: String? = null)
+private data class Outcome(val status: UseStatus, val error: String? = null, val question: String? = null, val options: List<ChoiceOption> = emptyList())
 
 /**
  * Plan, open, loop (with stuck handling and collecting), report, as one function with no UI in it:
@@ -683,10 +687,30 @@ internal class ComputerUseFlow(
                     // The elements Jev may pick by number, drawn on a copy of the screenshot (the one image it sees).
                     val marks = if (look != null) Marks.visible(look.marks) else emptyList()
                     val marked = if (marks.isNotEmpty()) renderMarks(run, shot, marks) else null
+                    // The person's answer to "which one do you want?" (the `choice` input: a number or a name): that element is clicked, found again in this look.
+                    val userPick = req.inputs.entries.firstOrNull { it.key.equals(Cu.CHOICE_INPUT, ignoreCase = true) }?.value
+                        ?.takeIf { !run.choiceDone && marks.isNotEmpty() }?.let { Marks.resolveChoice(it, marks, run.pendingOptions, lookPhrases) }
+                    if (userPick != null) {
+                        run.choiceDone = true
+                        run.advice += "The person chose ${Marks.display(userPick)}"
+                        d = VisionDecision(VisionOp.CLICK, 1.0, null, null, null, 0.0, clickChoice = userPick.id, mark = userPick)
+                    } else {
                     val reply = tools.invoke(ToolNames.JEV_DECIDE, Cu.decideArgs(req.jevModel, plan.goal, url, title, Cu.recentActions(steps), marked ?: shot.path, run.advice.toList(), shot.position, targets, run.store.info(), req.pointerLabel, plan.milestones, run.doneMilestones.size, marks, plan.stopWhen))
                     if (reply.isError) return Outcome(UseStatus.ERROR, "Jev could not decide: ${reply.errorMessage}")
-                    d = runCatching { Marks.reconcile(Cu.parseDecision(reply.json ?: error("Jev returned no JSON")), marks, shot.cssWidth, shot.cssHeight) }
+                    val decided = runCatching { Marks.reconcile(Cu.parseDecision(reply.json ?: error("Jev returned no JSON")), marks, shot.cssWidth, shot.cssHeight) }
                         .getOrElse { return Outcome(UseStatus.ERROR, "Jev could not decide: ${it.message}") }
+                    // Several equally good matches and Jev hesitating: the person chooses, unless the goal's own words name exactly one.
+                    val goalWords = (Candidates.phrases(req.task, listOf(url)) + Candidates.phrases(plan.goal, listOf(url)) + Candidates.values(req.task) + Candidates.values(plan.goal)).distinct()
+                    d = when (val amb = Marks.disambiguate(decided, marks, lookPhrases, goalWords)) {
+                        is Marks.Disambiguation.Chosen -> decided.copy(mark = amb.mark, boxDisagreed = false, confidence = maxOf(decided.confidence, Cu.ASK_BELOW))
+                        is Marks.Disambiguation.Ask -> {
+                            run.pendingOptions = amb.options.map(Marks::display)
+                            return Outcome(UseStatus.NEEDS_INPUT, "Several items match '${amb.entity}' and Jev is only ${TaskRunner.pct(minOf(decided.markP ?: 1.0, decided.confidence))} sure which one you want",
+                                Marks.choiceQuestion(amb.options), amb.options.mapIndexed { i, m -> ChoiceOption("${i + 1}", Marks.display(m)) })
+                        }
+                        null -> decided
+                    }
+                    }
                     stuck = when {
                         d.op == VisionOp.BLOCKED -> "Jev found no operation that makes progress"
                         d.confidence < req.consultBelow -> "Jev is only ${TaskRunner.pct(d.confidence)} sure what to do next"
@@ -1445,7 +1469,7 @@ internal class ComputerUseFlow(
         val seconds = run.priorMs / 1000.0
         val summary = Cu.summary(o.status, steps, seconds, title, url, o.error)
         val blocker = if (o.status == UseStatus.NEEDS_INPUT || o.status == UseStatus.BLOCKED) {
-            UseBlocker(o.error.orEmpty(), o.question, url, title, tab, st.lastShot, steps.size)
+            UseBlocker(o.error.orEmpty(), o.question, url, title, tab, st.lastShot, steps.size, o.options)
         } else null
         val report = UseReport(
             status = o.status, task = req.task, goal = plan?.goal, summary = summary, url = url, title = title,

@@ -159,6 +159,75 @@ internal object Marks {
         return d.copy(mark = mark, boxDisagreed = disagree, confidence = if (disagree) d.confidence * DISAGREE_FACTOR else d.confidence)
     }
 
+    /** Jev's pick is "low" below this: its click_target probability or its operation confidence. */
+    const val AMBIGUOUS_BELOW = 0.6
+    const val MAX_CHOICES = 6
+
+    /** What an element is called to a person: the card or row around it, else its own label, at most 60 characters. */
+    fun display(m: Mark): String = clean(m.context.ifBlank { m.label }, 60)
+
+    /** [display] without a price: "Classic Tres Leches ₹450" is "Classic Tres Leches". */
+    fun nameOf(m: Mark): String = display(m).replace(Regex("[\\u20B9$\\u20AC\\u00A3]\\s?\\d[\\d.,]*"), "").replace(Regex("\\s+"), " ").trim().trim('-', '\u2014', '\u00B7', ' ')
+
+    private fun pool(marks: List<Mark>, op: VisionOp) = (if (op == VisionOp.TYPE_TEXT) typeables(marks) else clickable(marks)).filter { !it.covered && !it.disabled }
+
+    /**
+     * Marks that name the same [entities] entity and are alike (the same kind of element with the same label, such as the ADD buttons of three items),
+     * distinct by what they are called: two or more means the goal does not say which. Alike to [picked] when it is one of them, else the largest such group.
+     */
+    fun alike(candidates: List<Mark>, entities: List<String>, picked: Mark?): Pair<String, List<Mark>>? {
+        for (e in entities) {
+            val hit = candidates.filter { "${it.label} ${it.context}".contains(e, ignoreCase = true) }
+            val group = if (picked != null && hit.any { it.id == picked.id }) hit.filter { it.role == picked.role && it.label.equals(picked.label, true) }
+            else hit.groupBy { it.role to it.label.lowercase() }.values.maxByOrNull { it.size }.orEmpty()
+            val distinct = group.distinctBy { display(it).lowercase() }
+            if (distinct.size >= 2) return e to distinct.take(MAX_CHOICES)
+        }
+        return null
+    }
+
+    /** What to do about a hesitant CLICK or TYPE_TEXT: [Chosen] when the goal's own words name exactly one candidate, [Ask] when several fit equally. */
+    sealed interface Disambiguation {
+        data class Chosen(val mark: Mark) : Disambiguation
+        data class Ask(val entity: String, val options: List<Mark>) : Disambiguation
+    }
+
+    /**
+     * Jev picked CLICK or TYPE_TEXT with low confidence (its target probability or its operation confidence under [AMBIGUOUS_BELOW]) and two or more marks
+     * that name the same entity look alike: ask the person, unless one of [phrases] (the goal's own words) is exactly one candidate's name.
+     */
+    fun disambiguate(d: VisionDecision, marks: List<Mark>, entities: List<String>, phrases: List<String>): Disambiguation? {
+        if (d.op != VisionOp.CLICK && d.op != VisionOp.TYPE_TEXT) return null
+        if ((d.markP ?: 1.0) >= AMBIGUOUS_BELOW && d.confidence >= AMBIGUOUS_BELOW) return null
+        val (entity, group) = alike(pool(marks, d.op), entities, d.mark) ?: return null
+        val named = group.filter { m -> nameOf(m).let { n -> n.isNotEmpty() && phrases.any { it.trim().equals(n, ignoreCase = true) } } }
+        named.singleOrNull()?.let { return Disambiguation.Chosen(it) }
+        return Disambiguation.Ask(entity, group)
+    }
+
+    /** "Which one do you want? 1) Classic Tres Leches ₹450 2) ..." */
+    fun choiceQuestion(options: List<Mark>): String =
+        "Which one do you want? " + options.mapIndexed { i, m -> "${i + 1}) ${display(m)}" }.joinToString(" ") + " (reply with the number or the name)"
+
+    /**
+     * The mark a reply to that question means, found again in a fresh look: a number counts into [pending] (the labels asked about), or into the
+     * options as they look now; a name is an exact label or product name, else the one candidate that holds it. Null when it names none or several.
+     */
+    fun resolveChoice(reply: String, marks: List<Mark>, pending: List<String>, entities: List<String>): Mark? {
+        val cands = pool(marks, VisionOp.CLICK)
+        val text = reply.trim().trimEnd('.', ')').let { r ->
+            r.toIntOrNull()?.let { n -> pending.getOrNull(n - 1) ?: alike(cands, entities, null)?.second?.getOrNull(n - 1)?.let(::display) ?: return null } ?: r
+        }
+        if (text.isBlank()) return null
+        // Elements inside a card or row (the ADD of an item) before bare links to the same name.
+        fun find(pool: List<Mark>): Mark? {
+            pool.filter { display(it).equals(text, true) }.distinctBy { display(it) }.singleOrNull()?.let { return it }
+            pool.filter { nameOf(it).equals(text, true) }.singleOrNull()?.let { return it }
+            return pool.filter { display(it).contains(text, true) || (nameOf(it).length >= 3 && text.contains(nameOf(it), true)) }.distinctBy { display(it) }.singleOrNull()
+        }
+        return find(cands.filter { it.context.isNotBlank() }) ?: find(cands)
+    }
+
     private val REFUSAL = Regex("""(?i)\bis (disabled|covered by\b.*)""")
 
     /** "ADD is disabled" / "ADD is covered by Login dialog" from the engine's click error, or null for any other failure. */

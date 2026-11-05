@@ -320,6 +320,8 @@ class ComputerUseTest {
         /** Which mark Jev picks for click_target / type_target when those questions are asked; null = NONE. */
         var clickPick: String? = null
         var typePick: String? = null
+        /** The probability Jev gives its click_target / type_target pick. */
+        var pickP = 0.9
         /** The box Jev answers with. */
         var boxJson = """{"top":0.2,"bottom":0.3,"left":0.4,"right":0.6}"""
         /** The next click_at replies fail with this error (the engine's disabled / covered refusal). */
@@ -422,7 +424,7 @@ class ComputerUseTest {
             return """{"ok":true,"screenshot":{"path":"${f.absolutePath}","width":560,"height":390,"css_width":1120,"css_height":780,"dpr":2${if (shotMeta) ""","url":"$pageUrl","title":"Shot title"""" else ""}${if (reportScroll) ""","scroll":{"x":0,"y":$scrollY,"max_y":5000}""" else ""}${contentHash?.invoke()?.let { ""","content_hash":"$it"""" }.orEmpty()}${shotModalLabel?.let { ""","modal":{"label":"$it"}""" }.orEmpty()}}${screenshotFlags.removeFirstOrNull()?.let { (r, v) -> listOfNotNull(r?.let { ""","revealed":$it""" }, v?.let { ""","visible":$it""" }).joinToString("") }.orEmpty()}$dlg}"""
         }
         private fun pickJson(key: String, pick: String?, q: JsonObject?) =
-            if (q != null && key in q) """"$key":{"type":"choice","choice":"${pick ?: Marks.NONE}","probabilities":{"${pick ?: Marks.NONE}":0.9}},""" else ""
+            if (q != null && key in q) """"$key":{"type":"choice","choice":"${pick ?: Marks.NONE}","probabilities":{"${pick ?: Marks.NONE}":$pickP}},""" else ""
         private fun reply(op: String, p: Double, milestone: Double? = null, q: JsonObject? = null) =
             """{"response":{"answers":{${milestone?.let { """"milestone":{"type":"noul","noul":$it},""" }.orEmpty()}${pickJson("click_target", clickPick, q)}${pickJson("type_target", typePick, q)}"operation":{"type":"choice","choice":"$op","probabilities":{"$op":$p}},""" +
                 """"target":{"type":"box","box":$boxJson,"confidence":0.8},"scroll":{"type":"choice","choice":"small"}},"usage":{"cost":0.01}}}"""
@@ -3374,7 +3376,10 @@ class ComputerUseTest {
         assertTrue(Cu.mayCredit(plain, true, emptyList()))
         // A later one needs an action: scrolls and waits are not.
         assertFalse(Cu.mayCredit(plain, false, emptyList()))
-        assertFalse(Cu.mayCredit(plain, false, listOf(step(VisionOp.SCROLL_DOWN), step(VisionOp.WAIT), step(VisionOp.COLLECT))))
+        assertFalse(Cu.mayCredit(plain, false, listOf(step(VisionOp.WAIT), step(VisionOp.COLLECT), step(VisionOp.SCROLL_DOWN, failed = true))))
+        // A scroll is enough for a milestone about what is visible or open (it was how the page got there).
+        assertTrue(Cu.mayCredit(plain, false, listOf(step(VisionOp.SCROLL_DOWN))))
+        assertTrue(Cu.mayCredit("Magnolia Bakery's Order Online menu is open", false, listOf(step(VisionOp.SCROLL_UP))))
         assertTrue(Cu.mayCredit(plain, false, listOf(step(VisionOp.CLICK))))
         assertTrue(Cu.mayCredit(plain, false, listOf(step(VisionOp.TYPE_TEXT))))
         assertTrue(Cu.mayCredit(plain, false, listOf(step(VisionOp.PRESS_ENTER))))
@@ -3391,7 +3396,7 @@ class ComputerUseTest {
         assertFalse(Cu.isStatefulMilestone("Magnolia Bakery's Order Online menu is open"))
         assertFalse(Cu.mayCredit(cart, true, emptyList()))
         assertFalse(Cu.mayCredit(cart, false, listOf(step(VisionOp.CLICK, contentChanged = false))))
-        assertFalse(Cu.mayCredit(cart, false, listOf(step(VisionOp.SCROLL_DOWN, contentChanged = true))))
+        assertFalse(Cu.mayCredit(cart, false, listOf(step(VisionOp.SCROLL_DOWN, contentChanged = true)))) // a scroll never makes a cart
         assertTrue(Cu.mayCredit(cart, false, listOf(step(VisionOp.CLICK, contentChanged = true))))
         // Without the engine's content hash, the pixels stand in.
         assertTrue(Cu.mayCredit(cart, false, listOf(step(VisionOp.CLICK, changed = true))))
@@ -3485,5 +3490,89 @@ class ComputerUseTest {
         val s3 = testScheduler.currentTime
         ComputerUseFlow(sc, { gateway(mutableListOf(), plan, typedJson) }, FakeTabs().also { it.now = mapOf("t1" to "Main") }, openWaitsMs = listOf(0), settleMs = 0).runComputerUse(UseRequest("t", maxSteps = 5))
         assertEquals(0L, testScheduler.currentTime - s3)
+    }
+
+    @Test
+    fun `a scroll credits a visible milestone, a cart milestone still needs a click`() = runTest {
+        val plan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"Order Tres Leches","milestones":["The menu is open","Tres Leches is visible on the menu","Tres Leches is in the cart"],"type_values":[]}"""
+        // Look 1 credits the page, the scroll that came with it is acted on, and the next look says Tres Leches is visible: credited by that scroll.
+        val b = looking(listOf("SCROLL_DOWN", "SCROLL_DOWN", "SCROLL_DOWN", "SCROLL_DOWN")) { reportScroll = true; milestoneScript = listOf(0.9, 0.9, 0.9, 0.9, 0.9); contentHash = { "same" } }
+        val r = flow(b, FakeTabs(), mutableListOf(), plan = plan).runComputerUse(UseRequest("t", maxSteps = 8))
+        // The cart stays uncredited however sure Jev is: only scrolls happened.
+        assertEquals(listOf("milestone 1 done: The menu is open", "milestone 2 done: Tres Leches is visible on the menu"), r.steps.filter { it.op == VisionOp.MILESTONE }.map { it.note })
+        assertEquals(2, r.milestonesDone)
+        assertEquals(UseStatus.BUDGET, r.status)
+    }
+
+    private val threeItems = """[
+        {"id":"m1","role":"button","tag":"button","label":"ADD","rect":{"x":900,"y":300,"w":80,"h":32},"disabled":false,"covered":false,"context":"Classic Tres Leches ₹450","editable":false},
+        {"id":"m2","role":"button","tag":"button","label":"ADD","rect":{"x":900,"y":420,"w":80,"h":32},"disabled":false,"covered":false,"context":"Eggless Classic Tres Leches ₹470","editable":false},
+        {"id":"m3","role":"button","tag":"button","label":"ADD","rect":{"x":900,"y":540,"w":80,"h":32},"disabled":false,"covered":false,"context":"Chocolate Tres Leches ₹500","editable":false},
+        {"id":"m4","role":"button","tag":"button","label":"ADD","rect":{"x":900,"y":660,"w":80,"h":32},"disabled":false,"covered":false,"context":"Brownie ₹250","editable":false},
+        {"id":"m5","role":"link","tag":"a","label":"Classic Tres Leches","rect":{"x":100,"y":300,"w":200,"h":20},"disabled":false,"covered":false,"context":"","editable":false}]"""
+    private val tresPlan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"Add Tres Leches to the cart","entities":["Tres Leches"],"type_values":[]}"""
+
+    @Test
+    fun `several matching items and a hesitant Jev is a question with options, not stuck`() = runTest {
+        val b = looking(listOf("CLICK", "DONE")) { lookElements = threeItems; clickPick = "m1"; pickP = 0.4 }
+        val run = UseRun("Add Tres Leches to the cart")
+        val r = flow(b, FakeTabs(), mutableListOf(), plan = tresPlan).runComputerUse(UseRequest("Add Tres Leches to the cart", maxSteps = 6), run)
+        assertEquals(UseStatus.NEEDS_INPUT, r.status)
+        assertEquals(0, b.stepArgs("click_at").size)
+        val blocker = r.blocker!!
+        assertEquals("Which one do you want? 1) Classic Tres Leches ₹450 2) Eggless Classic Tres Leches ₹470 3) Chocolate Tres Leches ₹500 (reply with the number or the name)", blocker.question)
+        assertEquals(listOf(ChoiceOption("1", "Classic Tres Leches ₹450"), ChoiceOption("2", "Eggless Classic Tres Leches ₹470"), ChoiceOption("3", "Chocolate Tres Leches ₹500")), blocker.options)
+        assertTrue(blocker.reason.startsWith("Several items match 'Tres Leches' and Jev is only 40% sure"), blocker.reason)
+        // The brownie is not a candidate and the link is not alike (not an ADD button). The options are in the report.
+        val json = r.toJson()["blocker"]!!.jsonObject["options"]!!.jsonArray
+        assertEquals(listOf("1" to "Classic Tres Leches ₹450", "2" to "Eggless Classic Tres Leches ₹470", "3" to "Chocolate Tres Leches ₹500"), json.map { it.jsonObject["id"]!!.jsonPrimitive.content to it.jsonObject["label"]!!.jsonPrimitive.content })
+        // A confident Jev is not second-guessed; so is one with a single match.
+        val sure = looking(listOf("CLICK", "DONE")) { lookElements = threeItems; clickPick = "m1"; pickP = 0.9 }
+        assertEquals(UseStatus.DONE, flow(sure, FakeTabs(), mutableListOf(), plan = tresPlan).runComputerUse(UseRequest("t", maxSteps = 6)).status)
+        val one = looking(listOf("CLICK", "DONE")) { lookElements = threeItems; clickPick = "m4"; pickP = 0.4 }
+        assertEquals(UseStatus.DONE, flow(one, FakeTabs(), mutableListOf(), plan = tresPlan.replace("Tres Leches\"]", "Brownie\"]")).runComputerUse(UseRequest("t", maxSteps = 6)).status)
+        // The reply resumes on the same tab: by number, found again in a fresh look, with the choice as advice.
+        val resume = flow(b, FakeTabs(), mutableListOf(), plan = tresPlan).runComputerUse(UseRequest("Add Tres Leches to the cart", tabId = "t1", resume = true, inputs = mapOf("choice" to "2"), maxSteps = 6), run)
+        assertEquals(UseStatus.DONE, resume.status, resume.error)
+        val click = b.stepArgs("click_at").single()["action"]!!.jsonObject
+        assertEquals("m2", click["element"]!!.jsonPrimitive.content)
+        assertTrue(run.advice.any { it == "The person chose Eggless Classic Tres Leches ₹470" }, run.advice.toString())
+        // It was clicked without asking Jev again for that look.
+        assertEquals(2, b.jevArgs.size) // the first question, then DONE: the click itself took no Jev call
+        // By name, from a fresh run (browser_use called again with inputs): the same, whatever order the page lists them in.
+        val named = looking(listOf("DONE")) { lookElements = threeItems }
+        val nr = flow(named, FakeTabs(), mutableListOf(), plan = "{\"open\":[],\"jev_goal\":\"Add Tres Leches to the cart\"}").runComputerUse(UseRequest("Add Tres Leches to the cart", tabId = "t1", planWithLlm = false, inputs = mapOf("choice" to "chocolate tres leches"), maxSteps = 6))
+        assertEquals(UseStatus.DONE, nr.status, nr.error)
+        assertEquals("m3", named.stepArgs("click_at").single()["action"]!!.jsonObject["element"]!!.jsonPrimitive.content)
+        // A name held by several candidates is no answer.
+        assertNull(Marks.resolveChoice("tres leches", Marks.parseMarks(json("""{"e":$threeItems}""")["e"]!!.jsonArray), emptyList(), emptyList()))
+        assertEquals("m1", Marks.resolveChoice("Classic Tres Leches", Marks.parseMarks(json("""{"e":$threeItems}""")["e"]!!.jsonArray), emptyList(), emptyList())!!.id)
+        // The choice is not typed into a field as text.
+        assertFalse(Cu.textOptions("g", emptyList(), "u", false, mapOf("choice" to "2")).contains("2"))
+    }
+
+    @Test
+    fun `when the goal's own words name exactly one candidate it is picked without asking`() = runTest {
+        val task = "Add the classic tres leches to the cart"
+        val b = looking(listOf("CLICK", "DONE")) { lookElements = threeItems; clickPick = "m2"; pickP = 0.4 }
+        val r = flow(b, FakeTabs(), mutableListOf(), plan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"$task","entities":["Tres Leches"],"type_values":[]}""").runComputerUse(UseRequest(task, maxSteps = 6))
+        assertEquals(UseStatus.DONE, r.status, r.error)
+        assertEquals("m1", b.stepArgs("click_at").single()["action"]!!.jsonObject["element"]!!.jsonPrimitive.content)
+        // Not enough: "tres leches" alone is every candidate's name part, so it asks.
+        val vague = looking(listOf("CLICK", "DONE")) { lookElements = threeItems; clickPick = "m2"; pickP = 0.4 }
+        assertEquals(UseStatus.NEEDS_INPUT, flow(vague, FakeTabs(), mutableListOf(), plan = tresPlan).runComputerUse(UseRequest("Add Tres Leches to the cart", maxSteps = 6)).status)
+        // The rule on its own.
+        val marks = Marks.parseMarks(json("""{"e":$threeItems}""")["e"]!!.jsonArray)
+        val low = VisionDecision(VisionOp.CLICK, 0.9, null, null, null, 0.0, clickChoice = "m2", mark = marks[1], markP = 0.4)
+        assertEquals("m3", (Marks.disambiguate(low, marks, listOf("Tres Leches"), listOf("chocolate tres leches")) as Marks.Disambiguation.Chosen).mark.id)
+        assertTrue(Marks.disambiguate(low, marks, listOf("Tres Leches"), emptyList()) is Marks.Disambiguation.Ask)
+        assertNull(Marks.disambiguate(low.copy(markP = 0.7), marks, listOf("Tres Leches"), emptyList()))
+        assertNull(Marks.disambiguate(low.copy(op = VisionOp.SCROLL_DOWN), marks, listOf("Tres Leches"), emptyList()))
+        assertNull(Marks.disambiguate(low, marks, listOf("Brownie"), emptyList()))
+        // At most 6 options, each at most 60 characters.
+        val many = (1..9).map { Mark("m$it", "button", "button", "ADD", null, Cu.Rect(0.0, it * 10.0, 5.0, it * 10.0 + 5), false, false, "Tres Leches variant $it " + "x".repeat(80), false, null) }
+        val ask = Marks.disambiguate(low.copy(clickChoice = "m1", mark = many[0]), many, listOf("Tres Leches"), emptyList()) as Marks.Disambiguation.Ask
+        assertEquals(6, ask.options.size)
+        assertTrue(ask.options.all { Marks.display(it).length <= 60 })
     }
 }

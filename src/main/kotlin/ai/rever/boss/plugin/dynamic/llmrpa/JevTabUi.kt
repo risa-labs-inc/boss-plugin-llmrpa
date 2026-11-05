@@ -252,7 +252,7 @@ private fun JevRunView(component: LlmrpaComponent, run: UseRun, active: Boolean)
     }
     if (!active) {
         val finished = report
-        finished?.blocker?.takeIf { finished.status == UseStatus.NEEDS_INPUT }?.let { NeedsInputCard(it) }
+        finished?.blocker?.takeIf { finished.status == UseStatus.NEEDS_INPUT }?.let { NeedsInputCard(it) { id -> component.chooseUseOption(id)?.let(component::showError) } }
         finished?.let { ReportCard(it) } ?: Text("Stopped before a report was written.", color = RpaTokens.TextSecondary, fontSize = 12.sp)
     }
     ActivitySection(activity, active)
@@ -381,14 +381,18 @@ private fun PageTextBlock(text: String) {
 private const val EXCERPT_CHARS = 2_000
 
 /** A run that stopped for the person: what it needs, and where to answer. */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun NeedsInputCard(b: UseBlocker) {
+private fun NeedsInputCard(b: UseBlocker, onPick: (String) -> Unit = {}) {
     Column(
         Modifier.fillMaxWidth().clip(RpaTokens.Shape).background(RpaTokens.Panel).border(1.dp, RpaTokens.Warning.copy(alpha = 0.6f), RpaTokens.Shape).padding(12.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         Text("Jev needs your input", color = RpaTokens.Text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
         Text(b.question ?: b.reason, color = RpaTokens.Text, fontSize = 13.sp)
+        if (b.options.isNotEmpty()) FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            b.options.forEach { o -> OutlineButton("${o.id}) ${o.label}", { onPick(o.id) }) }
+        }
         Text("Why it stopped: ${b.reason}", color = RpaTokens.TextSecondary, fontSize = 12.sp)
         b.url?.let { Text("Still on $it", color = RpaTokens.TextMuted, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis) }
         Text("Type your reply below: Jev continues on this same page, not a new one.", color = RpaTokens.TextSecondary, fontSize = 12.sp)

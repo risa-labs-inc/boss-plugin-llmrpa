@@ -61,6 +61,8 @@ internal data class VisionDecision(
     val mark: Mark? = null,
     /** The box pointed somewhere else than the picked mark. */
     val boxDisagreed: Boolean = false,
+    /** Jev's probability for the click_target / type_target pick of this operation. */
+    val markP: Double? = null,
 )
 
 /** What `rpa_step screenshot` reported (contract C): the saved image and the viewport in CSS px. */
@@ -226,6 +228,9 @@ internal object Cu {
             .firstOrNull { mayBeVision(it.providerName, it.modelId) }
     }
 
+    /** The input name that answers a "which one do you want?" question: the option's number or its name. */
+    const val CHOICE_INPUT = "choice"
+
     const val SHOT_REF = "viewport-screenshot-9d2b"
     const val VISION_DEFAULT_MODEL = "typesafe/jev-1.14"
     const val ASK_BELOW = 0.6
@@ -261,14 +266,15 @@ internal object Cu {
     private fun performed(s: UseStep) = !s.failed && !s.refused && (s.op == VisionOp.CLICK || s.op == VisionOp.TYPE_TEXT || s.op == VisionOp.PRESS_ENTER)
 
     /**
-     * Whether a milestone Jev says is true may be credited. The first one is (a page reached by navigation). Later ones need an action of this run (a click,
-     * typing, Enter or a replan's navigation) since the previous milestone, and one about a cart, selection or checked state needs a click or typing whose
-     * effect changed the page's content: a fact already true before the run (a cart left over from an earlier session) is not progress.
+     * Whether a milestone Jev says is true may be credited. The first one is (a page reached by navigation). A later one about what is visible or open needs
+     * something this run did since the previous milestone: a scroll, a click, typing, Enter or a replan's navigation. One about a cart, selection or checked
+     * state needs a click or typing whose effect changed the page's content: a fact already true before the run (a cart left over from an earlier session)
+     * is not progress.
      * [sinceLast] are the steps after the previous milestone.
      */
     fun mayCredit(milestone: String, first: Boolean, sinceLast: List<UseStep>): Boolean {
         if (isStatefulMilestone(milestone)) return sinceLast.any { performed(it) && (it.contentChanged ?: it.changed ?: false) }
-        return first || sinceLast.any { performed(it) || (it.op == VisionOp.REPLAN && it.note?.startsWith("replanned") == true) }
+        return first || sinceLast.any { performed(it) || (!it.failed && !it.refused && (it.op == VisionOp.SCROLL_DOWN || it.op == VisionOp.SCROLL_UP)) || (it.op == VisionOp.REPLAN && it.note?.startsWith("replanned") == true) }
     }
 
     const val MILESTONE_RULES = "state.milestone is the step to work on now: pick DONE as soon as the screenshot shows it is reached (the run then moves on to the next one), not when the whole goal is."
@@ -413,6 +419,10 @@ internal object Cu {
             milestoneP = ((answers["milestone"] as? JsonObject)?.get("noul") as? JsonPrimitive)?.doubleOrNull,
             clickChoice = ((answers["click_target"] as? JsonObject)?.get("choice") as? JsonPrimitive)?.contentOrNull,
             typeChoice = ((answers["type_target"] as? JsonObject)?.get("choice") as? JsonPrimitive)?.contentOrNull,
+            markP = (answers[if (op == VisionOp.TYPE_TEXT) "type_target" else "click_target"] as? JsonObject)?.let { t ->
+                val c = (t["choice"] as? JsonPrimitive)?.contentOrNull
+                ((t["probabilities"] as? JsonObject)?.get(c ?: "") as? JsonPrimitive)?.doubleOrNull ?: (t["confidence"] as? JsonPrimitive)?.doubleOrNull
+            },
         )
     }
 
@@ -843,7 +853,7 @@ internal object Cu {
     /** Text for a field: always from [typeValues] (the plan's) and the goal's quoted values; words from the goal only for a plain field. */
     fun textOptions(goal: String, typeValues: List<String>, pageUrl: String, sensitive: Boolean, inputs: Map<String, String> = emptyMap()): List<String> {
         // A caller's input named like a secret (a password, a code) goes only into a private field.
-        val given = (typeValues + inputs.filterKeys { sensitive || !secretName(it) }.values + Candidates.values(goal)).map { it.trim() }.filter { it.isNotEmpty() }
+        val given = (typeValues + inputs.filterKeys { (sensitive || !secretName(it)) && !it.equals(CHOICE_INPUT, ignoreCase = true) }.values + Candidates.values(goal)).map { it.trim() }.filter { it.isNotEmpty() }
         val all = if (sensitive) given else given.filterNot { Candidates.isKeywordSecret(goal, it) } + Candidates.phrases(goal, listOf(pageUrl)) + clauseOptions(goal)
         return all.distinctBy { it.lowercase() }
     }
@@ -1195,7 +1205,11 @@ internal data class UseBlocker(
     val tabId: String?,
     val screenshotPath: String?,
     val step: Int,
+    /** For a "which one do you want?" question: the candidates, numbered from 1. Reply with the id or the label. */
+    val options: List<ChoiceOption> = emptyList(),
 )
+
+internal data class ChoiceOption(val id: String, val label: String)
 
 /** Information saved from a page: by Jev's COLLECT or automatically before leaving the page. */
 internal data class CollectedItem(val step: Int, val url: String, val title: String, val text: String, val screenshotPath: String?, val auto: Boolean)
@@ -1307,6 +1321,7 @@ internal data class UseReport(
                 b.tabId?.let { put("tab_id", it) }
                 b.screenshotPath?.let { put("screenshot_path", it) }
                 put("step", b.step)
+                if (b.options.isNotEmpty()) putJsonArray("options") { b.options.forEach { o -> add(buildJsonObject { put("id", o.id); put("label", o.label) }) } }
             }
         }
         putJsonArray("collected") {

@@ -219,6 +219,11 @@ class PanelRenderTest {
             stuck.updateUseInput("My phone is 555 0100")
             render(stuck, 360, 1500, "jev-needs-input-typed-360")
 
+            val which = "Several items match 'Tres Leches' and Jev is only 40% sure which one you want"
+            val options = listOf(ChoiceOption("1", "Classic Tres Leches \u20B9450"), ChoiceOption("2", "Eggless Classic Tres Leches \u20B9470"), ChoiceOption("3", "Chocolate Tres Leches \u20B9500"))
+            val choose = jevComponent().also { it.showUse(runOf(base(UseStatus.NEEDS_INPUT, which, UseBlocker(which, "Which one do you want? 1) Classic Tres Leches \u20B9450 2) Eggless Classic Tres Leches \u20B9470 3) Chocolate Tres Leches \u20B9500 (reply with the number or the name)", url, title, "t1", null, 4, options)))) }
+            listOf(360, 960).forEach { render(choose, it, 1500, "jev-choose-$it") }
+
             val extracted = jevComponent().also { it.showUse(runOf(base(UseStatus.DONE, null, null, extract = true, answer = "The top restaurants in Palo Alto on Zomato are Restaurant 1 (4.2) and Restaurant 2 (4.3)."))) }
             listOf(360, 960).forEach { render(extracted, it, 1500, "jev-collected-$it") }
         } finally {

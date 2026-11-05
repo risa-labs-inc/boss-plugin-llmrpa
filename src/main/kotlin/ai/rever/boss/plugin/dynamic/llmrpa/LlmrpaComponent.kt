@@ -681,15 +681,23 @@ class LlmrpaComponent(
         useBlocker()?.let { return it }
         // "continue" or "logged in": the person did it themselves in the tab. Anything else is details Jev may type.
         val cont = Cu.isContinueReply(reply)
-        if (!cont) {
+        // A reply to "which one do you want?": the number or the name, which the run finds again in a fresh look.
+        val picked = blocker.options.firstOrNull { it.id == reply.trim().trimEnd('.', ')') || it.label.equals(reply.trim(), true) || (reply.trim().length >= 3 && it.label.contains(reply.trim(), true)) }
+        if (picked != null) {
+            run.inputs[Cu.CHOICE_INPUT] = reply.trim()
+            run.choiceDone = false
+        } else if (!cont) {
             val name = generateSequence(1) { it + 1 }.map { if (it == 1) "reply" else "reply$it" }.first { it !in run.inputs }
             run.inputs[name] = reply
         }
         _useInput.value = ""
-        val advice = if (cont) "The person did what the page asked in this tab themselves (logged in, entered a code): continue from the page as it is now" else "The person replied: $reply"
+        val advice = if (picked != null) "The person chose ${picked.label}" else if (cont) "The person did what the page asked in this tab themselves (logged in, entered a code): continue from the page as it is now" else "The person replied: $reply"
         launchUse(useFlow(activeTabsProvider), baseRequest(run, tab, resume = true, advice = listOf(advice)), run)
         return null
     }
+
+    /** A button of a "which one do you want?" card: replies with that option's number. */
+    fun chooseUseOption(id: String): String? { _useInput.value = id; return continueUse() }
 
     /** Shows [run] in the Jev tab without starting one; for tests and previews. */
     internal fun showUse(run: UseRun?) { _useRun.value = run }
