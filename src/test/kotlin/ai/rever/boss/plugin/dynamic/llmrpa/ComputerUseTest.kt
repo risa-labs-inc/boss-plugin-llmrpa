@@ -2147,7 +2147,7 @@ class ComputerUseTest {
         flow(menu, FakeTabs(), req).runComputerUse(UseRequest("t", onStuck = OnStuck.CONSULT))
         assertEquals(1, req.count { it.system.startsWith("You help a browser agent") })
         // A code or card on the page counts without a modal; NEEDS_INPUT alone, with nothing recognised, still stops.
-        val pay = FakeBrowser(tmp(), listOf("BLOCKED")).also { it.pageTextFn = { "Pay now\nCard number\nCVV" } }
+        val pay = FakeBrowser(tmp(), listOf("BLOCKED")).also { it.pageTextFn = { "Pay now\nCard number\nCVV" }; it.elements = """[{"id":"e1","role":"textbox","tag":"input","label":"Card number","options":null,"sensitive":false,"in_viewport":true,"selector":{"type":"css","value":"#cc"}},{"id":"e2","role":"textbox","tag":"input","label":"CVV","options":null,"sensitive":true,"in_viewport":true,"selector":{"type":"css","value":"#cvv"}}]""" }
         assertTrue(flow(pay, FakeTabs(), mutableListOf()).runComputerUse(UseRequest("t")).blocker!!.question!!.contains("enter payment details"))
         val odd = FakeBrowser(tmp(), listOf("NEEDS_INPUT"))
         assertTrue(flow(odd, FakeTabs(), mutableListOf()).runComputerUse(UseRequest("t")).blocker!!.question!!.contains("provide something only you can"))
@@ -2271,7 +2271,7 @@ class ComputerUseTest {
         assertEquals(listOf(ms[0]), state["done_milestones"]!!.jsonArray.map { it.jsonPrimitive.content })
         val q = Cu.decideArgs("m", "Order", "u", "t", emptyList(), "/x.jpg", milestones = ms, doneMilestones = 1)["questions"]!!.jsonObject["operation"]!!.jsonObject["instructions"]!!.jsonPrimitive.content
         assertTrue(q.contains("Current milestone (2 of 3): Tres Leches is in the cart"))
-        assertTrue(q.contains("pick DONE as soon as the screenshot shows it is reached"))
+        assertTrue(q.contains("answer the milestone question from the screenshot") && q.contains("Pick DONE only when the whole goal is visibly done"))
         // No milestones: no such fields.
         val plain = Cu.decideArgs("m", "g", "u", "t", emptyList(), "/x.jpg")["state"]!!.jsonObject
         assertNull(plain["milestone"]); assertNull(plain["done_milestones"])
@@ -2280,22 +2280,29 @@ class ComputerUseTest {
     private val milestonePlan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"Order Tres Leches from Magnolia Bakery","milestones":["Magnolia Bakery's page is open","Tres Leches is in the cart","the login or checkout step is shown"],"type_values":[]}"""
 
     @Test
-    fun `DONE moves to the next milestone, which needs an action of this run, and only the last one ends the run`() = runTest {
-        val browser = FakeBrowser(tmp(), listOf("DONE", "CLICK", "DONE", "CLICK", "DONE"))
+    fun `DONE after this run's own actions accepts the goal and passes the milestones left, and the first one is credited by navigation`() = runTest {
+        val browser = FakeBrowser(tmp(), listOf("DONE", "CLICK", "DONE"))
         val report = flow(browser, FakeTabs(), mutableListOf(), plan = milestonePlan).runComputerUse(UseRequest("order a cake", maxSteps = 10))
         assertEquals(UseStatus.DONE, report.status)
-        assertEquals(5, browser.jevCalls)
-        assertEquals(listOf(VisionOp.MILESTONE, VisionOp.CLICK, VisionOp.MILESTONE, VisionOp.CLICK), report.steps.map { it.op })
+        assertEquals(3, browser.jevCalls)
+        assertEquals(listOf(VisionOp.MILESTONE, VisionOp.CLICK, VisionOp.MILESTONE), report.steps.map { it.op })
         assertEquals("milestone 1 done: Magnolia Bakery's page is open", report.steps[0].note)
-        assertEquals("milestone 2 done: Tres Leches is in the cart", report.steps[2].note)
+        assertEquals("DONE accepted: milestones 2 to 3 done, the final state is reached by this run's actions", report.steps[2].note)
         // Jev saw each one in turn, with those done so far.
         val states = browser.jevArgs.map { it["state"]!!.jsonObject }
-        assertEquals(listOf("1 of 3: Magnolia Bakery's page is open", "2 of 3: Tres Leches is in the cart", "2 of 3: Tres Leches is in the cart", "3 of 3: the login or checkout step is shown", "3 of 3: the login or checkout step is shown"), states.map { it["milestone"]!!.jsonPrimitive.content })
-        assertEquals(listOf(0, 1, 1, 2, 2), states.map { it["done_milestones"]!!.jsonArray.size })
+        assertEquals(listOf("1 of 3: Magnolia Bakery's page is open", "2 of 3: Tres Leches is in the cart", "2 of 3: Tres Leches is in the cart"), states.map { it["milestone"]!!.jsonPrimitive.content })
+        assertEquals(listOf(0, 1, 1), states.map { it["done_milestones"]!!.jsonArray.size })
         assertEquals("milestone 1 done: Magnolia Bakery's page is open", states[1]["recent_actions"]!!.jsonArray.single().jsonObject["result"]!!.jsonPrimitive.content)
         // The report lists them, all reached.
         val ms = report.toJson()["milestones"]!!.jsonArray.map { it.jsonObject["text"]!!.jsonPrimitive.content to it.jsonObject["done"]!!.jsonPrimitive.content.toBoolean() }
         assertEquals(listOf("Magnolia Bakery's page is open" to true, "Tres Leches is in the cart" to true, "the login or checkout step is shown" to true), ms)
+        // The milestone's confidence is never the 0.04 of a noul that said no: a DONE credits at Jev's own confidence.
+        val low = FakeBrowser(tmp(), listOf("DONE", "CLICK", "SCROLL_DOWN")).also { it.milestoneScript = listOf(0.04, null, null) }
+        val lr = flow(low, FakeTabs(), mutableListOf(), plan = milestonePlan).runComputerUse(UseRequest("t", maxSteps = 4))
+        assertEquals(0.9, lr.steps.first { it.op == VisionOp.MILESTONE }.confidence)
+        // Nothing this run did changed the page: a DONE is not accepted (the cart was there before).
+        val leftover = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "DONE")).also { it.contentHash = { "same" } }
+        assertEquals(UseStatus.BLOCKED, flow(leftover, FakeTabs(), mutableListOf(), plan = milestonePlan).runComputerUse(UseRequest("t", maxSteps = 12)).status)
         // A run that stops early reports how far it got.
         val partial = flow(FakeBrowser(tmp(), listOf("DONE", "BLOCKED")), FakeTabs(), mutableListOf(), plan = milestonePlan).runComputerUse(UseRequest("t", maxSteps = 10))
         assertEquals(listOf(true, false, false), partial.toJson()["milestones"]!!.jsonArray.map { it.jsonObject["done"]!!.jsonPrimitive.content.toBoolean() })
@@ -2406,10 +2413,10 @@ class ComputerUseTest {
 
     @Test
     fun `every look asks whether the current milestone is true, at 0_7 it is reached and the next one is asked next`() = runTest {
-        val browser = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "SCROLL_DOWN", "CLICK", "SCROLL_DOWN", "DONE", "CLICK", "DONE", "DONE")).also {
+        val browser = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "SCROLL_DOWN", "CLICK", "SCROLL_DOWN", "DONE")).also {
             // call 1: not yet; call 2: reached (0.8), and the scroll is acted on; call 3: a click, not yet (0.4) for the next one; call 4: 0.69 is not enough;
             // call 5: DONE (the click since the last milestone makes it creditable); call 6: a click; call 7: DONE for the cart; call 8: DONE ends the run.
-            it.milestoneScript = listOf(0.3, 0.8, 0.4, 0.69, null, null, null, null)
+            it.milestoneScript = listOf(0.3, 0.8, 0.4, 0.69, null)
         }
         val report = flow(browser, FakeTabs(), mutableListOf(), plan = orderPlan).runComputerUse(UseRequest("order a cake", maxSteps = 12))
         assertEquals(UseStatus.DONE, report.status, report.error)
@@ -2422,10 +2429,10 @@ class ComputerUseTest {
         assertEquals(setOf("true", "false"), browser.jevArgs[0]["questions"]!!.jsonObject["milestone"]!!.jsonObject["criteria"]!!.jsonObject.keys)
         val notes = report.steps.filter { it.op == VisionOp.MILESTONE }.map { it.note }
         // The first by Jev's own answer, the next two by DONE, which stays an alternative way to advance; the stop_when ends the run (it is no milestone).
-        assertEquals(listOf("milestone 1 done: A Magnolia Bakery Zomato order page is open", "milestone 2 done: Tres Leches is visible on the menu", "milestone 3 done: Tres Leches is in the cart"), notes)
+        assertEquals(listOf("milestone 1 done: A Magnolia Bakery Zomato order page is open", "DONE accepted: milestones 2 to 3 done, the final state is reached by this run's actions"), notes)
         // The milestone's own decision was acted on: the scroll that came with the 0.8 answer happened.
         assertEquals(listOf(VisionOp.SCROLL_DOWN, VisionOp.SCROLL_DOWN), report.steps.filter { it.op == VisionOp.SCROLL_DOWN }.map { it.op }.take(2))
-        assertEquals(8, browser.jevCalls)
+        assertEquals(5, browser.jevCalls)
         // No call of its own: the same number of calls as without it (one per look).
         assertEquals(browser.jevCalls, browser.jevArgs.size)
         // The question is asked of nothing when there are no milestones.
@@ -2639,6 +2646,8 @@ class ComputerUseTest {
 
     // ---- done is never said over a login ----
 
+    private fun we(label: String, role: String = "button", editable: Boolean = false, covered: Boolean = false, sensitive: Boolean = false) = Cu.WallElement(label, role, editable, sensitive, covered)
+
     private val stopPlan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"Order a cake","milestones":["Tres Leches is in the cart","Stop at the login or payment step"],"type_values":[]}"""
 
     @Test
@@ -2659,10 +2668,10 @@ class ComputerUseTest {
         val q2 = flow(otp, FakeTabs(), mutableListOf(), plan = stopPlan).runComputerUse(UseRequest("order", maxSteps = 8)).blocker!!.question!!
         assertTrue(q2.contains("is asking you to log in."), q2)
         assertFalse(q2.contains("verification code"))
-        assertEquals("log in", Cu.wallKind("Login", "Phone number\nSend One Time Password"))
-        assertEquals("log in", Cu.wallKind("Sign in to continue", "Enter OTP"))
-        assertEquals("enter a verification code", Cu.wallKind("Verify", "Enter the verification code"))
-        assertEquals("enter payment details", Cu.wallKind("Payment", "Card number\nCVV"))
+        assertEquals("log in", Cu.wallKind("Login", listOf(we("Phone number", "textbox", editable = true), we("Send One Time Password")), null))
+        assertEquals("log in", Cu.wallKind("Sign in to continue", listOf(we("Enter OTP", "textbox", editable = true)), null))
+        assertEquals("enter a verification code", Cu.wallKind("Verify", listOf(we("Enter the verification code", "textbox", editable = true)), null))
+        assertEquals("enter payment details", Cu.wallKind("Payment", listOf(we("Card number", "textbox", editable = true), we("CVV", "textbox", editable = true)), null))
         // No dialog, no wall: the stop milestone is simply reached.
         val calm = FakeBrowser(tmp(), listOf("CLICK", "CLICK", "DONE")).also { it.milestoneScript = listOf(null, 0.9, null); it.pageTextFn = { "Your Order (1)" } }
         assertEquals(UseStatus.DONE, flow(calm, FakeTabs(), mutableListOf(), plan = stopPlan).runComputerUse(UseRequest("order", maxSteps = 8)).status)
@@ -2676,14 +2685,15 @@ class ComputerUseTest {
         assertEquals(UseStatus.NEEDS_INPUT, r.status)
         assertTrue(r.blocker!!.question!!.contains("is asking you to log in"))
         // A payment dialog.
-        val pay = FakeBrowser(tmp(), listOf("DONE")).also { it.shotModalLabel = "Pay"; it.pageTextFn = { "Card number\nCVV" } }
+        val pay = FakeBrowser(tmp(), listOf("DONE")).also { it.shotModalLabel = "Pay"; it.pageTextFn = { "Card number\nCVV" }; it.elements = """[{"id":"e1","role":"textbox","tag":"input","label":"Card number","options":null,"sensitive":false,"in_viewport":true,"selector":{"type":"css","value":"#cc"}},{"id":"e2","role":"textbox","tag":"input","label":"CVV","options":null,"sensitive":true,"in_viewport":true,"selector":{"type":"css","value":"#cvv"}}]""" }
         assertTrue(flow(pay, FakeTabs(), mutableListOf()).runComputerUse(UseRequest("t")).blocker!!.question!!.contains("enter payment details"))
         // Through an ordinary last milestone too (not only a stop one).
         val ordinary = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"g","milestones":["Page open","Item in the cart"],"type_values":[]}"""
         val m = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "CLICK", "SCROLL_DOWN")).also { it.milestoneScript = listOf(0.9, null, 0.9); it.shotModalLabel = "Sign in"; it.pageTextFn = { "Sign in\nEmail" } }
         assertEquals(UseStatus.NEEDS_INPUT, flow(m, FakeTabs(), mutableListOf(), plan = ordinary).runComputerUse(UseRequest("t", maxSteps = 8)).status)
         // A dialog that is not a wall (a cookie notice) does not stop a done.
-        val cookie = FakeBrowser(tmp(), listOf("DONE")).also { it.shotModalLabel = "Cookie settings"; it.pageTextFn = { "We use cookies" } }
+        val cookie = FakeBrowser(tmp(), listOf("DONE")).also { it.shotModalLabel = "Cookie settings"; it.pageTextFn = { "We use cookies" }
+            it.elements = """[{"id":"e1","role":"button","tag":"button","label":"Accept all","in_viewport":true,"selector":{"type":"css","value":"#a"}}]""" }
         assertEquals(UseStatus.DONE, flow(cookie, FakeTabs(), mutableListOf()).runComputerUse(UseRequest("t")).status)
         // No dialog: done, as before.
         assertEquals(UseStatus.DONE, flow(FakeBrowser(tmp(), listOf("DONE")), FakeTabs(), mutableListOf()).runComputerUse(UseRequest("t")).status)
@@ -3801,8 +3811,9 @@ class ComputerUseTest {
             return b to flow(b, FakeTabs(), mutableListOf(), plan = "{}").runComputerUse(UseRequest("t", url = "https://sample.com/", planWithLlm = false, pagePlans = true, maxSteps = 6))
         }
         val (strong, rs) = run(0.85)
-        assertEquals("m2", strong.stepArgs("click_at").single()["action"]!!.jsonObject["element"]!!.jsonPrimitive.content)
-        assertTrue(rs.steps.first { it.op == VisionOp.CLICK }.note!!.contains("navigator suggested button 'ADD'") && rs.steps.first { it.op == VisionOp.CLICK }.note!!.contains("followed Jev"))
+        // The navigator has the authority: Jev's 85%-sure pick of another element is noted, not followed.
+        assertEquals("m1", strong.stepArgs("click_at").single()["action"]!!.jsonObject["element"]!!.jsonPrimitive.content)
+        assertTrue(rs.steps.first { it.op == VisionOp.CLICK }.note!!.contains("followed the navigator's button 'ADD'; Jev preferred button 'ADD' (85% sure)"), rs.steps.first { it.op == VisionOp.CLICK }.note)
         val (weak, rw) = run(0.4)
         assertEquals("m1", weak.stepArgs("click_at").single()["action"]!!.jsonObject["element"]!!.jsonPrimitive.content)
         assertTrue(rw.steps.first { it.op == VisionOp.CLICK }.note!!.contains("followed the navigator's"))
@@ -3853,5 +3864,51 @@ class ComputerUseTest {
         val d = BrowserUseArgs.parse("""{"task":"t"}""").getOrThrow()
         assertNull(d.navigatorModel); assertTrue(d.pagePlan)
         assertTrue(LlmrpaMcpToolProvider.BROWSER_USE_SCHEMA.contains("\"navigator_model\"") && LlmrpaMcpToolProvider.BROWSER_USE_SCHEMA.contains("\"page_plan\""))
+    }
+
+    private val customizeModal = """[
+        {"id":"m1","role":"link","tag":"a","label":"Log in","rect":{"x":1000,"y":10,"w":60,"h":20},"disabled":false,"covered":true,"context":"","editable":false},
+        {"id":"m2","role":"radio","tag":"input","label":"COLD BEVERAGES","rect":{"x":300,"y":300,"w":200,"h":24},"disabled":false,"covered":false,"context":"Choose From","editable":false},
+        {"id":"m3","role":"button","tag":"button","label":"Add to order - ₹450","rect":{"x":300,"y":600,"w":300,"h":40},"disabled":false,"covered":false,"context":"","editable":false}]"""
+    private val loginModalElements = """[
+        {"id":"m1","role":"link","tag":"a","label":"Log in","rect":{"x":1000,"y":10,"w":60,"h":20},"disabled":false,"covered":true,"context":"","editable":false},
+        {"id":"m2","role":"textbox","tag":"input","label":"Phone number","rect":{"x":300,"y":300,"w":300,"h":40},"disabled":false,"covered":false,"context":"","editable":true},
+        {"id":"m3","role":"button","tag":"button","label":"Send One Time Password","rect":{"x":300,"y":400,"w":300,"h":40},"disabled":false,"covered":false,"context":"","editable":false}]"""
+
+    @Test
+    fun `a customization modal with a Log in link in the header is a normal page, a real login modal is a wall`() = runTest {
+        val plan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"Add Classic Tres Leches","milestones":["The item is chosen"],"stop_when":"login or payment step","type_values":[]}"""
+        // The live case (run 4364): the modal is "Classic Tres Leches", the page behind it has a Log in link, and the page's text says Log in.
+        val custom = looking(listOf("CLICK", "DONE")) {
+            lookElements = customizeModal; shotModalLabel = "Classic Tres Leches"; clickPick = "m3"; boxJson = """{"top":0.76,"bottom":0.78,"left":0.3,"right":0.5}"""
+            pageTextFn = { "Log in\nSign up\nClassic Tres Leches\nChoose From COLD BEVERAGES\nAdd to order - ₹450" }
+        }
+        val r = flow(custom, FakeTabs(), mutableListOf(), plan = plan).runComputerUse(UseRequest("t", maxSteps = 6))
+        assertEquals(UseStatus.DONE, r.status, r.blocker?.question ?: r.error)
+        // Jev acted on the modal: it clicked the button inside it.
+        assertEquals("m3", custom.stepArgs("click_at").single()["action"]!!.jsonObject["element"]!!.jsonPrimitive.content)
+        // Without a stop_when, and in the fallback (no look): the same, by the dialog's own elements.
+        val plain = FakeBrowser(tmp(), listOf("DONE")).also { it.shotModalLabel = "Classic Tres Leches"; it.pageTextFn = { "Log in\nSign up\nClassic Tres Leches" }
+            it.elements = """[{"id":"e1","role":"link","tag":"a","label":"Log in","in_viewport":true,"covered":true,"selector":{"type":"css","value":"#l"}},{"id":"e2","role":"button","tag":"button","label":"Add to order - ₹450","in_viewport":true,"selector":{"type":"css","value":"#a"}}]""" }
+        assertEquals(UseStatus.DONE, flow(plain, FakeTabs(), mutableListOf()).runComputerUse(UseRequest("t")).status)
+        // A real login modal: a phone field and an OTP button inside it.
+        val login = looking(listOf("CLICK", "DONE")) { lookElements = loginModalElements; shotModalLabel = "Login"; pageTextFn = { "Login\nPhone number\nSend One Time Password" } }
+        val lr = flow(login, FakeTabs(), mutableListOf(), plan = plan).runComputerUse(UseRequest("t", maxSteps = 6))
+        assertEquals(UseStatus.NEEDS_INPUT, lr.status)
+        assertTrue(lr.blocker!!.question!!.contains("is asking you to log in"))
+        assertEquals(0, login.jevCalls) // found before any decision
+        // The rule: only the dialog's own content counts.
+        fun e(label: String, role: String = "button", editable: Boolean = false, covered: Boolean = false) = Cu.WallElement(label, role, editable, false, covered)
+        assertNull(Cu.wallKind("Classic Tres Leches", listOf(e("Log in", "link", covered = true), e("Add to order - ₹450")), "Log in\nSign in"))
+        assertNull(Cu.wallKind("Classic Tres Leches", listOf(e("Log in", "link"), e("Add to order")), null)) // even an uncovered link is no evidence
+        assertNull(Cu.wallKind("Login", emptyList(), "Login")) // named so, but nothing to log in with in it
+        assertNull(Cu.wallKind("Cookie settings", listOf(e("Accept all")), "We use cookies"))
+        assertEquals("log in", Cu.wallKind("Sign up", listOf(e("Continue with Google")), null))
+        assertEquals("log in", Cu.wallKind("Welcome", listOf(e("Email", "textbox", editable = true), e("Sign in")), null))
+        // With no dialog, page text counts only for a code or card, and only on a page that is a form for it.
+        assertNull(Cu.wallKind(null, listOf(e("Log in", "link")), "Log in\nCard number"))
+        assertNull(Cu.wallKind(null, listOf(e("Search", "textbox", editable = true)), "Enter the verification code"))
+        assertEquals("enter a verification code", Cu.wallKind(null, listOf(e("Enter OTP", "textbox", editable = true)), "We sent a verification code to your phone"))
+        assertEquals("enter payment details", Cu.wallKind(null, listOf(e("Card number", "textbox", editable = true)), "Pay now\nCard number"))
     }
 }

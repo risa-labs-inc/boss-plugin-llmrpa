@@ -169,19 +169,49 @@ internal object Cu {
     private val LOGIN_HEADING = Regex("(?i)\\b(log ?in|sign ?in)\\b")
     private val LOGIN_WORDS = Regex("(?i)log ?in|sign ?in|password|continue with (email|google|phone|apple)")
 
+    /** One element as the wall check reads it: its label, and whether it is a field, a private field, a link, or hidden behind the open dialog. */
+    data class WallElement(val label: String, val role: String, val editable: Boolean, val sensitive: Boolean, val covered: Boolean)
+
+    fun wallElement(m: Mark) = WallElement(m.label, m.role, m.editable || m.role.equals("textbox", true), Regex(SENSITIVE_LABEL).containsMatchIn(m.label), m.covered)
+
+    fun wallElement(e: PageElement) = WallElement(
+        e.label.orEmpty(), e.role,
+        e.role.lowercase() in setOf("textbox", "searchbox", "combobox") || (e.tag.lowercase() in setOf("input", "textarea") && e.type?.lowercase() !in setOf("checkbox", "radio", "button", "submit")),
+        e.sensitive || e.type.equals("password", true), e.covered,
+    )
+
+    private val OTP_BUTTON = Regex("(?i)(send|resend|get|request)\\s+(one[- ]time\\s+password|otp|(a |the )?(verification )?code)|\\botp\\b")
+    private val SOCIAL_LOGIN = Regex("(?i)continue with (email|google|phone|apple|facebook)")
+    private val FORM_FIELD = Regex("(?i)otp|one[- ]time|verification|card number|\\bcvv\\b|\\bcvc\\b|security code|card no")
+
     /**
-     * What the page is asking of the person, or null: a code or payment details anywhere on it, or a login when a dialog or overlay is open
-     * over the page and names one (a login link in a page's menu is not a wall). [modal] is the label of the open dialog, [text] the page text.
+     * What the page is asking of the person, or null. An open dialog is judged by its own content only: its [modal] label and the labels of the
+     * elements inside it (the open ones; what it covers, such as a "Log in" link in the page's header, is not its content, and links are no evidence).
+     * A login is a dialog named Log in, Sign in or Sign up that has a phone, email or password field, an OTP button or a "continue with" button in it;
+     * a code or payment dialog likewise needs a field. With no dialog open, page text counts for a code or payment only when the page is clearly a form
+     * (a field for a one-time code, a card number or a security code is on it). Anything else is an ordinary page state for Jev to act on.
      */
-    fun wallKind(modal: String?, text: String?): String? {
-        val all = modal.orEmpty() + "\n" + text.orEmpty().take(20_000)
-        // A dialog (or the page's heading) that says Login or Sign in is a login, whatever else it mentions: its one-time-password step is part of logging in.
-        val heading = modal.orEmpty() + "\n" + text.orEmpty().lines().take(3).joinToString("\n")
+    fun wallKind(modal: String?, elements: List<WallElement>, pageText: String?): String? {
+        val open = elements.filter { !it.covered }
+        val hasField = open.any { it.editable || it.sensitive }
+        if (modal != null) {
+            val own = modal + "\n" + open.filter { it.role != "link" }.joinToString("\n") { it.label }
+            val otp = open.any { it.role != "link" && OTP_BUTTON.containsMatchIn(it.label) }
+            val login = hasField || otp || open.any { SOCIAL_LOGIN.containsMatchIn(it.label) }
+            return when {
+                // A dialog named Log in is a login, whatever else it mentions: its one-time-password step is part of logging in.
+                LOGIN_HEADING.containsMatchIn(modal) && login -> "log in"
+                CODE_WORDS.containsMatchIn(own) && (hasField || otp) -> "enter a verification code"
+                PAYMENT_WORDS.containsMatchIn(own) && hasField -> "enter payment details"
+                LOGIN_WORDS.containsMatchIn(own) && login -> "log in"
+                else -> null
+            }
+        }
+        if (open.none { (it.editable || it.sensitive) && FORM_FIELD.containsMatchIn(it.label) }) return null
+        val all = pageText.orEmpty().take(20_000)
         return when {
-            modal != null && LOGIN_HEADING.containsMatchIn(heading) -> "log in"
             CODE_WORDS.containsMatchIn(all) -> "enter a verification code"
             PAYMENT_WORDS.containsMatchIn(all) -> "enter payment details"
-            modal != null && LOGIN_WORDS.containsMatchIn(all.take(6_000)) -> "log in"
             else -> null
         }
     }
@@ -302,7 +332,10 @@ internal object Cu {
         return first || sinceLast.any { performed(it) || (!it.failed && !it.refused && (it.op == VisionOp.SCROLL_DOWN || it.op == VisionOp.SCROLL_UP)) || (it.op == VisionOp.REPLAN && it.note?.startsWith("replanned") == true) }
     }
 
-    const val MILESTONE_RULES = "state.milestone is the step to work on now: pick DONE as soon as the screenshot shows it is reached (the run then moves on to the next one), not when the whole goal is."
+    const val MILESTONE_RULES = "state.milestone is the step to work on now: answer the milestone question from the screenshot (the run moves on by itself when it is reached). Pick DONE only when the whole goal is visibly done."
+
+    /** Whether this run's own actions changed the page: a click, typing or Enter that did something, not a scroll and not a refused click. */
+    fun ownProgress(steps: List<UseStep>): Boolean = steps.any { performed(it) && (it.contentChanged ?: it.changed ?: false) }
 
     private fun milestoneLine(milestones: List<String>, done: Int): String =
         milestones.getOrNull(done)?.let { "Current milestone (${done + 1} of ${milestones.size}): $it\n" } ?: ""

@@ -699,8 +699,10 @@ internal class ComputerUseFlow(
             }
 
             // The plan's stop_when: a login, code or payment the page puts up ends the run for the person, before another call is made.
-            if (plan.stopWhen != null && dlg == null && !hidden && Cu.wallKind(shot.modal, look?.pageText) != null) {
-                userWall(tools, tab, url, title, explicit = false, shotModal = shot.modal)?.let { return it }
+            if (plan.stopWhen != null && dlg == null && !hidden) {
+                // Judged by the open dialog's own content (the look's elements), never by the page's text around it; without a look, any open dialog is read.
+                val quick = if (look != null) Cu.wallKind(shot.modal, look.marks.map(Cu::wallElement), look.pageText) else if (shot.modal != null) "check" else null
+                if (quick != null) userWall(tools, tab, url, title, explicit = false, shotModal = shot.modal, marks = look?.marks)?.let { return it }
             }
 
             // Stuck before asking Jev again: the page is where it was.
@@ -777,7 +779,18 @@ internal class ComputerUseFlow(
             if (d != null && d.op != VisionOp.NEEDS_INPUT && ((d.milestoneP ?: 0.0) >= Cu.MILESTONE_NOUL || (d.op == VisionOp.DONE && stuck == null))) {
                 val reached = plan.milestones.getOrNull(run.doneMilestones.size)
                 // Done is never said over an open login or payment dialog: that is the person's to deal with.
-                if (reached == null) return (if (shot.modal != null) userWall(tools, tab, url, title, explicit = false, shotModal = shot.modal) else null) ?: Outcome(UseStatus.DONE)
+                if (reached == null) return (if (shot.modal != null) userWall(tools, tab, url, title, explicit = false, shotModal = shot.modal, marks = look?.marks) else null) ?: Outcome(UseStatus.DONE)
+                // DONE after this run's own actions changed the page: the goal's final state is reached, so the milestones not yet credited (a transient
+                // one, a dialog that has closed again) are passed, not waited for.
+                if (d.op == VisionOp.DONE && stuck == null && Cu.ownProgress(steps)) {
+                    val from = run.doneMilestones.size + 1
+                    plan.milestones.drop(run.doneMilestones.size).forEach { run.doneMilestones += it }
+                    run.milestonesDone.value = run.doneMilestones.size
+                    steps += UseStep(steps.size + 1, VisionOp.MILESTONE, confidence = d.confidence, ms = (System.nanoTime() - t0) / 1_000_000, before = now, tabId = tab,
+                        note = "DONE accepted: ${if (from == plan.milestones.size) "milestone $from" else "milestones $from to ${plan.milestones.size}"} done, the final state is reached by this run's actions")
+                    publish()
+                    return (if (shot.modal != null) userWall(tools, tab, url, title, explicit = false, shotModal = shot.modal, marks = look?.marks) else null) ?: Outcome(UseStatus.DONE)
+                }
                 val sinceLast = steps.drop(steps.indexOfLast { it.op == VisionOp.MILESTONE } + 1)
                 if (Cu.mayCredit(reached, run.doneMilestones.isEmpty(), sinceLast)) {
                     val k = run.doneMilestones.size + 1
@@ -787,15 +800,15 @@ internal class ComputerUseFlow(
                     val last = k >= plan.milestones.size
                     if (last && plan.stopWhen == null) {
                         // A "stop at the login or payment step" milestone from a planner that wrote it there ends as the person's when the page does ask; else it is done.
-                        if (Cu.isStopMilestone(reached) || shot.modal != null) userWall(tools, tab, url, title, explicit = false, shotModal = shot.modal)?.let { return it }
+                        if (Cu.isStopMilestone(reached) || shot.modal != null) userWall(tools, tab, url, title, explicit = false, shotModal = shot.modal, marks = look?.marks)?.let { return it }
                         return Outcome(UseStatus.DONE)
                     }
-                    steps += UseStep(steps.size + 1, VisionOp.MILESTONE, confidence = d.milestoneP ?: d.confidence, ms = (System.nanoTime() - t0) / 1_000_000, before = now, tabId = tab,
+                    steps += UseStep(steps.size + 1, VisionOp.MILESTONE, confidence = d.milestoneP?.takeIf { it >= Cu.MILESTONE_NOUL } ?: d.confidence, ms = (System.nanoTime() - t0) / 1_000_000, before = now, tabId = tab,
                         note = "milestone $k done: $reached")
                     publish()
                     mark = steps.size
                     // With a stop_when the run goes on toward it after the last milestone; the page asking for a login or payment ends it.
-                    if (last && shot.modal != null) userWall(tools, tab, url, title, explicit = false, shotModal = shot.modal)?.let { return it }
+                    if (last && shot.modal != null) userWall(tools, tab, url, title, explicit = false, shotModal = shot.modal, marks = look?.marks)?.let { return it }
                     if (d.op == VisionOp.DONE) { prevHash = null; continue }
                 } else if (d.op == VisionOp.DONE) {
                     // DONE for a state that was already there, not reached by this run: not accepted. The page is read again after a nudge.
@@ -810,7 +823,7 @@ internal class ComputerUseFlow(
             }
             // The page asks for something only the person can give (a login, a code, payment): stop for them in either mode, before any consult.
             if (d != null && (d.op == VisionOp.NEEDS_INPUT || d.op == VisionOp.BLOCKED)) {
-                userWall(tools, tab, url, title, explicit = d.op == VisionOp.NEEDS_INPUT, shotModal = shot.modal)?.let { return it }
+                userWall(tools, tab, url, title, explicit = d.op == VisionOp.NEEDS_INPUT, shotModal = shot.modal, marks = look?.marks)?.let { return it }
             }
             // A dead end (the page does not have what the next milestone needs): ask the planner for a better place to continue from.
             // Never undo progress: a page that is already the right site is not a dead end, and a menu that loads as it scrolls has not been scrolled yet.
@@ -892,7 +905,7 @@ internal class ComputerUseFlow(
             }
 
             val dec = checkNotNull(d)
-            if (dec.op == VisionOp.DONE) return (if (shot.modal != null) userWall(tools, tab, url, title, explicit = false, shotModal = shot.modal) else null) ?: Outcome(UseStatus.DONE)
+            if (dec.op == VisionOp.DONE) return (if (shot.modal != null) userWall(tools, tab, url, title, explicit = false, shotModal = shot.modal, marks = look?.marks) else null) ?: Outcome(UseStatus.DONE)
 
             // Unsure: ask the person when one is there; a headless run never waits for anyone.
             val ask = req.confirm
@@ -1319,11 +1332,14 @@ internal class ComputerUseFlow(
      * Whether the page is waiting on the person: Jev said so, or it is blocked while a login, a code or payment details are asked for (an open
      * dialog's label and the page text say which). Returns the stop, or null when it is an ordinary block.
      */
-    private suspend fun userWall(tools: RecordingTools, tab: String, url: String, title: String, explicit: Boolean, shotModal: String? = null): Outcome? {
-        // The dialog this screenshot shows is what is open now; observe is the fallback (and may predate it).
-        val modal = shotModal ?: runCatching { tools.invoke(ToolNames.OBSERVE, buildJsonObject { put("tab_id", tab) }).json?.let(PageSnapshot::parse)?.modal }.getOrNull()
-        val text = runCatching { readPageText(tools, tab) }.getOrNull()
-        val kind = Cu.wallKind(modal, text)
+    private suspend fun userWall(tools: RecordingTools, tab: String, url: String, title: String, explicit: Boolean, shotModal: String? = null, marks: List<Mark>? = null): Outcome? {
+        // The dialog this screenshot shows is what is open now, and the look's elements are what is in it; observe is the fallback (and may predate them).
+        val snap = if (shotModal == null || marks == null) runCatching { tools.invoke(ToolNames.OBSERVE, buildJsonObject { put("tab_id", tab) }).json?.let(PageSnapshot::parse) }.getOrNull() else null
+        val modal = shotModal ?: snap?.modal
+        val elements = marks?.map(Cu::wallElement) ?: snap?.elements.orEmpty().map(Cu::wallElement)
+        // With a dialog open only its own content counts; the page's text matters only for a form with no dialog.
+        val text = if (modal == null) runCatching { readPageText(tools, tab) }.getOrNull() else null
+        val kind = Cu.wallKind(modal, elements, text)
         if (kind == null && !explicit) return null
         val what = kind ?: "provide something only you can"
         val site = host(url).ifBlank { title }

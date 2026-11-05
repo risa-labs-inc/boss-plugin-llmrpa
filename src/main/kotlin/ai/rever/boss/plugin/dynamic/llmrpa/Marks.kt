@@ -246,15 +246,17 @@ internal object Marks {
     }
 
     /**
-     * The navigator planned [step] for this page (an element, by mark id): Jev's own pick stands when it is sure of a different one (click_target 0.7+),
-     * noted; when Jev is not sure, the navigator's element is used. Only for the same operation, and never onto a covered or disabled element.
+     * The navigator planned [step] for this page (an element, by mark id): it is followed unless the element is missing, disabled or covered (Jev grounds the
+     * step and verifies the page; it does not overrule the plan). When Jev was sure of another element (click_target 0.7+) the note says so. Only for the same
+     * operation.
      */
     fun followNavigator(d: VisionDecision, step: Cu.PageStep?, marks: List<Mark>): Pair<VisionDecision, String?> {
         if (step?.element == null || step.op != d.op || (d.op != VisionOp.CLICK && d.op != VisionOp.TYPE_TEXT)) return d to null
         val nav = marks.firstOrNull { it.id == step.element && !it.covered && !it.disabled } ?: return d to null
         if (d.mark?.id == nav.id) return d to null
-        if ((d.markP ?: 0.0) >= 0.7) return d to "navigator suggested ${nav.short}; Jev chose ${d.mark?.short ?: "its box"} (${(100 * (d.markP ?: 0.0)).toInt()}% sure), followed Jev"
-        return d.copy(mark = nav, boxDisagreed = false) to "followed the navigator's ${nav.short} (Jev was not sure)"
+        val note = if ((d.markP ?: 0.0) >= 0.7) "followed the navigator's ${nav.short}; Jev preferred ${d.mark?.short ?: "its box"} (${(100 * (d.markP ?: 0.0)).toInt()}% sure)"
+        else "followed the navigator's ${nav.short}"
+        return d.copy(mark = nav, boxDisagreed = false) to note
     }
 
     private val REFUSAL = Regex("""(?i)\bis (disabled|covered by\b.*)""")
