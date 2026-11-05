@@ -514,6 +514,8 @@ internal class ComputerUseFlow(
         var consults = 0
         var prevHash: String? = null
         var prevContent: String? = null
+        // The page's text as of the last time it was read, to tell what an action changed.
+        var lastText: String? = null
         var failures = 0
         run.advice += req.advice
         while (true) {
@@ -558,7 +560,14 @@ internal class ComputerUseFlow(
 
             // A browser dialog is open over the page: the next decision is its answer. The page cannot be read while it waits.
             val dlg = tools.dialogFor(tab)
-            val (url, title) = if (dlg != null) (run.pageUrl.value.orEmpty() to "") else observe(tools, tab)
+            // The screenshot result carries the address and title (observe fails on popup windows): observe only when it does not.
+            val (url, title) = when {
+                dlg != null -> run.pageUrl.value.orEmpty() to ""
+                fresh?.url != null -> fresh.url to fresh.title.orEmpty()
+                else -> observe(tools, tab)
+            }
+            // The dialog drawn on the last screenshot: what Jev and a consulted model get to look at.
+            val shotView = if (dlg != null && shot.path.isNotEmpty()) renderDialogShot(run, shot, dlg) else shot
             if (dlg == null) {
                 run.pageUrl.value = url
                 if (run.visited.lastOrNull()?.url != url) run.visited += PageVisit(url, title, steps.size)
@@ -568,9 +577,12 @@ internal class ComputerUseFlow(
             // The content changed after an action (a scroll that loaded more, a click that opened a panel): save what is on the page, so the
             // collected text covers everything the run passed, even when Jev never picks COLLECT.
             if (dlg == null && fresh != null && shot.contentHash != null) {
-                if (steps.isNotEmpty() && prevContent != null && shot.contentHash != prevContent && run.contentSeen.add("${pageKey(url)}|${shot.contentHash}")) {
+                if (steps.isNotEmpty() && prevContent != null && shot.contentHash != prevContent) {
                     val text = runCatching { readPageText(tools, tab) }.getOrNull().orEmpty()
-                    if (run.store.add(CollectedItem(steps.size, url, title, text, shot.path, auto = true))) run.collected.value = run.store.list
+                    // What the last step did to the page, in a line Jev can remember it by.
+                    Cu.changeSummary(lastText, text)?.let { r -> steps[steps.lastIndex] = steps.last().let { it.copy(result = it.result ?: r) }; publish() }
+                    if (text.isNotBlank()) lastText = text
+                    if (run.contentSeen.add("${pageKey(url)}|${shot.contentHash}") && run.store.add(CollectedItem(steps.size, url, title, text, shot.path, auto = true))) run.collected.value = run.store.list
                 }
                 prevContent = shot.contentHash
             }
@@ -584,11 +596,12 @@ internal class ComputerUseFlow(
             if (stuck == null) {
                 t0 = System.nanoTime()
                 if (dlg != null) {
-                    dd = dialogDecision(req, tools, plan, dlg, shot, url, title, steps, run).getOrElse { return Outcome(UseStatus.ERROR, "Jev could not decide: ${it.message}") }
-                    if (dd.viaJev && dd.confidence < req.consultBelow) stuck = "Jev is only ${TaskRunner.pct(dd.confidence)} sure how to answer the ${dlg.type} dialog"
+                    dd = dialogDecision(req, tools, plan, dlg, shotView, url, title, steps, run).getOrElse { return Outcome(UseStatus.ERROR, "Jev could not decide: ${it.message}") }
+                    // Unsure by its probability, or by the confidence the answer itself reports (a split 0.4 / 0.6 with confidence 0.2 is a guess).
+                    if (dd.viaJev && (dd.confidence < req.consultBelow || (dd.choiceConfidence ?: 1.0) < Cu.DIALOG_MIN_CONFIDENCE)) stuck = "Jev is only ${TaskRunner.pct(minOf(dd.confidence, dd.choiceConfidence ?: 1.0))} sure how to answer the ${dlg.type} dialog"
                 } else {
-                    targets = locateTargets(tools, st, tab, plan.goal, url, shot, h)
-                    val reply = tools.invoke(ToolNames.JEV_DECIDE, Cu.decideArgs(req.jevModel, plan.goal, url, title, steps.map(Cu::recentAction), shot.path, run.advice.toList(), shot.position, targets, run.store.info(), req.pointerLabel))
+                    targets = Cu.pruneTargets(locateTargets(tools, st, tab, plan.goal, url, shot, h, steps), steps, isPopupId(tab))
+                    val reply = tools.invoke(ToolNames.JEV_DECIDE, Cu.decideArgs(req.jevModel, plan.goal, url, title, Cu.recentActions(steps), shot.path, run.advice.toList(), shot.position, targets, run.store.info(), req.pointerLabel))
                     if (reply.isError) return Outcome(UseStatus.ERROR, "Jev could not decide: ${reply.errorMessage}")
                     d = runCatching { Cu.parseDecision(reply.json ?: error("Jev returned no JSON")) }
                         .getOrElse { return Outcome(UseStatus.ERROR, "Jev could not decide: ${it.message}") }
@@ -602,7 +615,7 @@ internal class ComputerUseFlow(
             if (stuck != null) {
                 if (req.onStuck == OnStuck.CONSULT && consults < req.maxConsults) {
                     consults++
-                    when (val r = consult(req, run, tools, llm, tab, plan, shot, url, title, steps, stuck)) {
+                    when (val r = consult(req, run, tools, llm, tab, plan, shotView, url, title, steps, stuck)) {
                         is ConsultResult.Stepped -> {
                             steps += r.step.copy(index = steps.size + 1, before = now, tabId = tab)
                             publish()
@@ -643,6 +656,9 @@ internal class ComputerUseFlow(
             // The page about to be left, saved once per address.
             if (dec.op == VisionOp.CLICK || dec.op == VisionOp.TYPE_TEXT || dec.op == VisionOp.PRESS_ENTER) {
                 snapshot(tools, run, tab, url, title, steps.size + 1, shot.path, auto = true)
+            }
+            if (lastText == null && shot.contentHash != null && (dec.op == VisionOp.CLICK || dec.op == VisionOp.TYPE_TEXT || dec.op == VisionOp.PRESS_ENTER)) {
+                lastText = runCatching { readPageText(tools, tab) }.getOrNull()
             }
             val tabBefore = runCatching { tabs.snapshot() }.getOrDefault(emptyMap()).also { if (it.isNotEmpty()) st.known = it }
             val actedOn = tab
@@ -735,16 +751,43 @@ internal class ComputerUseFlow(
 
     // ---- browser dialogs ----
 
-    private data class DialogDecision(val ok: Boolean, val confidence: Double, val viaJev: Boolean)
+    private data class DialogDecision(
+        val ok: Boolean, val confidence: Double, val viaJev: Boolean,
+        /** The text Jev chose to enter in a prompt, or that it wants the writing model to write it. */
+        val text: String? = null, val wantsLlm: Boolean = false,
+        /** The confidence the answer itself reported, apart from its probability. */
+        val choiceConfidence: Double? = null,
+    )
+
+    /** Draws the pending dialog on the last screenshot so Jev can see it; the file is noted in the activity. Falls back to the plain screenshot. */
+    private fun renderDialogShot(run: UseRun, shot: Shot, dlg: Cu.DialogInfo): Shot {
+        val path = DialogImage.render(shot.path, dlg, shot.width, shot.height)
+        run.log.add(ActivityEntry(n = 0, atMs = clock(), kind = ActivityKind.TOOL, name = "render dialog", args = "${dlg.type} '${dlg.message.replace(Regex("\\s+"), " ").take(40)}' over ${shot.path.substringAfterLast('/')}",
+            result = path ?: "could not draw the dialog; the plain screenshot is used", durationMs = 0, failed = path == null, image = path))
+        return if (path != null) shot.copy(path = path) else shot
+    }
 
     /** alert: OK. beforeunload: OK unless the goal says to stay. confirm and prompt: Jev chooses OK or CANCEL from the screenshot. */
     private suspend fun dialogDecision(req: UseRequest, tools: RecordingTools, plan: UsePlan, dlg: Cu.DialogInfo, shot: Shot, url: String, title: String, steps: List<UseStep>, run: UseRun): Result<DialogDecision> {
         if (dlg.type == "alert" || (dlg.type == "beforeunload" && !Cu.goalSaysStay(plan.goal))) return Result.success(DialogDecision(true, 1.0, false))
         // Nothing to show Jev (the dialog came before any screenshot): the safe answer.
         if (shot.path.isEmpty()) return Result.success(DialogDecision(false, 1.0, false))
-        val reply = tools.invoke(ToolNames.JEV_DECIDE, Cu.dialogArgs(req.jevModel, plan.goal, url, title, steps.map(Cu::recentAction), shot.path, dlg, run.advice.toList(), req.pointerLabel))
+        // A prompt is answered with a concrete text: each candidate (inputs, quoted values, the goal's clause and phrases) is an option, and the writing model too.
+        var texts = emptyList<String>()
+        var askLlm = false
+        if (dlg.type == "prompt") {
+            val sensitive = Cu.sensitiveField(Focused("prompt", true, dlg.message.take(80), null, null))
+            texts = Cu.textOptions(plan.goal, plan.typeValues, url, sensitive, req.inputs).take(8)
+            askLlm = req.llmTyping && !sensitive
+            if (sensitive) tools.secrets.addAll(texts)
+        }
+        val reply = tools.invoke(ToolNames.JEV_DECIDE, Cu.dialogArgs(req.jevModel, plan.goal, url, title, Cu.recentActions(steps), shot.path, dlg, run.advice.toList(), req.pointerLabel, texts, askLlm))
         if (reply.isError) return Result.failure(IllegalStateException(reply.errorMessage))
-        return runCatching { Cu.parseDialogChoice(reply.json ?: error("Jev returned no JSON")).let { DialogDecision(it.first, it.second, true) } }
+        return runCatching {
+            Cu.parseDialogChoice(reply.json ?: error("Jev returned no JSON"), texts.size).let { c ->
+                DialogDecision(c.ok, c.probability, true, text = c.textIndex?.let { texts[it] }, wantsLlm = c.askLlm, choiceConfidence = c.confidence)
+            }
+        }
     }
 
     /** Answers the pending dialog through `dialog_answer`; a prompt's text comes from the usual choice (inputs, goal words, the writing model). */
@@ -763,7 +806,10 @@ internal class ComputerUseFlow(
             val sensitive = Cu.sensitiveField(field)
             val options = Cu.textOptions(plan.goal, plan.typeValues, url, sensitive, req.inputs)
             val mayAsk = req.llmTyping && !sensitive
-            val picked = if (options.isEmpty() && !mayAsk) null else pickText(tools, llm, req, plan, field, options, url, title, history, mayAsk)
+            // Jev already picked the text in the dialog question; else the usual choice.
+            val picked = dd.text?.let { it to false }
+                ?: (if (dd.wantsLlm) writeText(llm, req, plan, field, url, title, history, free = true)?.let { it to true } else null)
+                ?: (if (options.isEmpty() && !mayAsk) null else pickText(tools, llm, req, plan, field, options, url, title, history, mayAsk))
             if (picked == null) { value = "cancel"; shownAnswer = "CANCEL"; note = "no text for the prompt, so it was cancelled" }
             else {
                 if (sensitive) tools.secrets.add(picked.first)
@@ -777,7 +823,7 @@ internal class ComputerUseFlow(
         val failed = reply.isError || (reply.json?.get("ok") as? JsonPrimitive)?.booleanOrNull == false
         val err = if (reply.isError) (if (reply.errorCode == ToolNames.NO_BROWSER) NO_BROWSER_NOTE else reply.errorMessage) else (reply.json?.get("error") as? JsonPrimitive)?.contentOrNull
         return UseStep(0, VisionOp.DIALOG, confidence = dd.confidence, ms = 0, text = text, textSource = source, failed = failed,
-            note = if (failed) err else note, dialog = "Dialog '$shownMsg': $shownAnswer")
+            note = if (failed) err else note, dialog = "Dialog '$shownMsg': $shownAnswer", dialogMessage = shownMsg, dialogAnswer = shownAnswer)
     }
 
     /**
@@ -785,10 +831,12 @@ internal class ComputerUseFlow(
      * Answers are cached by address, content hash (pixels when there is none) and scroll position, so a screen already asked about
      * costs nothing. An engine without `locate_text` is asked once and then left alone.
      */
-    private suspend fun locateTargets(tools: RecordingTools, st: FlowState, tab: String, goal: String, url: String, shot: Shot, pixelHash: String): List<Cu.Target> {
+    private suspend fun locateTargets(tools: RecordingTools, st: FlowState, tab: String, goal: String, url: String, shot: Shot, pixelHash: String, steps: List<UseStep>): List<Cu.Target> {
         if (!st.locateWorks) return emptyList()
         val out = mutableListOf<Cu.Target>()
         for (phrase in Cu.targetPhrases(goal, url)) {
+            // Already clicked, snapped to or typed: no need to look for it again.
+            if (Cu.actedOn(phrase, steps)) continue
             val key = "$url|${shot.contentHash ?: pixelHash}|${shot.scrollY?.toInt()}|$phrase"
             val found = st.located[key] ?: run {
                 val r = tools.invoke(ToolNames.STEP, Cu.step(tab, "locate_text", phrase))
@@ -936,7 +984,9 @@ internal class ComputerUseFlow(
             VisionOp.CLICK, VisionOp.TYPE_TEXT -> {
                 val (x, y) = Cu.clickPoint(d.box, shot.cssWidth, shot.cssHeight)
                     ?: return base("Jev gave no usable target box", failed = true)
-                val where = base().copy(x = x, y = y, xPct = Cu.percent(d.box!!.centreX), yPct = Cu.percent(d.box.centreY))
+                // Which of the goal's targets was under the click, so they are not reported as missing once acted on.
+                val under = targets.filter { it.located.inView && it.located.rect?.contains(x.toDouble(), y.toDouble()) == true }.map { it.text }
+                val where = base().copy(x = x, y = y, xPct = Cu.percent(d.box!!.centreX), yPct = Cu.percent(d.box.centreY), clickedTargets = under)
                 // The box goes along so a click that lands beside its target is moved onto it.
                 val click = tools.invoke(ToolNames.STEP, Cu.step(tab, "click_at", "$x,$y", pointer, Cu.snapBox(d.box, shot.cssWidth, shot.cssHeight)))
                 failure(click)?.let { return where.copy(note = it, failed = true) }
@@ -1039,7 +1089,10 @@ internal class ComputerUseFlow(
         var title: String? = null
         var pageText: String? = null
         if (tab != null && tools.dialogFor(tab) == null) {
-            runCatching { observe(tools, tab) }.getOrNull()?.let { (u, t) -> url = u.ifBlank { null }; title = t.ifBlank { null } }
+            // The last screenshot already told the address and title (a popup window cannot be observed); observe otherwise.
+            val seen = st.lastShotObj
+            if (seen?.url != null) { url = seen.url; title = seen.title?.ifBlank { null } }
+            else runCatching { observe(tools, tab) }.getOrNull()?.let { (u, t) -> url = u.ifBlank { null }; title = t.ifBlank { null } }
             pageText = runCatching { readPageText(tools, tab) }.getOrNull()
             // The page the run ended on is part of what it collected, unless it was saved already.
             url?.takeIf { pageKey(it) !in run.snapshotted && !pageText.isNullOrBlank() }?.let { u ->

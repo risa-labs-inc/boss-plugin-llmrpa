@@ -278,6 +278,12 @@ class ComputerUseTest {
         var locateReply: ((String) -> String)? = { locatedFor(it) }
         private fun locatedFor(@Suppress("UNUSED_PARAMETER") phrase: String) = """{"ok":true,"located":{"found":false,"count":0,"in_view":false}}"""
         var dialogPick = "OK"
+        /** Pick the dialog answer whose description contains this; else [dialogPick]. */
+        var dialogPickLabel: String? = null
+        var dialogConfidence: Double? = null
+        /** screenshot results carry url and title (RPA Engine 1.3.5+). */
+        var shotMeta = false
+        val observeFailsFor = mutableSetOf<String>()
         var dialogP = 0.9
         var dialogJevCalls = 0
         val urlByTab = mutableMapOf<String, String>()
@@ -310,7 +316,8 @@ class ComputerUseTest {
             val tabArg = a["tab_id"]?.jsonPrimitive?.content ?: "t1"
             val pageUrl = urlByTab[tabArg] ?: url
             return when (toolName) {
-                ToolNames.OBSERVE -> if (strictDialogs && dialog != null) { refused += "observe"; ToolReply("""{"ok":false,"error":"A browser dialog is waiting","dialog":$dialog}""", false) }
+                ToolNames.OBSERVE -> if (tabArg in observeFailsFor) ToolReply("""{"error":{"code":"NO_BROWSER","message":"observe does not work on popup windows"}}""", true)
+                    else if (strictDialogs && dialog != null) { refused += "observe"; ToolReply("""{"ok":false,"error":"A browser dialog is waiting","dialog":$dialog}""", false) }
                     else ToolReply("""{"tab_id":"$tabArg","url":"$pageUrl","title":"S","elements":$elements}""", false)
                 ToolNames.STEP -> {
                     val action = a["action"]!!.jsonObject
@@ -327,7 +334,7 @@ class ComputerUseTest {
                         "cu_end" -> ToolReply("""{"ok":true}""", false)
                         "screenshot" -> {
                             val f = File(dir, "shot-${if (frozen) 0 else shots++}.jpg").also { it.writeText("shot ${if (frozen) 0 else shots}") }
-                            ToolReply("""{"ok":true,"screenshot":{"path":"${f.absolutePath}","width":560,"height":390,"css_width":1120,"css_height":780,"dpr":2${if (reportScroll) ""","scroll":{"x":0,"y":$scrollY,"max_y":5000}""" else ""}${contentHash?.invoke()?.let { ""","content_hash":"$it"""" }.orEmpty()}}$dlg}""", false)
+                            ToolReply("""{"ok":true,"screenshot":{"path":"${f.absolutePath}","width":560,"height":390,"css_width":1120,"css_height":780,"dpr":2${if (shotMeta) ""","url":"$pageUrl","title":"Shot title"""" else ""}${if (reportScroll) ""","scroll":{"x":0,"y":$scrollY,"max_y":5000}""" else ""}${contentHash?.invoke()?.let { ""","content_hash":"$it"""" }.orEmpty()}}$dlg}""", false)
                         }
                         "focused" -> ToolReply("""{"ok":true,"focused":$focused}""", false)
                         "page_text" -> ToolReply("""{"ok":true,"text":"${pageTextFn?.invoke() ?: pageTexts[pageUrl] ?: if (pageUrl == "https://sample.com/") "Best: A, B, C" else "Text of $pageUrl"}"}""", false)
@@ -342,7 +349,10 @@ class ComputerUseTest {
                     if ("dialog" in q) {
                         dialogJevCalls++
                         jevArgs += a
-                        ToolReply("""{"response":{"answers":{"dialog":{"type":"choice","choice":"$dialogPick","probabilities":{"$dialogPick":$dialogP}}},"usage":{"cost":0.002}}}""", false)
+                        val criteria = q["dialog"]!!.jsonObject["criteria"]!!.jsonObject.mapValues { it.value.jsonPrimitive.content }
+                        val key = dialogPickLabel?.let { l -> criteria.entries.first { it.value.contains(l) }.key } ?: dialogPick
+                        val conf = dialogConfidence?.let { ""","confidence":$it""" }.orEmpty()
+                        ToolReply("""{"response":{"answers":{"dialog":{"type":"choice","choice":"$key","probabilities":{"$key":$dialogP}$conf}},"usage":{"cost":0.002}}}""", false)
                     } else if ("text" in q) {
                         val criteria = q["text"]!!.jsonObject["criteria"]!!.jsonObject.mapValues { it.value.jsonPrimitive.content }
                         askLlmOffered += JevDecider.ASK_LLM in criteria
@@ -1126,8 +1136,14 @@ class ComputerUseTest {
         assertEquals("Dialog 'Delete this item?': OK", report.steps[1].description)
         // Jev judged it on the last screenshot, with the dialog in its state and a note that it sits on top of the page.
         val dialogArgs = browser.jevArgs.first { "dialog" in it["questions"]!!.jsonObject }
-        val firstShot = run.log.entries.value.first { it.image != null }.image!!
-        assertEquals(firstShot, dialogArgs["assets"]!!.jsonObject[Cu.SHOT_REF]!!.jsonObject["path"]!!.jsonPrimitive.content)
+        // Jev is shown the dialog drawn on that screenshot, a new file next to it that the activity lists.
+        val firstShot = run.log.entries.value.first { it.image != null && "dialog" !in it.image }.image!!
+        val sent = dialogArgs["assets"]!!.jsonObject[Cu.SHOT_REF]!!.jsonObject["path"]!!.jsonPrimitive.content
+        assertEquals(firstShot.removeSuffix(".jpg") + "-dialog.jpg", sent)
+        assertTrue(java.io.File(sent).isFile)
+        assertTrue(run.log.entries.value.any { it.name == "render dialog" && it.image == sent })
+        val rendered = javax.imageio.ImageIO.read(java.io.File(sent))
+        assertEquals(560 to 390, rendered.width to rendered.height) // the screenshot's own size
         assertTrue(dialogArgs["state"]!!.jsonObject["dialog"]!!.jsonObject["note"]!!.jsonPrimitive.content.contains("on top of this page"))
         // After the answer, pages are read again.
         val after = browser.calls.map { it.first to (it.second["action"]?.jsonObject?.get("type")?.jsonPrimitive?.content) }
@@ -1137,7 +1153,7 @@ class ComputerUseTest {
     @Test
     fun `a prompt that arrives late is answered with a goal phrase`() = runTest {
         val prompt = """{"type":"prompt","message":"What is your name?","default_value":"","url":"https://sample.com/"}"""
-        val browser = FakeBrowser(tmp(), listOf("CLICK", "DONE"), textPick = "Grace").also { it.strictDialogs = true; it.armedDialogOnClick = prompt }
+        val browser = FakeBrowser(tmp(), listOf("CLICK", "DONE"), textPick = "Grace").also { it.strictDialogs = true; it.armedDialogOnClick = prompt; it.dialogPickLabel = "enter 'Grace'" }
         val report = flow(browser, FakeTabs(), mutableListOf(), plan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"Say hello to Grace","type_values":[]}""")
             .runComputerUse(UseRequest("Say hello to Grace"))
         assertEquals(UseStatus.DONE, report.status, report.error)
@@ -1583,6 +1599,244 @@ class ComputerUseTest {
         assertEquals(listOf(false), browser.askLlmOffered)
     }
 
+    // ---- the dialog drawn into the image, concrete answers, memory ----
+
+    private val promptGoal = "Click Confirm delete and confirm it. Then click Prompt name and enter the name \"Grace\"."
+
+    @Test
+    fun `the dialog is painted onto the screenshot like the browser shows it, at the screenshot's own size`() {
+        val dir = tmp()
+        val src = java.io.File(dir, "page.jpg")
+        val page = java.awt.image.BufferedImage(800, 600, java.awt.image.BufferedImage.TYPE_INT_RGB).also { img -> img.createGraphics().apply { color = java.awt.Color.WHITE; fillRect(0, 0, 800, 600); dispose() } }
+        javax.imageio.ImageIO.write(page, "jpg", src)
+        val d = Cu.DialogInfo("prompt", "What is your name?", "Ada", null, null, "http://127.0.0.1:8811/popup.html")
+        val out = DialogImage.render(src.absolutePath, d, 560, 390)!!
+        // Kept for a look: build/reports/visual.
+        java.nio.file.Files.createDirectories(java.nio.file.Path.of("build/reports/visual"))
+        java.io.File(out).copyTo(java.io.File("build/reports/visual/llmrpa-dialog-prompt.jpg"), overwrite = true)
+        DialogImage.render(src.absolutePath, d.copy(type = "confirm", message = "Delete this item?", defaultValue = null, url = "http://127.0.0.1:8811/popup.html"), 560, 390)
+            ?.let { java.io.File(it).copyTo(java.io.File("build/reports/visual/llmrpa-dialog-confirm.jpg"), overwrite = true) }
+        assertEquals(java.io.File(dir, "page-dialog.jpg").absolutePath, out)
+        val img = javax.imageio.ImageIO.read(java.io.File(out))
+        assertEquals(800 to 600, img.width to img.height)
+        // The page is dimmed (white to well under it) and the box is white in the middle area.
+        fun lum(x: Int, y: Int) = java.awt.Color(img.getRGB(x, y)).let { (it.red + it.green + it.blue) / 3 }
+        assertTrue(lum(5, 5) < 200, "page corner dimmed: ${lum(5, 5)}")
+        val boxLum = (0 until 40).map { lum(400 + it * 4 - 80, 200) }
+        assertTrue(boxLum.any { it > 230 }, "a white box in the middle")
+        // An alert, a confirm and an unreadable source all draw something, the last on a blank page of the given size.
+        assertNotNull(DialogImage.render(src.absolutePath, d.copy(type = "alert", message = "Heads up"), 0, 0))
+        assertNotNull(DialogImage.render(src.absolutePath, d.copy(type = "confirm", message = "Delete this item? ".repeat(20), okText = "Delete", cancelText = "Keep"), 0, 0))
+        val blank = DialogImage.render(java.io.File(dir, "not-an-image.jpg").also { it.writeText("x") }.absolutePath, d, 560, 390)!!
+        assertEquals(560 to 390, javax.imageio.ImageIO.read(java.io.File(blank)).let { it.width to it.height })
+    }
+
+    @Test
+    fun `a prompt offers OK, enter each candidate text and cancel, and a confirm offers its own buttons`() {
+        val texts = Cu.textOptions(promptGoal, emptyList(), "http://127.0.0.1:8811/", sensitive = false)
+        assertTrue("Grace" in texts)
+        val prompt = Cu.DialogInfo("prompt", "What is your name?", "", null, null, "http://127.0.0.1:8811/")
+        val crit = Cu.dialogArgs("m", promptGoal, "u", "t", emptyList(), "/x.jpg", prompt, texts = texts.take(8), askLlm = true)["questions"]!!.jsonObject["dialog"]!!.jsonObject["criteria"]!!.jsonObject
+        val labels = crit.values.map { it.jsonPrimitive.content }
+        assertTrue("OK, enter 'Grace'" in labels, labels.toString())
+        assertTrue("OK, enter text written by the writing model" in labels)
+        assertEquals("Cancel", labels.last())
+        assertEquals("OK_LLM", crit.keys.toList()[crit.size - 2])
+        // Without typing by the model there is no such option.
+        assertFalse(Cu.dialogArgs("m", "g", "u", "t", emptyList(), "/x.jpg", prompt, texts = listOf("Grace"), askLlm = false)["questions"]!!.jsonObject["dialog"]!!.jsonObject["criteria"]!!.jsonObject.keys.contains("OK_LLM"))
+        // A confirm: OK and Cancel, named by the dialog's buttons.
+        val confirm = Cu.dialogArgs("m", "g", "u", "t", emptyList(), "/x.jpg", Cu.DialogInfo("confirm", "Delete?", null, "Delete", "Keep", null))["questions"]!!.jsonObject["dialog"]!!.jsonObject
+        assertEquals(listOf("OK", "CANCEL"), confirm["criteria"]!!.jsonObject.keys.toList())
+        assertEquals("OK: press Delete", confirm["criteria"]!!.jsonObject["OK"]!!.jsonPrimitive.content)
+        assertEquals("Cancel: press Keep", confirm["criteria"]!!.jsonObject["CANCEL"]!!.jsonPrimitive.content)
+        assertTrue(confirm["instructions"]!!.jsonPrimitive.content.contains("A browser dialog (confirm) is open on top of the page (shown in the image). Answer it to advance the goal"))
+        // The choice maps back to the text, to the writing model, or to cancel.
+        fun reply(choice: String) = json("""{"response":{"answers":{"dialog":{"choice":"$choice","probabilities":{"$choice":0.8},"confidence":0.7}},"usage":{"cost":0.001}}}""")
+        assertEquals(Cu.DialogChoice(true, 1, false, 0.8, 0.7, 0.001), Cu.parseDialogChoice(reply("OK_2"), 3))
+        assertTrue(Cu.parseDialogChoice(reply("OK_LLM"), 3).askLlm)
+        assertFalse(Cu.parseDialogChoice(reply("CANCEL"), 3).ok)
+        assertTrue(runCatching { Cu.parseDialogChoice(reply("OK_9"), 3) }.isFailure)
+    }
+
+    @Test
+    fun `the prompt in the live scenario is answered with the quoted name chosen in the dialog question`() = runTest {
+        val prompt = """{"type":"prompt","message":"What is your name?","default_value":"","url":"http://127.0.0.1:8811/popup.html"}"""
+        val browser = FakeBrowser(tmp(), listOf("CLICK", "DONE")).also { it.strictDialogs = true; it.armedDialogOnClick = prompt; it.dialogPickLabel = "enter 'Grace'" }
+        val report = flow(browser, FakeTabs(), mutableListOf(), plan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"Click Prompt name and enter the name \"Grace\".","type_values":[]}""")
+            .runComputerUse(UseRequest("t"))
+        assertEquals(listOf("ok:Grace"), browser.dialogAnswers)
+        assertEquals("Dialog 'What is your name?': OK 'Grace'", report.steps[1].description)
+        val labels = browser.jevArgs.first { "dialog" in it["questions"]!!.jsonObject }["questions"]!!.jsonObject["dialog"]!!.jsonObject["criteria"]!!.jsonObject.values.map { it.jsonPrimitive.content }
+        assertTrue("OK, enter 'Grace'" in labels)
+    }
+
+    @Test
+    fun `what changed on the page after a step is remembered in the recent actions`() {
+        assertEquals("page now shows 'Deleted'", Cu.changeSummary("Nothing yet\nDelete", "Deleted\nDelete"))
+        assertEquals("page now shows 'A / B'", Cu.changeSummary("x", "x\nA\nB\nC"))
+        assertEquals("'Spinner' is gone", Cu.changeSummary("Spinner\nx", "x"))
+        assertNull(Cu.changeSummary("same", "same"))
+        assertNull(Cu.changeSummary(null, "x"))
+        assertTrue(Cu.changeSummary("a", "b".repeat(300))!!.length <= "page now shows ''".length + 80)
+        val step = UseStep(1, VisionOp.CLICK, xPct = 50, yPct = 20, confidence = 0.9, ms = 1, result = "page now shows 'Deleted'")
+        assertEquals("page now shows 'Deleted'", Cu.recentAction(step)["result"]!!.jsonPrimitive.content)
+        val dialog = UseStep(2, VisionOp.DIALOG, confidence = 1.0, ms = 1, dialogMessage = "Delete this item?", dialogAnswer = "OK", result = "page now shows 'Deleted'")
+        val r = Cu.recentAction(dialog)
+        assertEquals("DIALOG", r["operation"]!!.jsonPrimitive.content)
+        assertEquals("Delete this item?", r["dialog"]!!.jsonPrimitive.content)
+        assertEquals("OK", r["answer"]!!.jsonPrimitive.content)
+        assertEquals("page now shows 'Deleted'", r["result"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `a click that changed the page, and a dialog answered, carry what came of them into Jev's next state`() = runTest {
+        var n = 0
+        val click = FakeBrowser(tmp(), listOf("CLICK", "DONE")).also { b ->
+            b.contentHash = { "c$n" }
+            b.pageTextFn = { if (n == 0) "Nothing yet" else "Deleted" }
+            b.onAction = { type, _ -> if (type == "click_at") n++ }
+        }
+        flow(click, FakeTabs(), mutableListOf()).runComputerUse(UseRequest("t"))
+        assertEquals("page now shows 'Deleted'", click.jevArgs.last()["state"]!!.jsonObject["recent_actions"]!!.jsonArray.single().jsonObject["result"]!!.jsonPrimitive.content)
+
+        // The confirm: Jev answers it, the page changes, and the next decision remembers both steps.
+        var m = 0
+        val confirm = FakeBrowser(tmp(), listOf("CLICK", "DONE")).also { b ->
+            b.strictDialogs = true; b.armedDialogOnClick = confirmDialog
+            b.contentHash = { "d$m" }
+            b.pageTextFn = { if (m == 0) "Nothing yet" else "Deleted" }
+            b.onAction = { type, _ -> if (type == "dialog_answer") m++ }
+        }
+        flow(confirm, FakeTabs(), mutableListOf()).runComputerUse(UseRequest("t"))
+        val recent = confirm.jevArgs.last()["state"]!!.jsonObject["recent_actions"]!!.jsonArray.map { it.jsonObject }
+        assertEquals(listOf("CLICK", "DIALOG"), recent.map { it["operation"]!!.jsonPrimitive.content })
+        val dlg = recent[1]
+        assertEquals("Delete this item?", dlg["dialog"]!!.jsonPrimitive.content)
+        assertEquals("OK", dlg["answer"]!!.jsonPrimitive.content)
+        assertEquals("page now shows 'Deleted'", dlg["result"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `a dialog answer whose own confidence is under 0_3 is unsure even when its probability is not, and the dialog is seen by a consulted model`() = runTest {
+        val unsure = FakeBrowser(tmp(), listOf("CLICK", "DONE")).also { b ->
+            b.strictDialogs = true; b.armedDialogOnClick = confirmDialog
+            b.dialogPick = "CANCEL"; b.dialogP = 0.6; b.dialogConfidence = 0.2 // the live run: OK 0.4 / CANCEL 0.6, confidence 0.2
+        }
+        val r = flow(unsure, FakeTabs(), mutableListOf()).runComputerUse(UseRequest("t"))
+        assertEquals(UseStatus.NEEDS_INPUT, r.status)
+        assertTrue(r.blocker!!.reason.contains("20% sure how to answer the confirm dialog"), r.blocker!!.reason)
+        assertEquals(0, unsure.dialogAnswers.size)
+        // Sure of itself: the same split is answered.
+        val sure = FakeBrowser(tmp(), listOf("CLICK", "DONE")).also { b -> b.strictDialogs = true; b.armedDialogOnClick = confirmDialog; b.dialogPick = "CANCEL"; b.dialogP = 0.6; b.dialogConfidence = 0.9 }
+        flow(sure, FakeTabs(), mutableListOf()).runComputerUse(UseRequest("t"))
+        assertEquals(listOf("cancel"), sure.dialogAnswers)
+
+        // The consulted model gets the image with the dialog on it.
+        consultReplies = ArrayDeque(listOf("""{"give_up":"x"}"""))
+        gatewayCaps = setOf(AiGatewayAPI.CAPABILITY_VISION)
+        val run = UseRun("t")
+        val requests = mutableListOf<AiRequest>()
+        try {
+            val b = FakeBrowser(tmp(), listOf("CLICK", "DONE")).also { x -> x.strictDialogs = true; x.armedDialogOnClick = confirmDialog; x.dialogP = 0.6; x.dialogConfidence = 0.1 }
+            flow(b, FakeTabs(), requests).runComputerUse(UseRequest("t", onStuck = OnStuck.CONSULT), run)
+        } finally { gatewayCaps = emptySet() }
+        val rendered = run.log.entries.value.first { it.name == "render dialog" }.image!!
+        val image = requests.single { it.system.startsWith("You help a browser agent") }.messages.single().images.single()
+        assertTrue(image.bytes.contentEquals(java.io.File(rendered).readBytes()))
+    }
+
+    // ---- url and title from the screenshot, targets already acted on, tab switches ----
+
+    private fun locatedRect(left: Int, top: Int, right: Int, bottom: Int) =
+        """{"ok":true,"located":{"found":true,"count":1,"in_view":true,"rect":{"left":$left,"top":$top,"right":$right,"bottom":$bottom}}}"""
+
+    @Test
+    fun `a target that was acted on is dropped, and nothing is reported missing in a popup window`() {
+        val found = Cu.Located(true, 1, true, null, 0.0)
+        val missing = Cu.Located(false, 0, false, null, null)
+        val t = listOf(Cu.Target("Sign in with Popup", found), Cu.Target("item 87", found), Cu.Target("Acme", missing))
+        fun step(f: (UseStep) -> UseStep) = f(UseStep(1, VisionOp.CLICK, confidence = 0.9, ms = 1))
+        // Clicked where it was; snapped onto it; typed; or a result that mentions it.
+        assertEquals(listOf("item 87", "Acme"), Cu.pruneTargets(t, listOf(step { it.copy(clickedTargets = listOf("sign in with popup")) }), inPopup = false).map { it.text })
+        assertEquals(listOf("Sign in with Popup", "Acme"), Cu.pruneTargets(t, listOf(step { it.copy(snapped = Snapped("a", "b", "link", "Item 87 details")) }), inPopup = false).map { it.text })
+        assertEquals(listOf("Sign in with Popup", "Acme"), Cu.pruneTargets(t, listOf(step { it.copy(op = VisionOp.TYPE_TEXT, text = "item 87") }), inPopup = false).map { it.text })
+        assertEquals(listOf("item 87", "Acme"), Cu.pruneTargets(t, listOf(step { it.copy(result = "page now shows 'Sign in with Popup opened'") }), inPopup = false).map { it.text })
+        // Nothing done: all three, the missing one reported as such. In a popup window the missing one is not reported.
+        assertEquals(3, Cu.pruneTargets(t, emptyList(), inPopup = false).size)
+        assertEquals(listOf("Sign in with Popup", "item 87"), Cu.pruneTargets(t, emptyList(), inPopup = true).map { it.text })
+        // The rect of a located phrase holds a click that lands on it.
+        assertEquals(Cu.Rect(500.0, 180.0, 620.0, 210.0), Cu.parseLocated(json(locatedRect(500, 180, 620, 210)))!!.rect)
+        assertEquals(Cu.Rect(10.0, 20.0, 110.0, 70.0), Cu.parseLocated(json("""{"located":{"found":true,"in_view":true,"rect":{"x":10,"y":20,"width":100,"height":50}}}"""))!!.rect)
+        assertTrue(Cu.Rect(500.0, 180.0, 620.0, 210.0).contains(560.0, 195.0))
+        assertFalse(Cu.Rect(500.0, 180.0, 620.0, 210.0).contains(300.0, 195.0))
+    }
+
+    @Test
+    fun `a target the run clicked is not offered again, and not looked up again`() = runTest {
+        val h = locateBrowser(listOf("CLICK", "DONE"), reply = { locatedRect(500, 180, 620, 210) })
+        val goal = "Click \"Sign in with Popup\""
+        flow(h.b, FakeTabs(), mutableListOf(), plan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"${goal.replace("\"", "\\\"")}","type_values":[]}""").runComputerUse(UseRequest("t", maxSteps = 5))
+        val first = h.b.jevArgs[0]["state"]!!.jsonObject["targets"]!!.jsonArray.map { it.jsonObject["text"]!!.jsonPrimitive.content to it.jsonObject["where"]!!.jsonPrimitive.content }
+        assertTrue(first.contains("Sign in with Popup" to "in view"), first.toString())
+        // The click landed at (560, 195), inside its rect: from then on it is done, not "missing".
+        assertNull(h.b.jevArgs[1]["state"]!!.jsonObject["targets"])
+        assertEquals(1, h.phrases.count { it == "Sign in with Popup" })
+    }
+
+    @Test
+    fun `the screenshot's url and title are the page state, and observe is only the fallback`() = runTest {
+        val tabs = FakeTabs().also { it.now = mapOf("t1" to "Main") }
+        val browser = FakeBrowser(tmp(), listOf("CLICK", "WAIT", "DONE")).also { b ->
+            b.shotMeta = true
+            b.observeFailsFor += "t1#popup-1"
+            b.urlByTab["t1#popup-1"] = "https://accounts.sample.com/signin"
+            var opened = false
+            b.onAction = { type, tab -> if (type == "click_at" && tab == "t1" && !opened) { opened = true; b.popupsJson = popupOpen } }
+        }
+        val report = flow(browser, tabs, mutableListOf()).runComputerUse(UseRequest("t", maxSteps = 6))
+        assertEquals(UseStatus.DONE, report.status, report.error)
+        val onPopup = browser.jevArgs.last()["state"]!!.jsonObject
+        assertEquals("https://accounts.sample.com/signin", onPopup["url"]!!.jsonPrimitive.content)
+        assertEquals("Shot title", onPopup["title"]!!.jsonPrimitive.content)
+        // Not one observe went to the popup window, and the loop made none at all once screenshots carried the address.
+        assertEquals(0, browser.calls.count { it.first == ToolNames.OBSERVE && it.second["tab_id"]?.jsonPrimitive?.content == "t1#popup-1" })
+        // Without them (an older engine) observe is used.
+        val old = FakeBrowser(tmp(), listOf("DONE"))
+        flow(old, FakeTabs(), mutableListOf()).runComputerUse(UseRequest("t"))
+        assertEquals("S", old.jevArgs.single()["state"]!!.jsonObject["title"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `every switch of tab is a recent action saying where the run is now`() = runTest {
+        // Unit: both spellings of the note, and the way back.
+        val steps = listOf(
+            UseStep(1, VisionOp.CLICK, confidence = 0.9, ms = 1, popup = "Switched to popup window 'Sign in'"),
+            UseStep(2, VisionOp.CLICK, confidence = 0.9, ms = 1, popup = "Popup window closed, back on 'Main'"),
+            UseStep(3, VisionOp.CLICK, confidence = 0.9, ms = 1, popup = "Switched to popup 'Other tab'"),
+        )
+        val all = Cu.recentActions(steps).map { it["operation"]!!.jsonPrimitive.content to it["result"]?.jsonPrimitive?.content }
+        assertEquals(listOf(
+            "CLICK" to null, "SWITCH" to "now in popup window 'Sign in' (separate window for this step)",
+            "CLICK" to null, "SWITCH" to "back on 'Main'",
+            "CLICK" to null, "SWITCH" to "now in popup window 'Other tab' (separate window for this step)",
+        ), all)
+        // Through a run: the decision after the switch and the one after the return both carry it.
+        val tabs = FakeTabs().also { it.now = mapOf("t1" to "Main") }
+        var closed = false
+        val browser = FakeBrowser(tmp(), listOf("CLICK", "CLICK", "DONE")).also { b ->
+            b.onAction = { type, tab ->
+                if (type == "click_at" && tab == "t1" && b.popupsJson == null) b.popupsJson = popupOpen
+                else if (type == "click_at" && tab == "t1#popup-1" && !closed) { closed = true; b.popupsJson = popupClosed }
+                else if (closed && type == "screenshot") b.popupsJson = null
+            }
+        }
+        flow(browser, tabs, mutableListOf()).runComputerUse(UseRequest("t", maxSteps = 10))
+        val second = browser.jevArgs[1]["state"]!!.jsonObject["recent_actions"]!!.jsonArray.map { it.jsonObject["result"]?.jsonPrimitive?.content }
+        assertTrue(second.contains("now in popup window 'Sign in' (separate window for this step)"), second.toString())
+        val third = browser.jevArgs[2]["state"]!!.jsonObject["recent_actions"]!!.jsonArray.map { it.jsonObject["result"]?.jsonPrimitive?.content }
+        assertTrue(third.contains("back on 'Main'"), third.toString())
+    }
+
     // ---- popup windows that are not tabs ----
 
     private val popupOpen = """[{"id":"t1#popup-1","url":"https://accounts.sample.com/signin","title":"Sign in","open":true}]"""
@@ -1721,6 +1975,7 @@ class ComputerUseTest {
     @Test
     fun `a prompt is answered with the caller's input, and a prompt with nothing to type is cancelled when typing is off`() = runTest {
         val prompt = FakeBrowser(tmp(), listOf("CLICK", "DONE"), textPick = "Ada").also { b ->
+            b.dialogPickLabel = "enter 'Ada'"
             b.onAction = { type, _ -> if (type == "click_at") b.dialog = """{"type":"prompt","message":"What is your name?","default_value":"","url":"https://sample.com/"}""" }
         }
         val r1 = flow(prompt, FakeTabs(), mutableListOf(), plan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"Say hello","type_values":[]}""")
@@ -1728,6 +1983,7 @@ class ComputerUseTest {
         assertEquals(listOf("ok:Ada"), prompt.dialogAnswers)
         assertEquals("Dialog 'What is your name?': OK 'Ada'", r1.steps[1].description)
         assertEquals("Ada", r1.steps[1].text)
+        assertEquals(0, prompt.textOptionsSeen.size) // the text was chosen in the dialog question itself
 
         val none = FakeBrowser(tmp(), listOf("CLICK", "DONE")).also { b ->
             b.onAction = { type, _ -> if (type == "click_at") b.dialog = """{"type":"prompt","message":"Your nickname?","url":"https://sample.com/"}""" }
