@@ -411,4 +411,43 @@ class AgentLoopTest {
         assertTrue("\"type\":\"find\"" in AgentPrompt.system("Jev") && "Ctrl+F" in AgentPrompt.system("Jev"))
         assertEquals(AgentAction.Find("Item 87"), AgentPrompt.parse("""{"action":{"type":"find","text":"Item 87"}}""").getOrThrow().action)
     }
+
+    // ---- frames ----
+
+    @Test
+    fun `an element in a frame names the frame, and click and type by element pass through unchanged`() = runTest {
+        val b = Browser().apply {
+            elements = """[{"id":"m14","role":"textbox","tag":"input","label":"Phone","rect":{"x":400,"y":300,"w":200,"h":40},"disabled":false,"covered":false,"context":"","editable":true,"frame":["www.zomato.com","https://accounts.zomato.com/login?x=1"]},""" +
+                """{"id":"m15","role":"button","tag":"button","label":"Send OTP","rect":{"x":400,"y":360,"w":200,"h":40},"disabled":false,"covered":false,"context":"Login","editable":false,"frame":"accounts.zomato.com"}]"""
+        }
+        say("""{"type":"type","element":"m14","text":"{{phone}}"}""", """{"type":"click","element":"m15"}""", """{"type":"done","result":"sent"}""")
+        val report = loop(b).run(AgentRequest("log in", tabId = "t1", inputs = mapOf("phone" to "9999999999")))
+        assertEquals(UseStatus.DONE, report.status, report.error)
+        val state = requests[0].messages.single().text
+        assertTrue("[m14] textbox 'Phone' — (in frame accounts.zomato.com)" in state, state)
+        assertTrue("[m15] button 'Send OTP' — Login (in frame accounts.zomato.com)" in state, state)
+        val typed = b.actions("type_text").single()
+        assertEquals("m14", typed["action"]!!.jsonObject["element"]!!.jsonPrimitive.content)
+        assertEquals("9999999999", b.value(typed))
+        val click = b.actions("click_at").single()
+        assertEquals("m15", click["action"]!!.jsonObject["element"]!!.jsonPrimitive.content)
+        assertEquals("500,380", b.value(click)) // the top-viewport centre as the fallback point
+    }
+
+    @Test
+    fun `frame names are read from a host, a url, a path or an object`() {
+        fun f(json: String) = Marks.frameName(kotlinx.serialization.json.Json.parseToJsonElement(json))
+        assertEquals("accounts.zomato.com", f("\"accounts.zomato.com\""))
+        assertEquals("pay.example.com", f("\"https://pay.example.com/checkout?id=1\""))
+        assertEquals("inner.example.com", f("""["outer.example.com","https://inner.example.com/x"]"""))
+        assertEquals("auth.example.com", f("""{"host":"auth.example.com","index":2}"""))
+        assertNull(f("null"))
+        assertNull(f("\"  \""))
+        assertNull(Marks.parseMarks(kotlinx.serialization.json.Json.parseToJsonElement("""[{"id":"m1","role":"link","label":"x","rect":{"x":1,"y":1,"w":2,"h":2}}]""") as kotlinx.serialization.json.JsonArray).single().frame)
+    }
+
+    @Test
+    fun `the prompt says a split code is typed into the first box in one go`() {
+        assertTrue("type the whole code into the first box in one go; the site spreads it across the boxes" in AgentPrompt.system("Jev"))
+    }
 }

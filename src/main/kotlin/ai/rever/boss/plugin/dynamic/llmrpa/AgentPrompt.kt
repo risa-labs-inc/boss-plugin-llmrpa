@@ -65,6 +65,7 @@ Rules:
 - Refer to elements by id (m12 is the mark numbered 12). Use click_point only for a target that has no mark (a canvas, an unlabeled icon).
 - When the person must act or decide (a login, a code, missing details, a choice between options, anything risky or unclear), use ask_user with a clear question and options when there are some.
 - Never guess credentials, codes or personal data. Type a named input as {{name}}; its value is filled in for you.
+- A one-time code split into several digit boxes: type the whole code into the first box in one go; the site spreads it across the boxes.
 - To find something, prefer a search: navigate to https://www.google.com/search?q=... rather than guessing deep links. navigate takes https only.
 - find works like Ctrl+F: it looks for the text on the whole page and scrolls the nearest match into view. Use it to reach something not on screen instead of scrolling blindly.
 - Each step's result says what changed, including how far a scroll moved; "Visible now" says what the screen shows.
@@ -138,7 +139,9 @@ Rules:
         fun clean(s: String, n: Int) = s.replace(Regex("\\s+"), " ").trim().take(n)
         append('[').append(m.id).append("] ").append(m.role.ifBlank { m.tag })
         clean(m.label, 80).takeIf { it.isNotEmpty() }?.let { append(" '").append(it).append('\'') }
-        clean(m.context, 80).takeIf { it.isNotEmpty() }?.let { append(" — ").append(it) }
+        val context = clean(m.context, 80)
+        if (context.isNotEmpty()) append(" — ").append(context)
+        m.frame?.let { append(if (context.isEmpty()) " — " else " ").append("(in frame ").append(it).append(')') }
         val state = listOfNotNull(
             if (m.disabled) "disabled" else null, if (m.covered) "covered" else null,
             m.valueKind?.let { if (it.startsWith("selected:")) "selected ${clean(it.removePrefix("selected:"), 60)}" else it },

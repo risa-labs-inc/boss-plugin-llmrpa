@@ -157,14 +157,6 @@ private fun ModelRow(component: LlmrpaComponent, enabled: Boolean) {
     var menu by remember { mutableStateOf<String?>(null) }
     val agent = mode == LlmrpaComponent.UseMode.AGENT
     FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        Box {
-            OutlineButton("Mode: ${mode.label}", { menu = "mode" }, enabled = enabled, tone = Tone.NEUTRAL, trailing = "▾")
-            if (menu == "mode") RpaMenu(onDismiss = { menu = null }, width = 280) {
-                MenuHeading("Mode")
-                MenuRow("Agent", onClick = { menu = null; component.selectUseMode(LlmrpaComponent.UseMode.AGENT) }, selected = agent, detail = "one vision model decides each step")
-                MenuRow("Fast", onClick = { menu = null; component.selectUseMode(LlmrpaComponent.UseMode.FAST) }, selected = !agent, detail = "Jev with plans and milestones")
-            }
-        }
         if (agent) Box {
             OutlineButton("Model: ${agentModel?.label ?: "auto"}", { menu = "agent"; component.refreshModels() }, enabled = enabled, tone = Tone.NEUTRAL, trailing = "▾")
             if (menu == "agent") RpaMenu(onDismiss = { menu = null }, width = 300) {

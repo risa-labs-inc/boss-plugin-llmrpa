@@ -1519,10 +1519,14 @@ class ComputerUseTest {
     }
 
     @Test
-    fun `wait_s is an argument from 5 to 600 seconds, default 45`() {
+    fun `wait_s is an argument from 5 to 50 seconds, default 45, under the client's 60 s timeout`() {
         assertEquals(45, BrowserUseArgs.parse("""{"task":"t"}""").getOrThrow().waitS)
         assertEquals(5, BrowserUseArgs.parse("""{"task":"t","wait_s":1}""").getOrThrow().waitS)
-        assertEquals(600, BrowserUseArgs.parse("""{"task":"t","wait_s":9999}""").getOrThrow().waitS)
+        assertEquals(50, BrowserUseArgs.parse("""{"task":"t","wait_s":9999}""").getOrThrow().waitS)
+        assertEquals(50, BrowserUseArgs.parse("""{"task":"t","wait_s":60}""").getOrThrow().waitS)
+        val waitSchema = json(LlmrpaMcpToolProvider.BROWSER_USE_SCHEMA)["properties"]!!.jsonObject["wait_s"]!!.jsonObject
+        assertEquals(50, waitSchema["maximum"]!!.jsonPrimitive.content.toInt())
+        assertTrue(waitSchema["description"]!!.jsonPrimitive.content.contains("Long runs return status running; poll browser_use_status"))
         assertTrue(BrowserUseArgs.parse("""{"task":"t","wait_s":"soon"}""").isFailure)
         assertTrue(LlmrpaMcpToolProvider.BROWSER_USE_SCHEMA.contains("\"wait_s\""))
     }
@@ -3840,6 +3844,21 @@ class ComputerUseTest {
         assertNull(Marks.followNavigator(d, Cu.PageStep(VisionOp.CLICK, "m1", null, null), marks.map { if (it.id == "m1") it.copy(disabled = true) else it }, true).second)
         assertNull(Marks.followNavigator(d, Cu.PageStep(VisionOp.TYPE_TEXT, "m1", null, null), marks, true).second)
         assertNull(Marks.followNavigator(d, Cu.PageStep(VisionOp.CLICK, null, null, null), marks, true).second)
+    }
+
+    @Test
+    fun `fast mode is done only when every milestone is done, else blocked with milestones not reached`() = runTest {
+        // As in run-20261105-182424-9b73: read mode collected the page and said done with 3 of 4 milestones open.
+        val plan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"Log in","mode":"read","type_values":[],"milestones":["Home page is open","Login flow is open"]}"""
+        val r = flow(looking(listOf("DONE")), FakeTabs(), mutableListOf(), plan = plan).runComputerUse(UseRequest("Log in to sample"))
+        assertEquals(UseStatus.BLOCKED, r.status)
+        assertTrue(r.error!!.startsWith("milestones not reached"), r.error)
+        assertTrue(r.error!!.contains("'Login flow is open'"), r.error)
+        assertFalse(r.ok)
+        assertEquals("blocked", r.toJson()["status"]!!.jsonPrimitive.content)
+        assertNotNull(r.blocker)
+        // The schema keeps fast for an explicit request only, as legacy.
+        assertTrue(LlmrpaMcpToolProvider.BROWSER_USE_SCHEMA.contains("fast and dom are legacy, only when asked for explicitly"))
     }
 
     @Test

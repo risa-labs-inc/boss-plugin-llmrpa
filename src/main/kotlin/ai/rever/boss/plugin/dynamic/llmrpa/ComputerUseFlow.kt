@@ -1643,8 +1643,13 @@ internal class ComputerUseFlow(
 
     // ---- 4. REPORT ----
 
-    private suspend fun finish(req: UseRequest, run: UseRun, tools: RecordingTools, llm: UseLlm, st: FlowState, o: Outcome): UseReport {
+    private suspend fun finish(req: UseRequest, run: UseRun, tools: RecordingTools, llm: UseLlm, st: FlowState, o0: Outcome): UseReport {
         run.phase.value = UsePhase.REPORTING
+        // Done means every milestone is done: a done with some left (read mode, a stray DONE) is blocked, never reported as success.
+        val milestones = run.plan.value?.milestones.orEmpty()
+        val o = if (o0.status == UseStatus.DONE && run.doneMilestones.size < milestones.size)
+            Outcome(UseStatus.BLOCKED, "milestones not reached: ${milestones.drop(run.doneMilestones.size).joinToString("; ") { "'${it.take(80)}'" }}")
+        else o0
         val steps = run.steps.value
         val tab = st.tab
         var url: String? = null

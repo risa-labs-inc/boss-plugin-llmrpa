@@ -88,7 +88,7 @@ internal class LlmrpaMcpToolProvider(
                     "(agent_model; Claude Haiku by default) decides each step from a marked screenshot and the element list, and RPA Engine clicks, types and scrolls " +
                     "with a visible pointer; it asks (status needs_input, blocker.question and blocker.options) for logins, codes, choices and before paying. To answer, call again " +
                     "with the same tab_id and inputs {\"reply\":\"...\"} (or a new named input, or {\"continue\":\"yes\"}): the same run resumes with its history. Secret inputs are typed as {{name}} and never sent to the model. " +
-                    "mode fast is the older Jev loop (a chat model plans the goal and page, Jev clicks from screenshots). " +
+                    "mode fast is legacy (the older Jev loop with milestones), used only when asked for explicitly. " +
                     "The result reports what happened plus the final page text. Use it to research or operate a website. " +
                     "The user sees the run: the tab is opened or brought to the front in the space on screen and a labelled pointer moves over it. " +
                     "It opens a new tab at the planned page (or url), or acts on tab_id; only tabs in the space on screen can be driven. " +
@@ -96,7 +96,7 @@ internal class LlmrpaMcpToolProvider(
                     "It never waits for a person. When it is stuck (no progress, Jev blocked or unsure) it stops with status needs_input and a blocker, leaving the tab open: " +
                     "call it again with the same tab_id, task and inputs (named values such as phone or code) to continue where it stopped; when the page asks for a login, a code or payment (status needs_input, nothing is consulted) the person does it in the tab and you call again with inputs {\"continue\":\"yes\"} to resume without replanning; with on_stuck consult it asks the planner chat model what to do first. " +
                     "Information on the pages it passes is saved in collected[]. " +
-                    "A long task does not block the call: after wait_s (default 45 s) it returns {ok:false, status:\"running\", run_id, tab_id, steps so far} and the run goes on in the background; poll browser_use_status with run_id until it returns the final report. " +
+                    "Long runs return status running; poll browser_use_status: after wait_s (default 45 s, at most 50, under the client's ~60 s timeout) the call returns {ok:false, status:\"running\", run_id, tab_id, steps so far} and the run goes on in the background; poll browser_use_status with run_id until it returns the final report. " +
                     "Returns JSON {ok, status (done|needs_input|blocked|budget|error|running), run_id, summary (built from the steps, not a model's opinion), url, title, tab_id, page_text, collected[] (text saved from pages), pages_visited[], blocker {reason, question, url, title, tab_id, screenshot_path, step} when it stopped, answer (only with extract), steps, seconds, jev_calls, " +
                     "llm_calls, tool_calls, cost_usd, confidences, screenshot_path}; ok only means Jev reached its goal, so read the answer from page_text yourself.",
             inputSchema = BROWSER_USE_SCHEMA,
@@ -278,7 +278,7 @@ internal class LlmrpaMcpToolProvider(
             """"url":{"type":"string","description":"http(s) address to open in a new tab; replaces the page the planner would choose (the goal is still planned)"},""" +
             """"tab_id":{"type":"string","description":"Browser tab to act on (explicit; giving it skips planning). Without tab_id the run plans and opens a new tab (as with new_tab: true); the focused tab is never used"},""" +
             """"new_tab":{"type":"boolean","default":false,"description":"Open the planned page in a new tab. The default whenever tab_id is not given"},""" +
-            """"mode":{"type":"string","enum":["agent","fast","dom"],"default":"agent","description":"agent: one vision chat model decides each step from a marked screenshot and the element list (general); fast: the Jev loop with milestones and page plans; dom: the text-list runner of llmrpa_execute"},""" +
+            """"mode":{"type":"string","enum":["agent","fast","dom"],"default":"agent","description":"agent (use this): one vision chat model decides each step from a marked screenshot and the element list. fast and dom are legacy, only when asked for explicitly: fast is the old Jev loop with milestones (done only when every milestone is reached), dom the text-list runner of llmrpa_execute"},""" +
             """"agent_model":{"type":"string","description":"agent mode: the chat model that decides each step; it must see images. Default: the newest Claude Haiku the AI Gateway lists, else the planner"},""" +
             """"model":{"type":"string","description":"Jev model; vision needs one that takes images and boxes (default typesafe/jev-1.14). In dom mode, any model id of llmrpa_execute"},""" +
             """"planner_model":{"type":"string","description":"Chat model id (from Settings → AI Providers) that plans the task and writes text for fields; defaults to the selected one"},""" +
@@ -296,7 +296,7 @@ internal class LlmrpaMcpToolProvider(
             """"llm_typing":{"type":"boolean","default":true,"description":"Let the planner chat model write text for a field when nothing from the task fits (never for password, PIN or card fields)"},""" +
             """"max_steps":{"type":"integer","minimum":1,"maximum":60,"default":25},""" +
             """"timeout_s":{"type":"integer","minimum":10,"maximum":600,"default":180,"description":"The run's own time limit"},""" +
-            """"wait_s":{"type":"integer","minimum":5,"maximum":600,"default":45,"description":"How long this call waits; a run still going then returns status running with its run_id (poll browser_use_status) and continues in the background"},""" +
+            """"wait_s":{"type":"integer","minimum":5,"maximum":50,"default":45,"description":"How long this call waits (at most 50 s, under the MCP client's ~60 s timeout). Long runs return status running; poll browser_use_status with run_id"},""" +
             """"include_text":{"type":"boolean","default":true,"description":"Include the final page's text (up to 20000 characters) as page_text"}""" +
             """},"required":["task"]}"""
 
@@ -480,7 +480,7 @@ internal data class BrowserUseArgs(
                 onStuck = if (stuck == "consult") OnStuck.CONSULT else OnStuck.RETURN, consultBelow = dbl("consult_below", 0.5, 0.0, 1.0),
                 maxConsults = int("max_consults", 5, 0, 10), consultModel = str("consult_model"), navigatorModel = str("navigator_model"), agentModel = str("agent_model"), pagePlan = bool("page_plan", true), maxReplans = int("max_replans", 2, 0, 5), inputs = inputs, extract = bool("extract", false),
                 plan = if (root["plan"] == null) null else bool("plan", false),
-                maxSteps = int("max_steps", 25, 1, 60), timeoutS = int("timeout_s", 180, 10, 600), waitS = int("wait_s", 45, 5, 600), includeText = bool("include_text", true),
+                maxSteps = int("max_steps", 25, 1, 60), timeoutS = int("timeout_s", 180, 10, 600), waitS = int("wait_s", 45, 5, 50), includeText = bool("include_text", true),
             )
         }
     }

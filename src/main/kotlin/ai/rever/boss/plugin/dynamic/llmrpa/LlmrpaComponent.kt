@@ -600,7 +600,8 @@ class LlmrpaComponent(
     private val _useMode = MutableStateFlow(UseMode.AGENT)
     /** Agent: one vision chat model decides each step (the default). Fast: the Jev loop with plans and milestones. */
     val useMode: StateFlow<UseMode> = _useMode
-    fun selectUseMode(mode: UseMode) { _useMode.value = mode }
+    /** Fast is legacy: not offered in the Jev tab, kept for the code path. */
+    internal fun selectUseMode(mode: UseMode) { _useMode.value = mode }
 
     private val _agentModel = MutableStateFlow<ModelOption?>(null)
     /** The model that decides each agent step; null = automatic (the newest Claude Haiku the gateway lists, else the planner). */

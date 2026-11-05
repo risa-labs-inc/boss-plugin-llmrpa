@@ -36,6 +36,8 @@ internal data class Mark(
     val context: String,
     val editable: Boolean,
     val hrefHost: String?,
+    /** The frame the element is in (its host), when it is not in the top document. The rect is still in top-viewport px. */
+    val frame: String? = null,
 ) {
     /** The number drawn on the image: "12" for "m12". */
     val number: String get() = id.removePrefix("m")
@@ -98,7 +100,20 @@ internal object Marks {
             disabled = b("disabled"), covered = b("covered"),
             context = s("context").orEmpty(), editable = b("editable"),
             hrefHost = s("href_host")?.takeIf { it.isNotBlank() },
+            frame = frameName(o["frame"]),
         )
+    }
+
+    /** `frame` as RPA Engine gives it: a host or URL, a path of them (the innermost names it), or an object with host/url. */
+    fun frameName(e: kotlinx.serialization.json.JsonElement?): String? {
+        val raw = when (e) {
+            is JsonPrimitive -> e.takeIf { it.isString }?.content
+            is JsonArray -> e.lastOrNull()?.let { return frameName(it) }
+            is JsonObject -> listOf("host", "url", "src", "name").firstNotNullOfOrNull { (e[it] as? JsonPrimitive)?.contentOrNull }
+            else -> null
+        }?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        val host = runCatching { java.net.URI(raw).host }.getOrNull()
+        return (host ?: raw.substringAfterLast('>').trim().substringAfterLast('/').ifEmpty { raw }).take(80)
     }
 
     private fun clean(s: String, max: Int) = s.replace(Regex("\\s+"), " ").trim().take(max)
