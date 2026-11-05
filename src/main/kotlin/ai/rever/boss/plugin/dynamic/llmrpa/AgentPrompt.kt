@@ -13,20 +13,22 @@ import kotlinx.serialization.json.putJsonArray
 
 /** One action the agent model chose. */
 internal sealed interface AgentAction {
-    data class Click(val element: String) : AgentAction
-    data class Type(val element: String, val text: String, val submit: Boolean) : AgentAction
-    data class Key(val key: String) : AgentAction
+    data class Click(val element: String, val irreversible: Boolean = false) : AgentAction
+    /** No [element]: into whatever has focus. */
+    data class Type(val element: String?, val text: String, val submit: Boolean, val irreversible: Boolean = false) : AgentAction
+    data class Key(val key: String, val irreversible: Boolean = false) : AgentAction
     data class Scroll(val down: Boolean, val amount: String) : AgentAction
     data class Navigate(val url: String) : AgentAction
     data class Find(val text: String) : AgentAction
-    data class ClickPoint(val description: String) : AgentAction
+    data class ClickPoint(val description: String, val irreversible: Boolean = false) : AgentAction
     data class AnswerDialog(val ok: Boolean, val text: String?) : AgentAction
     data class Wait(val ms: Long) : AgentAction
     data class AskUser(val question: String, val options: List<String>) : AgentAction
     data class Done(val result: String) : AgentAction
 }
 
-internal data class AgentDecision(val thought: String, val action: AgentAction, val raw: JsonObject)
+/** [thenDone]: the action is the last one; when it succeeds and changes something, the run ends done with this result, with no further call. */
+internal data class AgentDecision(val thought: String, val action: AgentAction, val raw: JsonObject, val thenDone: String? = null)
 
 /** A remembered step, as the model sees it in the next turns; [changed] is whether it changed the page or the view. */
 internal data class AgentTurn(val action: String, val target: String?, val result: String?, val error: String?, val changed: Boolean? = null)
@@ -52,6 +54,7 @@ internal object AgentPrompt {
 Reply with only JSON: {"thought":"<one short sentence>","action":{...}} where action is one of:
 {"type":"click","element":"m12"}
 {"type":"type","element":"m3","text":"...","submit":false}
+{"type":"type","text":"...","submit":false}   (no element: types into the field that has focus)
 {"type":"key","key":"Enter|Escape|Tab|ArrowDown|ArrowUp|Backspace|PageDown"}
 {"type":"scroll","direction":"down|up","amount":"half|page|two_pages"}
 {"type":"navigate","url":"https://..."}
@@ -61,8 +64,10 @@ Reply with only JSON: {"thought":"<one short sentence>","action":{...}} where ac
 {"type":"wait","ms":1000}
 {"type":"ask_user","question":"...","options":["...","..."]}
 {"type":"done","result":"the answer, or what was achieved, taken from the page"}
+click, type, key and click_point take "irreversible":true for an action that places an order, pays, checks out, submits a form that commits something, sends a message or deletes; the person is asked first. Ordinary navigation and adding to a cart are not irreversible.
+When the action is the last one the task needs, add "then":"done" and "result":"..." beside "action": if it succeeds and changes the page, the run ends with that result without another turn.
 Rules:
-- Refer to elements by id (m12 is the mark numbered 12). Use click_point only for a target that has no mark (a canvas, an unlabeled icon).
+- Refer to elements by id (m12 is the mark numbered 12). Use click_point only for a target that has no mark (a canvas, an unlabeled icon). After click_point on a field that has no mark, type without an element: the text goes into the focused field.
 - When the person must act or decide (a login, a code, missing details, a choice between options, anything risky or unclear), use ask_user with a clear question and options when there are some.
 - Never guess credentials, codes or personal data. Type a named input as {{name}}; its value is filled in for you.
 - A one-time code split into several digit boxes: type the whole code into the first box in one go; the site spreads it across the boxes.
@@ -126,6 +131,31 @@ Rules:
         return "${q(first)} … ${q(last)}"
     }
 
+    /**
+     * What changed in the elements' own state between two looks of the same page: focus, a switch or checkbox, a selection, a field's fill.
+     * Elements are matched by role, label, context and frame (ids are per look).
+     */
+    fun stateChanges(before: List<Mark>, after: List<Mark>): List<String> {
+        fun key(m: Mark) = listOf(m.role, m.label, m.context, m.frame)
+        val old = before.groupBy(::key).mapValues { it.value.first() }
+        fun name(m: Mark) = "${m.role.ifBlank { m.tag }} '${m.label.replace(Regex("\\s+"), " ").trim().take(40)}'"
+        val out = mutableListOf<String>()
+        after.firstOrNull { it.focused }?.let { f -> if (old[key(f)]?.focused != true) out += "focused ${name(f)}" }
+        for (m in after) {
+            val was = old[key(m)] ?: continue
+            if (was.valueKind == m.valueKind || m.valueKind == null) continue
+            val toggle = m.role.contains("switch", true)
+            out += when (val v = m.valueKind) {
+                "checked" -> "${name(m)} now ${if (toggle) "on" else "checked"}"
+                "unchecked" -> "${name(m)} now ${if (toggle) "off" else "unchecked"}"
+                "text" -> "${name(m)} now has text"
+                "empty" -> "${name(m)} is now empty"
+                else -> if (v.startsWith("selected:")) "${name(m)} now shows '${v.removePrefix("selected:").take(40)}'" else "${name(m)} is now $v"
+            }
+        }
+        return out.take(4)
+    }
+
     /** How the view moved between two looks, or null when the page reports no scroll position. */
     fun movement(before: ScrollPos?, after: ScrollPos?): String? {
         if (before == null || after == null) return null
@@ -170,14 +200,15 @@ Rules:
         fun s(k: String) = (a[k] as? JsonPrimitive)?.takeIf { it.isString }?.content?.trim()
         fun need(k: String) = s(k)?.takeIf { it.isNotEmpty() } ?: throw IllegalArgumentException("'${s("type")}' needs '$k'")
         fun element() = need("element").let { if (it.first().isDigit()) "m$it" else it }
+        val irreversible = (a["irreversible"] as? JsonPrimitive)?.booleanOrNull ?: false
         val action = when (val type = s("type")?.lowercase()) {
-            "click" -> AgentAction.Click(element())
-            "type" -> AgentAction.Type(element(), (a["text"] as? JsonPrimitive)?.contentOrNull ?: throw IllegalArgumentException("'type' needs 'text'"), (a["submit"] as? JsonPrimitive)?.booleanOrNull ?: false)
-            "key" -> AgentAction.Key(KEYS.firstOrNull { it.equals(need("key"), true) } ?: throw IllegalArgumentException("Unknown key '${s("key")}'. Use one of ${KEYS.joinToString()}"))
+            "click" -> AgentAction.Click(element(), irreversible)
+            "type" -> AgentAction.Type(s("element")?.takeIf { it.isNotEmpty() }?.let { if (it.first().isDigit()) "m$it" else it }, (a["text"] as? JsonPrimitive)?.contentOrNull ?: throw IllegalArgumentException("'type' needs 'text'"), (a["submit"] as? JsonPrimitive)?.booleanOrNull ?: false, irreversible)
+            "key" -> AgentAction.Key(KEYS.firstOrNull { it.equals(need("key"), true) } ?: throw IllegalArgumentException("Unknown key '${s("key")}'. Use one of ${KEYS.joinToString()}"), irreversible)
             "scroll" -> AgentAction.Scroll(!s("direction").equals("up", true), s("amount")?.lowercase()?.takeIf { it in AMOUNTS } ?: "page")
             "navigate" -> AgentAction.Navigate(need("url"))
             "find" -> AgentAction.Find(need("text").take(200))
-            "click_point" -> AgentAction.ClickPoint(need("description"))
+            "click_point" -> AgentAction.ClickPoint(need("description"), irreversible)
             "answer_dialog" -> AgentAction.AnswerDialog(!s("answer").equals("cancel", true), s("text"))
             "wait" -> AgentAction.Wait(((a["ms"] as? JsonPrimitive)?.intOrNull ?: 1000).toLong().coerceIn(500, 3_000))
             "ask_user" -> AgentAction.AskUser(need("question").take(400), (a["options"] as? JsonArray).orEmpty().mapNotNull { (it as? JsonPrimitive)?.contentOrNull?.trim()?.takeIf(String::isNotEmpty)?.take(120) }.take(8))
@@ -185,18 +216,20 @@ Rules:
             else -> throw IllegalArgumentException("Unknown action type '$type'")
         }
         val thought = (obj["thought"] as? JsonPrimitive)?.contentOrNull?.replace(Regex("\\s+"), " ")?.trim()?.take(300).orEmpty()
-        return AgentDecision(thought, action, a)
+        val thenDone = if ((obj["then"] as? JsonPrimitive)?.contentOrNull?.trim().equals("done", true) && action !is AgentAction.Done && action !is AgentAction.AskUser)
+            (obj["result"] as? JsonPrimitive)?.contentOrNull?.trim().orEmpty().take(8_000) else null
+        return AgentDecision(thought, action, a, thenDone)
     }
 
     /** The action as a one-line JSON for the record (the model's own text: secrets stay `{{name}}`). */
     fun actionJson(a: AgentAction): String = when (a) {
-        is AgentAction.Click -> buildJsonObject { put("type", "click"); put("element", a.element) }
-        is AgentAction.Type -> buildJsonObject { put("type", "type"); put("element", a.element); put("text", a.text); put("submit", a.submit) }
-        is AgentAction.Key -> buildJsonObject { put("type", "key"); put("key", a.key) }
+        is AgentAction.Click -> buildJsonObject { put("type", "click"); put("element", a.element); if (a.irreversible) put("irreversible", true) }
+        is AgentAction.Type -> buildJsonObject { put("type", "type"); a.element?.let { put("element", it) }; put("text", a.text); put("submit", a.submit); if (a.irreversible) put("irreversible", true) }
+        is AgentAction.Key -> buildJsonObject { put("type", "key"); put("key", a.key); if (a.irreversible) put("irreversible", true) }
         is AgentAction.Scroll -> buildJsonObject { put("type", "scroll"); put("direction", if (a.down) "down" else "up"); put("amount", a.amount) }
         is AgentAction.Navigate -> buildJsonObject { put("type", "navigate"); put("url", a.url) }
         is AgentAction.Find -> buildJsonObject { put("type", "find"); put("text", a.text) }
-        is AgentAction.ClickPoint -> buildJsonObject { put("type", "click_point"); put("description", a.description) }
+        is AgentAction.ClickPoint -> buildJsonObject { put("type", "click_point"); put("description", a.description); if (a.irreversible) put("irreversible", true) }
         is AgentAction.AnswerDialog -> buildJsonObject { put("type", "answer_dialog"); put("answer", if (a.ok) "ok" else "cancel"); a.text?.let { put("text", it) } }
         is AgentAction.Wait -> buildJsonObject { put("type", "wait"); put("ms", a.ms) }
         is AgentAction.AskUser -> buildJsonObject { put("type", "ask_user"); put("question", a.question); putJsonArray("options") { a.options.forEach { add(JsonPrimitive(it)) } } }
@@ -205,7 +238,8 @@ Rules:
 
     // ---- the only enforced guardrails ----
 
-    private val PAYMENT = Regex("""(?i)\b(pay(\s+now|\s+₹|\s+\$|\s+rs)?|place\s+(your\s+)?order|confirm\s+(and\s+pay|order|payment|purchase)|checkout\s+and\s+pay|buy\s+now|complete\s+(purchase|order|payment)|submit\s+payment|make\s+payment|proceed\s+to\s+pay)\b""")
+    /** The wording backstop behind the model's own `irreversible` flag. */
+    private val PAYMENT = Regex("""(?i)\b(pay(\s+now|\s+₹|\s+\$|\s+rs)?|place\s+(your\s+)?order|confirm\s+(and\s+pay|order|payment|purchase)|check\s?out(\s+and\s+pay)?|buy\s+now|complete\s+(purchase|order|payment)|submit\s+(payment|order)|make\s+payment|proceed\s+to\s+(pay|checkout))\b""")
 
     /** Whether a click on [label] (with [context]) would pay or place an order. */
     fun isPayment(label: String, context: String = ""): Boolean = PAYMENT.containsMatchIn(label) || (label.length <= 3 && PAYMENT.containsMatchIn(context))

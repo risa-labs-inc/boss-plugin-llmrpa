@@ -38,6 +38,8 @@ internal data class Mark(
     val hrefHost: String?,
     /** The frame the element is in (its host), when it is not in the top document. The rect is still in top-viewport px. */
     val frame: String? = null,
+    /** The element has keyboard focus (RPA Engine's look reports it). */
+    val focused: Boolean = false,
 ) {
     /** The number drawn on the image: "12" for "m12". */
     val number: String get() = id.removePrefix("m")
@@ -101,6 +103,7 @@ internal object Marks {
             context = s("context").orEmpty(), editable = b("editable"),
             hrefHost = s("href_host")?.takeIf { it.isNotBlank() },
             frame = frameName(o["frame"]),
+            focused = b("focused"),
         )
     }
 

@@ -67,6 +67,10 @@ internal class AgentLoop(
         var title: String? = null
         var pageText: String? = null
         var content: String? = null
+        var marks: List<Mark> = emptyList()
+        /** What the executor itself learned about the last action (a field's value), put in front of what the next look shows. */
+        var fieldNote: String? = null
+        var fieldChanged = false
     }
 
     suspend fun run(req: AgentRequest, run: UseRun = UseRun(req.task, clock())): UseReport {
@@ -151,6 +155,8 @@ internal class AgentLoop(
         var taken = 0
         var misses = 0
         var lastStepIndex = -1
+        // The model's "then":"done" for the action just run: the run ends done once the next look shows it changed something.
+        var pendingDone: String? = null
         while (true) {
             if (taken >= req.maxSteps) return Outcome(UseStatus.BUDGET, "Stopped at ${req.maxSteps} steps")
             var tab = st.tab
@@ -182,18 +188,26 @@ internal class AgentLoop(
                         val viewOp = op == VisionOp.SCROLL_DOWN || op == VisionOp.SCROLL_UP || op == VisionOp.KEY || op == VisionOp.PRESS_ENTER || op == VisionOp.FIND
                         val moved = if (url == st.url) AgentPrompt.movement(st.shot?.position, shot.position) else null
                         val scrolled = moved != null && !moved.startsWith("did not move")
-                        val content = if (contentChanged && url == st.url) Cu.changeSummary(st.pageText, text)?.take(120) ?: if (scrolled) null else "the page changed" else null
+                        // The elements' own state (focus, a switch, a selection, a field's fill), from the look, not the pixels.
+                        val states = if (url == st.url) AgentPrompt.stateChanges(st.marks, look.marks) else emptyList()
+                        val summary = if (contentChanged && url == st.url) Cu.changeSummary(st.pageText, text)?.take(120) else null
+                        val content = summary ?: if (contentChanged && url == st.url && !scrolled && states.isEmpty() && st.fieldNote == null) "the page changed" else null
+                        val parts = listOfNotNull(st.fieldNote) + states + listOfNotNull(moved.takeIf { scrolled || (viewOp && moved != null && !contentChanged && states.isEmpty()) }, content)
                         val result = when {
-                            url != st.url -> "now on '${shot.title.orEmpty().take(60)}' (${host(url)})"
-                            scrolled || (viewOp && moved != null && !contentChanged) -> listOfNotNull(moved, content).joinToString("; ")
-                            contentChanged -> content ?: "the page changed"
+                            url != st.url -> listOfNotNull(st.fieldNote, "now on '${shot.title.orEmpty().take(60)}' (${host(url)})").joinToString("; ")
+                            parts.isNotEmpty() -> parts.joinToString("; ")
                             else -> NOTHING
                         }
-                        val changed = contentChanged || scrolled
+                        val changed = contentChanged || scrolled || states.isNotEmpty() || st.fieldChanged
                         mem.turns[mem.turns.lastIndex] = mem.turns.last().copy(result = result, changed = changed)
                         steps[lastStepIndex] = steps[lastStepIndex].copy(result = result, contentChanged = contentChanged, changed = changed)
                         publish()
+                        val fieldWrong = st.fieldNote?.startsWith(FIELD_MISMATCH) == true
+                        pendingDone?.let { if (changed && !fieldWrong) return Outcome(UseStatus.DONE, answer = it.ifBlank { null }) }
                     }
+                    pendingDone = null
+                    st.fieldNote = null; st.fieldChanged = false
+                    st.marks = look.marks
                     st.shot = shot; st.url = url; st.title = shot.title; st.pageText = text; st.content = shot.contentHash
                     run.pageUrl.value = url
                     if (run.visited.lastOrNull()?.url != url) run.visited += PageVisit(url, shot.title.orEmpty(), steps.size)
@@ -251,6 +265,11 @@ internal class AgentLoop(
             lastStepIndex = steps.lastIndex
             publish()
             if (act.error == NO_BROWSER_NOTE) return Outcome(UseStatus.ERROR, NO_BROWSER_HINT)
+            // The last action of the task: done without another call once it is seen to have worked.
+            if (decision.thenDone != null && act.error == null) {
+                if (act.result != null) { if (act.changed == true) return Outcome(UseStatus.DONE, answer = decision.thenDone.ifBlank { null }) }
+                else pendingDone = decision.thenDone
+            }
         }
     }
 
@@ -281,18 +300,19 @@ internal class AgentLoop(
         suspend fun followed(before: Map<String, String>, wait: Boolean) = follow(run, st, tools, before, wait)
         suspend fun snapshot() = runCatching { tabs.snapshot() }.getOrDefault(emptyMap()).also { if (it.isNotEmpty()) st.known = it }
 
-        // The payment guard: a click that would pay or place an order asks first, unless the person confirmed that label.
-        fun guard(label: String, context: String): Act? {
-            if (!AgentPrompt.isPayment(label, context) || label in mem.confirmed) return null
+        // The confirm guard: an action the model marked irreversible, or a click whose wording pays or orders, asks first unless the person confirmed it.
+        fun guard(label: String, context: String, irreversible: Boolean): Act? {
+            if (!(irreversible || AgentPrompt.isPayment(label, context)) || label in mem.confirmed) return null
             mem.pendingConfirm = label
-            return Act(VisionOp.CLICK, "click", label, notRun = true, ask = Outcome(UseStatus.NEEDS_INPUT, "About to '${label.take(80)}', which may pay or place an order",
+            val why = if (irreversible) "which cannot be undone" else "which may pay or place an order"
+            return Act(VisionOp.CLICK, "click", label, notRun = true, ask = Outcome(UseStatus.NEEDS_INPUT, "About to '${label.take(80)}', $why",
                 "About to '${label.take(80)}'. Confirm?", listOf("Confirm", "Cancel")))
         }
 
         return when (a) {
             is AgentAction.Click -> {
                 val m = mark(a.element) ?: return Act(VisionOp.CLICK, "click", a.element, error = noMark(a.element), notRun = true)
-                guard(m.label, m.context)?.let { return it }
+                guard(m.label, m.context, a.irreversible)?.let { return it }
                 val t = checkNotNull(tab)
                 val before = snapshot()
                 val r = tools.invoke(ToolNames.STEP, Cu.step(t, "click_at", "${m.centreX.roundToInt()},${m.centreY.roundToInt()}", pointer, element = m.id))
@@ -301,30 +321,57 @@ internal class AgentLoop(
                 Act(VisionOp.CLICK, "click", m.short, t, error = e, refused = refusal != null, popup = if (e == null) followed(before, true) else null)
             }
             is AgentAction.Type -> {
-                val m = mark(a.element) ?: return Act(VisionOp.TYPE_TEXT, "type", a.element, error = noMark(a.element), notRun = true)
-                val supplied = AgentPrompt.personSupplied(a.text, run.inputs, req.task)
-                if (AgentPrompt.isPrivateField(m) && !supplied) return Act(VisionOp.TYPE_TEXT, "type", m.short, notRun = true,
-                    error = "only text the person gave goes into a password, code or card field: type a named input as {{name}}, or ask_user")
-                val value = Cu.fillInputs(a.text, run.inputs) ?: return Act(VisionOp.TYPE_TEXT, "type", m.short, notRun = true,
-                    error = "unknown input in '${a.text.take(60)}'; the inputs are: ${run.inputs.keys.joinToString().ifEmpty { "none" }}")
-                val private = AgentPrompt.isPrivateField(m) || PLACEHOLDER_SECRET.findAll(a.text).any { Cu.secretName(it.groupValues[1]) }
-                if (private && value !in tools.secrets) tools.secrets.add(value)
                 val t = checkNotNull(tab)
+                // With an element, that one; without, the field that has focus (after a click_point on an unmarked field), asked of the engine.
+                val m = a.element?.let { mark(it) ?: return Act(VisionOp.TYPE_TEXT, "type", it, error = noMark(it), notRun = true) }
+                val focused = if (m == null) tools.invoke(ToolNames.STEP, Cu.step(t, "focused")).json?.let(Cu::parseFocused) else null
+                if (m == null && focused != null && !focused.editable && !focused.tag.equals("select", true))
+                    return Act(VisionOp.TYPE_TEXT, "type", "the focused element", notRun = true, error = "no text field has focus (${focused.tag.ifBlank { "nothing" }} '${focused.label.take(40)}'); click the field first")
+                val label = m?.short ?: focused?.let { "${it.tag.ifBlank { "field" }} '${it.label.take(40)}'" } ?: "the focused field"
+                val privateField = m?.let(AgentPrompt::isPrivateField) ?: focused?.let(Cu::sensitiveField) ?: false
+                val supplied = AgentPrompt.personSupplied(a.text, run.inputs, req.task)
+                if (privateField && !supplied) return Act(VisionOp.TYPE_TEXT, "type", label, notRun = true,
+                    error = "only text the person gave goes into a password, code or card field: type a named input as {{name}}, or ask_user")
+                val value = Cu.fillInputs(a.text, run.inputs) ?: return Act(VisionOp.TYPE_TEXT, "type", label, notRun = true,
+                    error = "unknown input in '${a.text.take(60)}'; the inputs are: ${run.inputs.keys.joinToString().ifEmpty { "none" }}")
+                val private = privateField || PLACEHOLDER_SECRET.findAll(a.text).any { Cu.secretName(it.groupValues[1]) }
+                if (private && value !in tools.secrets) tools.secrets.add(value)
+                val desc = "type '${if (private) a.text.takeIf { PLACEHOLDER_SECRET.matches(it.trim()) } ?: Secrets.MASK else a.text.take(80)}'${if (a.submit) " and Enter" else ""}"
+                if (a.irreversible) guard("$desc into $label", "", true)?.let { return it }
                 val before = snapshot()
-                val r = tools.invoke(ToolNames.STEP, buildJsonObject {
+                suspend fun typeOnce() = tools.invoke(ToolNames.STEP, buildJsonObject {
                     put("tab_id", t)
                     // The engine refuses a sensitive field without it; only the person's own text gets it.
                     if (supplied) put("allow_sensitive", true)
-                    putJsonObject("action") { put("type", "type_text"); put("value", value); put("element", m.id) }
+                    putJsonObject("action") { put("type", "type_text"); put("value", value); m?.let { put("element", it.id) } }
                     putJsonObject("pointer") { put("label", pointer) }
                 })
+                var r = typeOnce()
                 var e = err(r)
+                // What the field reads now, as the engine reports it (value, or value_ok for a sensitive field): a mismatch is retyped once.
+                var check = if (e == null) fieldCheck(r.json, value) else null
+                var retyped = false
+                if (check == false) {
+                    retyped = true
+                    err(tools.invoke(ToolNames.STEP, Cu.step(t, "key", "ctrl+a")))
+                    r = typeOnce(); e = err(r)
+                    check = if (e == null) fieldCheck(r.json, value) else null
+                }
+                if (e == null) {
+                    val reads = (r.json?.get("value") as? JsonPrimitive)?.takeIf { it.isString }?.content
+                    st.fieldNote = when (check) {
+                        true -> if (private || reads == null) "the field holds the typed text" else "field now reads '${reads.take(80)}'"
+                        false -> FIELD_MISMATCH + (if (!private && reads != null) ": it reads '${reads.take(80)}'" else "") + if (retyped) " (retyped once)" else ""
+                        null -> null
+                    }?.let { if (retyped && check == true) "$it (retyped once)" else it }?.let { Secrets.mask(it, tools.secrets) }
+                    st.fieldChanged = check == true
+                }
                 if (e == null && a.submit) e = err(tools.invoke(ToolNames.STEP, Cu.step(t, "key", "Enter", pointer)))
                 val shown = if (private) Secrets.MASK else a.text.take(200)
-                Act(VisionOp.TYPE_TEXT, "type '${if (private) a.text.takeIf { PLACEHOLDER_SECRET.matches(it.trim()) } ?: Secrets.MASK else a.text.take(80)}'${if (a.submit) " and Enter" else ""}",
-                    m.short, t, text = shown, error = e, popup = if (e == null && a.submit) followed(before, true) else null)
+                Act(VisionOp.TYPE_TEXT, desc, label, t, text = shown, error = e, popup = if (e == null && a.submit) followed(before, true) else null)
             }
             is AgentAction.Key -> {
+                if (a.irreversible) guard("press ${a.key}${marks.firstOrNull { it.focused }?.let { " in ${it.short}" }.orEmpty()}", "", true)?.let { return it }
                 val t = checkNotNull(tab)
                 val before = snapshot()
                 val e = err(tools.invoke(ToolNames.STEP, Cu.step(t, "key", a.key, pointer)))
@@ -369,7 +416,7 @@ internal class AgentLoop(
                 }
             }
             is AgentAction.ClickPoint -> {
-                guard(a.description, "")?.let { return it }
+                guard(a.description, "", a.irreversible)?.let { return it }
                 val t = checkNotNull(tab)
                 val shot = st.shot ?: return Act(VisionOp.CLICK, "click_point", a.description, error = "no screenshot yet", notRun = true)
                 val box = jevBox(tools, req, shot, a.description).getOrElse { return Act(VisionOp.CLICK, "click_point", a.description.take(80), error = it.message, notRun = true) }
@@ -390,6 +437,13 @@ internal class AgentLoop(
             is AgentAction.Wait -> { delay(a.ms); Act(VisionOp.WAIT, "wait ${a.ms} ms", null, tab) }
             is AgentAction.AskUser, is AgentAction.Done -> error("handled by the loop")
         }
+    }
+
+    /** Whether the field holds [typed], from type_text's `value` (compared trimmed) or `value_ok`; null when the engine does not say. */
+    private fun fieldCheck(reply: JsonObject?, typed: String): Boolean? {
+        (reply?.get("value_ok") as? JsonPrimitive)?.booleanOrNull?.let { return it }
+        val v = (reply?.get("value") as? JsonPrimitive)?.takeIf { it.isString }?.content ?: return null
+        return v.trim() == typed.trim() || v.replace(Regex("\\s+"), " ").trim() == typed.replace(Regex("\\s+"), " ").trim()
     }
 
     /** Jev's box question for an element the look did not mark, on the plain screenshot. */
@@ -521,6 +575,7 @@ internal class AgentLoop(
     companion object {
         const val NOTHING = "nothing changed"
         const val NOT_DONE = "not done"
+        const val FIELD_MISMATCH = "field value doesn't match"
         const val MAX_MISSES = 3
         private const val NO_BROWSER_NOTE = "NO_BROWSER"
         private val CONFIRM = Regex("""(?i)\s*(confirm(ed)?|yes|ok(ay)?|go ahead|proceed|1)\s*[.!]?\s*""")

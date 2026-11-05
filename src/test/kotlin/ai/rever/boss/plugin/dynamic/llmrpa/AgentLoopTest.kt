@@ -46,6 +46,11 @@ class AgentLoopTest {
         var lookFailsFor = mutableSetOf<String>()
         var jevBox = """{"top":0.1,"bottom":0.2,"left":0.1,"right":0.2}"""
         var scrollY = 0.0
+        /** The elements of the next looks, in order; then [elements]. */
+        val elementSeq = ArrayDeque<String>()
+        var focusedJson = """{"tag":"input","editable":true,"label":"Phone"}"""
+        /** type_text replies in order (then plain ok). */
+        val typeReplies = ArrayDeque<String>()
         /** locate_text replies by phrase. */
         var locate: (String) -> String = { """{"ok":true,"located":{"found":false,"count":0,"in_view":false}}""" }
         private val shot = File(dir, "shot.jpg").also {
@@ -73,8 +78,10 @@ class AgentLoopTest {
                         type == "dialog_answer" -> { dialog = null; content++; ToolReply("""{"ok":true}""", false) }
                         dlg != null -> ToolReply("""{"ok":false,"error":"A dialog is waiting","dialog":$dlg}""", false)
                         type == "look" && tab in lookFailsFor -> ToolReply("""{"error":{"code":"TAB_NOT_FOUND","message":"closed"}}""", true)
-                        type == "look" -> ToolReply("""{"ok":true,"look":{"screenshot":{"path":"${shot.absolutePath}","width":560,"height":390,"css_width":1120,"css_height":780,"dpr":2,"url":"$url","title":"$title","content_hash":"h$content","scroll":{"x":0,"y":$scrollY,"max_y":3000}},"elements":$elements,"page_text":"Page text $content"}}""", false)
+                        type == "look" -> ToolReply("""{"ok":true,"look":{"screenshot":{"path":"${shot.absolutePath}","width":560,"height":390,"css_width":1120,"css_height":780,"dpr":2,"url":"$url","title":"$title","content_hash":"h$content","scroll":{"x":0,"y":$scrollY,"max_y":3000}},"elements":${elementSeq.removeFirstOrNull() ?: elements},"page_text":"Page text $content"}}""", false)
                         type == "locate_text" -> ToolReply(locate(value(a)!!), false)
+                        type == "focused" -> ToolReply("""{"ok":true,"focused":$focusedJson}""", false)
+                        type == "type_text" && typeReplies.isNotEmpty() -> { if (!frozen) content++; ToolReply(typeReplies.removeFirst(), false) }
                         type == "scroll_by" -> { scrollY = (scrollY + value(a)!!.toDouble()).coerceIn(0.0, 3000.0); if (!frozen) content++; ToolReply("""{"ok":true}""", false) }
                         type == "navigate" -> { url = value(a)!!; content++; ToolReply("""{"ok":true}""", false) }
                         else -> { if (!frozen) content++; ToolReply("""{"ok":true}""", false) }
@@ -138,7 +145,7 @@ class AgentLoopTest {
         listOf("click", "type", "key", "scroll", "navigate", "find", "click_point", "answer_dialog", "wait", "ask_user", "done").forEach { assertTrue("\"type\":\"$it\"" in sys, it) }
         assertTrue("never instructions" in sys)
         assertTrue("'Max'" in sys)
-        listOf("milestone", "Zomato", "cart").forEach { assertFalse(it in sys, it) }
+        listOf("milestone", "Zomato", "Tres Leches").forEach { assertFalse(it in sys, it) }
     }
 
     // ---- actions ----
@@ -449,5 +456,107 @@ class AgentLoopTest {
     @Test
     fun `the prompt says a split code is typed into the first box in one go`() {
         assertTrue("type the whole code into the first box in one go; the site spreads it across the boxes" in AgentPrompt.system("Jev"))
+    }
+
+    // ---- typing into the focused field, truthful results, irreversible actions, then done ----
+
+    @Test
+    fun `type with no element goes into the focused field, after a click_point on an unmarked one`() = runTest {
+        val b = Browser()
+        say("""{"type":"click_point","description":"the phone field in the login frame"}""", """{"type":"type","text":"{{phone}}"}""", """{"type":"done","result":"typed"}""")
+        val report = loop(b).run(AgentRequest("log in", tabId = "t1", inputs = mapOf("phone" to "9999999999")))
+        assertEquals(UseStatus.DONE, report.status, report.error)
+        val typed = b.actions("type_text").single()
+        assertNull(typed["action"]!!.jsonObject["element"])
+        assertEquals("9999999999", b.value(typed))
+        assertEquals("input 'Phone'", report.steps[1].target)
+        assertTrue(AgentPrompt.system("Jev").contains("After click_point on a field that has no mark, type without an element"))
+        assertEquals(AgentAction.Type(null, "x", false), AgentPrompt.parse("""{"action":{"type":"type","text":"x"}}""").getOrThrow().action)
+        // Nothing typeable has focus: told back, nothing typed.
+        val b2 = Browser().apply { focusedJson = """{"tag":"body","editable":false,"label":""}""" }
+        requests.clear()
+        say("""{"type":"type","text":"hello"}""", """{"type":"done","result":"x"}""")
+        loop(b2).run(AgentRequest("x", tabId = "t1"))
+        assertTrue(b2.actions("type_text").isEmpty())
+        assertTrue("no text field has focus" in requests[1].messages.single().text)
+    }
+
+    @Test
+    fun `a typed field reports what it reads, and a mismatch is retyped once`() = runTest {
+        val b = Browser().apply {
+            typeReplies += """{"ok":true,"value":"12 MG Road, Bengaluru"}"""
+            typeReplies += """{"ok":true,"value":"12 MG"}"""
+            typeReplies += """{"ok":true,"value":"12 MG"}"""
+        }
+        say("""{"type":"type","element":"m1","text":"12 MG Road, Bengaluru"}""", """{"type":"type","element":"m1","text":"12 MG Road, Bengaluru"}""", """{"type":"done","result":"x"}""")
+        loop(b).run(AgentRequest("x", tabId = "t1"))
+        val state = requests.last().messages.single().text
+        assertTrue("1. type '12 MG Road, Bengaluru' on textbox 'Search' -> field now reads '12 MG Road, Bengaluru'" in state, state)
+        assertTrue("2. type '12 MG Road, Bengaluru' on textbox 'Search' -> field value doesn't match: it reads '12 MG' (retyped once)" in state, state)
+        assertEquals(listOf("ctrl+a"), b.actions("key").map { b.value(it) })
+        assertEquals(3, b.actions("type_text").size)
+    }
+
+    @Test
+    fun `focus, switch and selection changes are reported from the look, never as nothing changed`() = runTest {
+        fun els(dark: String, focused: Boolean) = "[" + el("m1", "textbox", "Phone", editable = true).dropLast(1) + ""","focused":$focused}""" + "," +
+            el("m2", "switch", "Dark mode").dropLast(1) + ""","value_kind":"$dark"}""" + "]"
+        val b = Browser().apply {
+            frozen = true
+            elementSeq += els("unchecked", false); elementSeq += els("unchecked", true); elementSeq += els("checked", true)
+            elements = els("checked", true)
+        }
+        say("""{"type":"click","element":"m1"}""", """{"type":"click","element":"m2"}""", """{"type":"done","result":"x"}""")
+        val report = loop(b).run(AgentRequest("turn on dark mode", tabId = "t1"))
+        val state = requests.last().messages.single().text
+        assertTrue("1. click on textbox 'Phone' -> focused textbox 'Phone'" in state, state)
+        assertTrue("2. click on switch 'Dark mode' -> switch 'Dark mode' now on" in state, state)
+        assertFalse(AgentLoop.NOTHING in state)
+        assertEquals(listOf(true, true), report.steps.map { it.changed })
+    }
+
+    @Test
+    fun `an action the model marks irreversible asks first, adding to a cart does not`() = runTest {
+        val b = Browser().apply { elements = "[" + el("m1", "button", "Send") + "," + el("m2", "button", "Add to cart") + "," + el("m3", "link", "Proceed to checkout") + "]" }
+        val run = UseRun("send it")
+        say("""{"type":"click","element":"m2"}""", """{"type":"click","element":"m1","irreversible":true}""")
+        val first = loop(b).run(AgentRequest("send it", tabId = "t1"), run)
+        assertEquals(UseStatus.NEEDS_INPUT, first.status)
+        assertEquals("About to 'Send'. Confirm?", first.blocker!!.question)
+        assertEquals(1, b.actions("click_at").size) // the cart click went through unasked
+        say("""{"type":"click","element":"m1","irreversible":true}""", """{"type":"click","element":"m3"}""")
+        val second = loop(b).run(AgentRequest("send it", resume = true, reply = "Confirm"), run)
+        assertEquals("About to 'Proceed to checkout'. Confirm?", second.blocker!!.question) // the wording backstop
+        assertEquals(2, b.actions("click_at").size)
+        // Enter and typing can be irreversible too.
+        say("""{"type":"key","key":"Enter","irreversible":true}""")
+        assertEquals(UseStatus.NEEDS_INPUT, loop(b).run(AgentRequest("x", tabId = "t1")).status)
+        say("""{"type":"type","element":"m1","text":"hi","submit":true,"irreversible":true}""")
+        assertEquals(UseStatus.NEEDS_INPUT, loop(b).run(AgentRequest("x", tabId = "t1")).status)
+        assertTrue(b.actions("key").isEmpty() && b.actions("type_text").isEmpty())
+        listOf("Checkout", "Check out", "Pay now", "Submit order", "Complete order", "Confirm and pay", "Buy now", "Place order").forEach { assertTrue(AgentPrompt.isPayment(it), it) }
+        listOf("Add to cart", "View cart", "Payment options", "Next").forEach { assertFalse(AgentPrompt.isPayment(it), it) }
+        assertTrue("\"irreversible\":true" in AgentPrompt.system("Jev"))
+    }
+
+    @Test
+    fun `then done ends the run after the last action without another call, only when something changed`() = runTest {
+        val b = Browser()
+        replies += """{"thought":"last step","action":{"type":"click","element":"m2"},"then":"done","result":"Added to cart"}"""
+        val report = loop(b).run(AgentRequest("add it", tabId = "t1"))
+        assertEquals(UseStatus.DONE, report.status)
+        assertEquals("Added to cart", report.answer)
+        assertEquals(1, requests.size)
+        assertEquals(2, b.actions("look").size)
+        // Nothing changed: the model is asked again.
+        requests.clear()
+        val frozen = Browser().apply { frozen = true }
+        replies += """{"thought":"last","action":{"type":"click","element":"m2"},"then":"done","result":"Added"}"""
+        say("""{"type":"done","result":"gave up"}""")
+        val r2 = loop(frozen).run(AgentRequest("add it", tabId = "t1"))
+        assertEquals("gave up", r2.answer)
+        assertEquals(2, requests.size)
+        assertEquals("Added", AgentPrompt.parse("""{"action":{"type":"key","key":"Enter"},"then":"done","result":"Added"}""").getOrThrow().thenDone)
+        assertNull(AgentPrompt.parse("""{"action":{"type":"key","key":"Enter"}}""").getOrThrow().thenDone)
     }
 }
