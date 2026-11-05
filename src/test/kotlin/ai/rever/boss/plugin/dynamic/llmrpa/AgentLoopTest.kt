@@ -493,8 +493,25 @@ class AgentLoopTest {
         val state = requests.last().messages.single().text
         assertTrue("1. type '12 MG Road, Bengaluru' on textbox 'Search' -> field now reads '12 MG Road, Bengaluru'" in state, state)
         assertTrue("2. type '12 MG Road, Bengaluru' on textbox 'Search' -> field value doesn't match: it reads '12 MG' (retyped once)" in state, state)
-        assertEquals(listOf("ctrl+a"), b.actions("key").map { b.value(it) })
-        assertEquals(3, b.actions("type_text").size)
+        assertTrue(b.actions("key").isEmpty()) // no key chord: type_text replaces the field itself
+        val types = b.actions("type_text")
+        assertEquals(3, types.size)
+        assertEquals(types[1]["action"], types[2]["action"]) // the retype is the same call, same element
+        // An engine that already retried says so, and is not retried a second time.
+        requests.clear()
+        val b2 = Browser().apply { typeReplies += """{"ok":true,"value":"12 MG","retyped":true}""" }
+        say("""{"type":"type","element":"m1","text":"12 MG Road"}""", """{"type":"done","result":"x"}""")
+        loop(b2).run(AgentRequest("x", tabId = "t1"))
+        assertEquals(1, b2.actions("type_text").size)
+        assertTrue("-> field value doesn't match: it reads '12 MG' (retyped once)" in requests.last().messages.single().text)
+        // The focused field (no element) is retyped with no element too.
+        requests.clear()
+        val b3 = Browser().apply { typeReplies += """{"ok":true,"value":"x"}"""; typeReplies += """{"ok":true,"value":"hello"}""" }
+        say("""{"type":"type","text":"hello"}""", """{"type":"done","result":"x"}""")
+        loop(b3).run(AgentRequest("x", tabId = "t1"))
+        assertEquals(2, b3.actions("type_text").size)
+        assertTrue(b3.actions("type_text").all { it["action"]!!.jsonObject["element"] == null })
+        assertTrue("-> field now reads 'hello' (retyped once)" in requests.last().messages.single().text)
     }
 
     @Test

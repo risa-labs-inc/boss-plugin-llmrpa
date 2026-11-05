@@ -350,10 +350,11 @@ internal class AgentLoop(
                 var e = err(r)
                 // What the field reads now, as the engine reports it (value, or value_ok for a sensitive field): a mismatch is retyped once.
                 var check = if (e == null) fieldCheck(r.json, value) else null
-                var retyped = false
-                if (check == false) {
+                // type_text replaces the field's content itself (select-all in the owning frame), so a retype is just type_text again.
+                // An engine that already retried says so (`retyped`); then it is not retried here a second time.
+                var retyped = (r.json?.get("retyped") as? JsonPrimitive)?.booleanOrNull == true
+                if (check == false && !retyped) {
                     retyped = true
-                    err(tools.invoke(ToolNames.STEP, Cu.step(t, "key", "ctrl+a")))
                     r = typeOnce(); e = err(r)
                     check = if (e == null) fieldCheck(r.json, value) else null
                 }
