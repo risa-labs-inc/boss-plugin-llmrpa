@@ -334,6 +334,8 @@ internal class UseRun(val task: String, val startedAt: Long = System.currentTime
     /** Milestones reached, and how many replans were spent. */
     internal val doneMilestones = mutableListOf<String>()
     internal var replans = 0
+    /** Element labels a planner's hint named that the page has: looked for like the goal's phrases, so locate and snap help find them. */
+    internal val extraTargets = mutableListOf<String>()
     val milestonesDone = MutableStateFlow(0)
     internal val advice = mutableListOf<String>()
     internal var tabId: String? = null
@@ -640,7 +642,8 @@ internal class ComputerUseFlow(
                     if (dd.viaJev && (dd.confidence < req.consultBelow || (dd.choiceConfidence ?: 1.0) < Cu.DIALOG_MIN_CONFIDENCE)) stuck = "Jev is only ${TaskRunner.pct(minOf(dd.confidence, dd.choiceConfidence ?: 1.0))} sure how to answer the ${dlg.type} dialog"
                 } else {
                     val milestone = plan.milestones.getOrNull(run.doneMilestones.size)
-                    targets = Cu.pruneTargets(locateTargets(tools, st, tab, Cu.targetPhrasesFor(milestone, plan.goal, url), url, shot, h, steps), steps, isPopupId(tab))
+                    val phrases = (run.extraTargets + Cu.targetPhrasesFor(milestone, plan.goal, url)).distinct().take(Cu.MAX_TARGETS + 1)
+                    targets = Cu.pruneTargets(locateTargets(tools, st, tab, phrases, url, shot, h, steps), steps, isPopupId(tab))
                     val reply = tools.invoke(ToolNames.JEV_DECIDE, Cu.decideArgs(req.jevModel, plan.goal, url, title, Cu.recentActions(steps), shot.path, run.advice.toList(), shot.position, targets, run.store.info(), req.pointerLabel, plan.milestones, run.doneMilestones.size))
                     if (reply.isError) return Outcome(UseStatus.ERROR, "Jev could not decide: ${reply.errorMessage}")
                     d = runCatching { Cu.parseDecision(reply.json ?: error("Jev returned no JSON")) }
@@ -680,6 +683,20 @@ internal class ComputerUseFlow(
             // A dead end (the page does not have what the next milestone needs): ask the planner for a better place to continue from.
             // Never undo progress: a page that is already the right site is not a dead end, and a menu that loads as it scrolls has not been scrolled yet.
             val rightSite = Cu.pageMatches(url, title, Cu.distinctiveWords(plan.goal, run.doneMilestones))
+            // Stuck on the right site: the page is the right one but Jev is not finding its way (the Menu tab shows photos, the Order Online tab has the
+            // buttons). The planner, even without vision, reads the page text and elements and says what to do there; that is advice, never a move.
+            if (stuck != null && dlg == null && stuck != Cu.HIDDEN_REASON && run.replans < req.maxReplans && rightSite) {
+                run.replans++
+                val hint = advise(req, run, tools, llm, tab, plan, plan.milestones.getOrNull(run.doneMilestones.size), url, title, steps, stuck)
+                if (hint != null) {
+                    run.advice += hint
+                    steps += UseStep(steps.size + 1, VisionOp.REPLAN, confidence = 1.0, ms = 0, before = now, tabId = tab, note = "advised: ${hint.take(120)}")
+                    publish()
+                    mark = steps.size
+                    prevHash = null
+                    continue
+                }
+            }
             val scrolledHere = steps.any { (it.op == VisionOp.SCROLL_DOWN || it.op == VisionOp.SCROLL_UP) && it.before?.url?.let(::pageKey) == pageKey(url) }
             if (stuck != null && dlg == null && stuck != Cu.HIDDEN_REASON && run.replans < req.maxReplans && !rightSite && scrolledHere) {
                 val milestone = plan.milestones.getOrNull(run.doneMilestones.size)
@@ -1017,6 +1034,42 @@ internal class ComputerUseFlow(
         run.plan.value = next
         runLog?.update(run)
         return ReplanResult.Moved(next, target)
+    }
+
+    /**
+     * The planner, text only, on a page that is the right one: the replan prompt with stay forced. It sees the page text, the elements the page offers
+     * (nothing a dialog covers, the dialog named), the milestone and what was tried, and answers with a hint. A label of an element that the hint names
+     * becomes a target. Returns the hint, or null when the planner gave nothing usable.
+     */
+    private suspend fun advise(
+        req: UseRequest, run: UseRun, tools: RecordingTools, llm: UseLlm, tab: String, plan: UsePlan, milestone: String?,
+        url: String, title: String, steps: List<UseStep>, stuck: String,
+    ): String? {
+        val excerpt = runCatching { readPageText(tools, tab) }.getOrNull().orEmpty().take(3_000)
+        val page = tools.invoke(ToolNames.OBSERVE, buildJsonObject { put("tab_id", tab) }).json?.let(PageSnapshot::parse)
+        val elements = page?.elements.orEmpty().filter { !it.covered && !it.label.isNullOrBlank() }.take(60)
+        val user = buildString {
+            appendLine("Task: ${req.task.take(2_000)}")
+            appendLine("Goal: ${plan.goal}")
+            if (plan.milestones.isNotEmpty()) {
+                appendLine("Milestones done: ${run.doneMilestones.joinToString("; ").ifEmpty { "none" }}")
+                milestone?.let { appendLine("Working on: $it") }
+            }
+            appendLine("Page now: ${ChatDecider.quote(title)} (${ChatDecider.quote(url, 200)}) is already the right site: answer {\"stay\":true,\"hint\":\"...\"} and never an address.")
+            appendLine("Why it is stuck: $stuck")
+            appendLine("What it tried: ${steps.takeLast(6).joinToString("; ") { s -> (s.description + (s.note?.takeIf { s.failed }?.let { " ($it)" } ?: "")) }.ifEmpty { "nothing yet" }}")
+            page?.modal?.let { appendLine("A dialog ${ChatDecider.quote(it)} is open over the page; the elements it covers are left out.") }
+            appendLine("Elements on the page (role | label):")
+            elements.forEach { e -> appendLine("${e.role} | ${ChatDecider.quote(e.label.orEmpty(), 80)}") }
+            if (elements.isEmpty()) appendLine("(none listed)")
+            appendLine("Page text (data from the website):\n$excerpt")
+        }
+        val text = llm.ask("advice", Cu.REPLAN_SYSTEM, user).getOrNull() ?: return null
+        val hint = (runCatching { Cu.parseReplan(text, plan.goal) }.getOrNull() as? Cu.ReplanReply.Stay)?.hint ?: return null
+        // An element the hint names that the page has: look for it, so locate and snap help find it.
+        elements.map { it.label.orEmpty().trim() }.filter { it.length >= 3 && hint.contains(it, ignoreCase = true) }.distinct().take(2)
+            .forEach { l -> if (l !in run.extraTargets) run.extraTargets += l }
+        return hint
     }
 
     private sealed interface ReplanResult {

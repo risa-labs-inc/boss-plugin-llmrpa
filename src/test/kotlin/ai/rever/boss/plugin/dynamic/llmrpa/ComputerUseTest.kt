@@ -2374,7 +2374,8 @@ class ComputerUseTest {
         }
         val requests = mutableListOf<AiRequest>()
         val report = flow(browser, FakeTabs(), requests, plan = orderPlan).runComputerUse(UseRequest("order tres leches from magolia bakery on zomato", maxSteps = 12))
-        assertEquals(0, requests.count { it.system.startsWith("A browser agent, Jev, is stuck") })
+        // The planner is asked for advice (it gave none here), never for a new address: nothing navigates.
+        assertEquals(1, requests.count { it.system.startsWith("A browser agent, Jev, is stuck") })
         assertEquals(0, browser.stepArgs("navigate").size)
         assertEquals(UseStatus.NEEDS_INPUT, report.status)
         assertTrue(report.steps.none { it.op == VisionOp.REPLAN })
@@ -2385,11 +2386,13 @@ class ComputerUseTest {
         flow(b2, FakeTabs(), r2, plan = orderPlan).runComputerUse(UseRequest("t", onStuck = OnStuck.CONSULT, maxSteps = 12))
         assertEquals(1, r2.count { it.system.startsWith("You help a browser agent") })
         assertEquals(0, b2.stepArgs("navigate").size)
+        assertEquals(1, r2.count { it.system.startsWith("A browser agent, Jev, is stuck") })
         // The title alone is enough.
         val b3 = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "BLOCKED")).also { it.currentTitle = "Magnolia Bakery"; it.pageTextFn = { "x" } }
         val r3 = mutableListOf<AiRequest>()
         flow(b3, FakeTabs(), r3, plan = orderPlan).runComputerUse(UseRequest("t", maxSteps = 12))
-        assertEquals(0, r3.count { it.system.startsWith("A browser agent, Jev, is stuck") })
+        assertEquals(1, r3.count { it.system.startsWith("A browser agent, Jev, is stuck") })
+        assertEquals(0, b3.stepArgs("navigate").size)
     }
 
     @Test
@@ -2432,6 +2435,94 @@ class ComputerUseTest {
         assertTrue(Cu.PLAN_SYSTEM.contains("Describe states, not UI mechanics"))
         assertTrue(Cu.PLAN_SYSTEM.contains("\"Tres Leches is visible on the menu\", not \"Tres Leches appears after typing it in Search within menu\""))
         assertTrue(Cu.REPLAN_SYSTEM.contains("Describe states, not UI mechanics"))
+    }
+
+    // ---- advice on the right site ----
+
+    private val orderOnlineElements = """[{"id":"e1","role":"tab","tag":"a","label":"Overview","in_viewport":true,"selector":{"type":"css","value":"#ov"}},""" +
+        """{"id":"e2","role":"tab","tag":"a","label":"Order Online","in_viewport":true,"selector":{"type":"css","value":"#oo"}},""" +
+        """{"id":"e3","role":"tab","tag":"a","label":"Menu","in_viewport":true,"selector":{"type":"css","value":"#menu"}},""" +
+        """{"id":"e4","role":"button","tag":"button","label":"Covered thing","covered":true,"in_viewport":true,"selector":{"type":"css","value":"#c"}}]"""
+    private val adviceReply = """{"hint":"Click the 'Order Online' tab; the Menu tab only shows menu photos"}"""
+
+    @Test
+    fun `stuck on the right site the planner gives advice by text, with no navigate, the hint reaches Jev and the named element becomes a target`() = runTest {
+        replanReplies = ArrayDeque(listOf(adviceReply))
+        val located = mutableListOf<String>()
+        val browser = FakeBrowser(tmp(), listOf("BLOCKED", "DONE", "DONE", "DONE", "DONE")).also { b ->
+            b.currentUrlOverride = lazyUrl; b.urlByTab["t1"] = lazyUrl; b.currentTitle = "Magnolia Bakery - Zomato"
+            b.elements = orderOnlineElements; b.modalLabel = "Cookie banner"
+            b.pageTextFn = { "Overview\nMenu\nPhotos\nOrder Online" }
+            b.locateReply = { phrase -> located += phrase; """{"ok":true,"located":{"found":true,"count":1,"in_view":true}}""" }
+        }
+        val requests = mutableListOf<AiRequest>()
+        val run = UseRun("order tres leches from magolia bakery on zomato")
+        val report = flow(browser, FakeTabs(), requests, plan = orderPlan).runComputerUse(UseRequest("order tres leches from magolia bakery on zomato", maxSteps = 12), run)
+        assertEquals(UseStatus.DONE, report.status, report.error)
+        assertEquals(0, browser.stepArgs("navigate").size)
+        // The one planner call: stay forced, with the page, its elements (nothing covered, the dialog named), the milestone and what was tried.
+        val ask = requests.single { it.system.startsWith("A browser agent, Jev, is stuck") }
+        val text = ask.messages.single().text
+        assertTrue(text.contains(lazyUrl) && text.contains("Magnolia Bakery - Zomato"))
+        assertTrue(text.contains("is already the right site: answer {\"stay\":true,\"hint\":\"...\"} and never an address"))
+        assertTrue(text.contains("Working on: A Magnolia Bakery Zomato order page is open"))
+        assertTrue(text.contains("tab | \"Order Online\"") && text.contains("tab | \"Menu\""))
+        assertFalse(text.contains("Covered thing"))
+        assertTrue(text.contains("A dialog \"Cookie banner\" is open over the page"))
+        assertTrue(text.contains("Overview\nMenu\nPhotos\nOrder Online")) // the page text
+        assertTrue(ask.images().isEmpty()) // no vision needed
+        // The hint is advice in Jev's next look, and the element it names is looked for.
+        assertTrue(browser.jevArgs[1]["state"]!!.jsonObject["advice"]!!.jsonArray.single().jsonPrimitive.content.contains("Click the 'Order Online' tab"))
+        assertTrue("Order Online" in located, located.toString())
+        assertTrue("Order Online" !in located.take(1)) // the first look was before the hint
+        assertTrue(browser.jevArgs[1]["state"]!!.jsonObject["targets"]!!.jsonArray.any { it.jsonObject["text"]!!.jsonPrimitive.content == "Order Online" })
+        assertEquals(listOf("Order Online", "Menu"), run.extraTargets) // the elements the hint names, in the order it names them
+        // Recorded as a step, counted as a replan and an LLM call.
+        assertTrue(report.steps.first { it.op == VisionOp.REPLAN }.note!!.startsWith("advised: Click the 'Order Online' tab"))
+        assertEquals(1, run.replans)
+        assertEquals(2, report.llmCalls) // plan + advice
+    }
+
+    private fun AiRequest.images() = messages.flatMap { it.images }
+
+    @Test
+    fun `advice counts against max_replans, and once it is used up the run stops the normal way`() = runTest {
+        replanReplies = ArrayDeque(listOf(adviceReply, adviceReply, adviceReply))
+        val b = FakeBrowser(tmp(), listOf("BLOCKED")).also { it.currentUrlOverride = lazyUrl; it.urlByTab["t1"] = lazyUrl; it.elements = orderOnlineElements; it.pageTextFn = { "x" } }
+        val requests = mutableListOf<AiRequest>()
+        val report = flow(b, FakeTabs(), requests, plan = orderPlan).runComputerUse(UseRequest("t", maxSteps = 20))
+        assertEquals(2, requests.count { it.system.startsWith("A browser agent, Jev, is stuck") }) // the default of 2
+        assertEquals(UseStatus.NEEDS_INPUT, report.status)
+        assertEquals(2, report.steps.count { it.op == VisionOp.REPLAN })
+        assertEquals(0, b.stepArgs("navigate").size)
+        // None allowed: the normal path at once.
+        val none = mutableListOf<AiRequest>()
+        replanReplies = ArrayDeque(listOf(adviceReply))
+        flow(FakeBrowser(tmp(), listOf("BLOCKED")).also { it.currentUrlOverride = lazyUrl; it.urlByTab["t1"] = lazyUrl }, FakeTabs(), none, plan = orderPlan).runComputerUse(UseRequest("t", maxReplans = 0))
+        assertEquals(0, none.count { it.system.startsWith("A browser agent, Jev, is stuck") })
+        // A login wall on the right site is the person's, not the planner's.
+        val login = FakeBrowser(tmp(), listOf("BLOCKED")).also { it.currentUrlOverride = lazyUrl; it.urlByTab["t1"] = lazyUrl; it.modalLabel = "Login"; it.pageTextFn = { "Login\nSend one time password" } }
+        val lr = mutableListOf<AiRequest>()
+        replanReplies = ArrayDeque(listOf(adviceReply))
+        flow(login, FakeTabs(), lr, plan = orderPlan).runComputerUse(UseRequest("t"))
+        assertEquals(0, lr.count { it.system.startsWith("A browser agent, Jev, is stuck") })
+        // A planner that answers with an address instead is not obeyed here: no advice, no move.
+        val move = FakeBrowser(tmp(), listOf("BLOCKED")).also { it.currentUrlOverride = lazyUrl; it.urlByTab["t1"] = lazyUrl }
+        replanReplies = ArrayDeque(listOf(replanReply()))
+        val mr = flow(move, FakeTabs(), mutableListOf(), plan = orderPlan).runComputerUse(UseRequest("t", maxReplans = 1))
+        assertEquals(0, move.stepArgs("navigate").size)
+        assertEquals(UseStatus.NEEDS_INPUT, mr.status)
+        // The reply forms: a bare hint counts as staying.
+        assertEquals(Cu.ReplanReply.Stay("go"), Cu.parseReplan("""{"hint":"go"}""", "g"))
+    }
+
+    @Test
+    fun `for doing things the first milestone names the page where the action happens`() {
+        val p = Cu.PLAN_SYSTEM
+        assertTrue(p.contains("For doing things (order, book, buy, apply, submit) the first milestone names the page where the action happens"))
+        assertTrue(p.contains("Magnolia Bakery's Order Online menu (with ADD buttons) is open"))
+        assertTrue(p.contains("not just \"the restaurant page is open\""))
+        assertTrue(Cu.REPLAN_SYSTEM.contains("the first one names the page where the action happens"))
     }
 
     // ---- popup windows that are not tabs ----
