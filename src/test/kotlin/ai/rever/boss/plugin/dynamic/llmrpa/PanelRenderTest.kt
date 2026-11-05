@@ -232,6 +232,36 @@ class PanelRenderTest {
     }
 
     @Test
+    fun `renders agent mode as the default with its Model setting, thoughts and a payment confirm`() {
+        Dispatchers.setMain(UnconfinedTestDispatcher())
+        try {
+            val c = jevComponent()
+            assertEquals(LlmrpaComponent.UseMode.AGENT, c.useMode.value)
+            assertEquals(null, c.agentModel.value)
+            val haiku = ModelOption(ModelOption.Kind.CHAT, "ANTHROPIC", "Anthropic", "claude-haiku-4-5")
+            c.selectAgentModel(haiku)
+            listOf(360, 960).forEach { render(c, it, 700, "jev-agent-idle-$it") }
+            val fast = jevComponent().also { it.selectUseMode(LlmrpaComponent.UseMode.FAST) }
+            render(fast, 360, 700, "jev-fast-idle-360")
+            val steps = listOf(
+                UseStep(1, VisionOp.NAVIGATE, confidence = 1.0, ms = 1900, target = "https://www.zomato.com/", thought = "Open Zomato to find the bakery.", result = "now on 'Zomato' (www.zomato.com)"),
+                UseStep(2, VisionOp.TYPE_TEXT, confidence = 1.0, ms = 1700, text = "Magnolia Bakery", target = "textbox 'Search for restaurant'", thought = "Search for the bakery.", result = "page now shows 'Magnolia Bakery, Bandra'"),
+                UseStep(3, VisionOp.CLICK, confidence = 1.0, ms = 1500, target = "button 'ADD'", thought = "Add the Tres Leches to the cart.", result = "page now shows '1 item added'"),
+            )
+            val q = "About to 'Place order'. Confirm?"
+            val report = UseReport(UseStatus.NEEDS_INPUT, "Order tres leches from Magnolia Bakery on Zomato", null, Cu.summary(UseStatus.NEEDS_INPUT, steps, 12.3, "Checkout", "https://www.zomato.com/checkout", "About to 'Place order', which may pay or place an order"),
+                "https://www.zomato.com/checkout", "Checkout", "Total 470", steps, 12.3, 0, 4, 9, null, 5200, "typesafe/jev-1.14", "Anthropic claude-haiku-4-5", emptyList(), null,
+                error = "About to 'Place order', which may pay or place an order", tabId = "t1",
+                blocker = UseBlocker("About to 'Place order', which may pay or place an order", q, "https://www.zomato.com/checkout", "Checkout", "t1", null, 3, listOf(ChoiceOption("1", "Confirm"), ChoiceOption("2", "Cancel"))))
+            val run = UseRun(report.task, startedAt = 0).also { r -> r.steps.value = steps; r.report.value = report; r.phase.value = UsePhase.FINISHED; r.agent = AgentMemory() }
+            val asked = jevComponent().also { it.showUse(run) }
+            listOf(360, 960).forEach { render(asked, it, 1300, "jev-agent-confirm-$it") }
+        } finally {
+            Dispatchers.resetMain()
+        }
+    }
+
+    @Test
     fun `the navigator model is a setting of the Jev tab, automatic until one is picked`() {
         Dispatchers.setMain(UnconfinedTestDispatcher())
         try {

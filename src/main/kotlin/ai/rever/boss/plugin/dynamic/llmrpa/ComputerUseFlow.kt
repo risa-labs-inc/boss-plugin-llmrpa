@@ -387,6 +387,8 @@ internal class UseRun(val task: String, val startedAt: Long = System.currentTime
     internal var pageTextNow: String? = null
     /** Text the navigator planned to type (never offered to a private field). */
     internal val navTexts = mutableListOf<String>()
+    /** Agent mode's memory, kept across a pause for the person. */
+    internal var agent: AgentMemory? = null
 }
 
 /** One step of a page plan with the element it named as it looked when planned (ids are per look, so the element is found again by role, label and context). */

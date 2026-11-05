@@ -163,6 +163,9 @@ class HeadlessRunner(
         data class Running(val run: UseRun) : UseOutcome
     }
 
+    /** Agent runs that stopped to ask, by the tab they left open: a call on that tab resumes them. */
+    private val agentPaused = java.util.concurrent.ConcurrentHashMap<String, UseRun>()
+
     /** Waits up to `wait_s` for the run; if it is still going it is left running and its id is returned to poll. */
     internal suspend fun browserUse(a: BrowserUseArgs): Result<UseOutcome> = try {
         // Only an explicit tab_id acts on an open tab; with none, the run plans (or takes url) and opens a new tab. The focused tab is never used.
@@ -180,7 +183,7 @@ class HeadlessRunner(
         if (newTab && a.tabId != null) return Result.failure(IllegalArgumentException("Pass tab_id or new_tab/url, not both"))
         val page = a.url?.let { StartPages.usable(it, httpsOnly = false) ?: return Result.failure(IllegalArgumentException("url must be an http(s) address with a host and no credentials")) }
         val tab = if (newTab) null else pickTab(a.tabId).getOrElse { return Result.failure(it) }
-        val chat = if (a.plannerModel == null && a.consultModel == null && a.navigatorModel == null) emptyList()
+        val chat = if (a.plannerModel == null && a.consultModel == null && a.navigatorModel == null && a.agentModel == null) emptyList()
             else withContext(Dispatchers.IO) { ModelDirectory(tools, llmProvider, gateway).load() }.flatMap { it.models }.filter { it.kind == ModelOption.Kind.CHAT }
         fun resolveChat(id: String, arg: String): Result<ModelOption> =
             chat.firstOrNull { it.key == id }?.let { Result.success(it) } ?: chat.filter { it.modelId == id }.let { same ->
@@ -193,6 +196,29 @@ class HeadlessRunner(
         val llm = a.plannerModel?.let { resolveChat(it, "planner_model").getOrElse { e -> return Result.failure(e) } }
         val navigatorModel = a.navigatorModel?.let { resolveChat(it, "navigator_model").getOrElse { e -> return Result.failure(e) } }
         val consultModel = a.consultModel?.let { resolveChat(it, "consult_model").getOrElse { e -> return Result.failure(e) } }
+        val lockedTabs = LockedTabs(locks, TabLocks.Owner.HEADLESS, openTab, reveal, list = { tabs().filter { it.url != null }.associate { it.tabId to it.title } })
+        if (a.mode == "agent") {
+            val agentModel = a.agentModel?.let { resolveChat(it, "agent_model").getOrElse { e -> return Result.failure(e) } }
+            // The same tab as a run that stopped to ask: that run resumes, with the reply in its history.
+            val paused = tab?.tabId?.let { agentPaused.remove(it) }
+            val reply = a.inputs.entries.firstOrNull { it.key.equals("reply", true) || it.key.equals(Cu.CHOICE_INPUT, true) }?.value
+                ?: if (a.inputs.keys.any { it.equals("continue", true) }) "continue: I did what was asked in the tab myself"
+                else if (paused != null && a.inputs.isNotEmpty()) "I gave: ${a.inputs.keys.joinToString()}" else null
+            val loop = AgentLoop(tools, gateway, lockedTabs, openWaitsMs = limits.openWaitsMs, settleMs = limits.navSettleMs, runLog = runLog)
+            val request = AgentRequest(
+                task = paused?.task ?: a.task, url = page, tabId = tab?.tabId, model = agentModel, planner = llm, jevModel = a.model ?: Cu.VISION_DEFAULT_MODEL,
+                pointerLabel = Cu.pointerLabel(a.displayName), inputs = a.inputs.filterKeys { k -> listOf("reply", "continue", Cu.CHOICE_INPUT).none { k.equals(it, true) } },
+                resume = paused != null, reply = reply, maxSteps = a.maxSteps, timeoutMs = a.timeoutS * 1000L,
+            )
+            val run = paused ?: UseRun(a.task)
+            val job = runScope.async {
+                loop.run(request, run).also { r ->
+                    if ((r.status == UseStatus.NEEDS_INPUT || r.status == UseStatus.BLOCKED) && r.tabId != null) agentPaused[r.tabId] = run
+                }
+            }
+            val report = withTimeoutOrNull(a.waitS * 1000L) { job.await() }
+            return Result.success(if (report != null) UseOutcome.Finished(report) else UseOutcome.Running(run))
+        }
         val flow = ComputerUseFlow(tools, gateway, LockedTabs(locks, TabLocks.Owner.HEADLESS, openTab, reveal, list = { tabs().filter { it.url != null }.associate { it.tabId to it.title } }),
             openWaitsMs = limits.openWaitsMs, settleMs = limits.navSettleMs, runLog = runLog)
         val request = UseRequest(

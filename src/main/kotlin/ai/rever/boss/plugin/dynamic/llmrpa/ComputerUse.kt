@@ -32,6 +32,8 @@ internal enum class VisionOp {
     MILESTONE,
     /** Not a Jev operation: the planner chose a new place to continue from. */
     REPLAN,
+    /** Agent mode only: a key press other than Enter, and going to an address. */
+    KEY, NAVIGATE,
 }
 
 /** What the page looked like when a step was decided: its address, vertical scroll (when RPA Engine reports it) and pixel hash. */
@@ -128,12 +130,15 @@ internal data class UseStep(
     val target: String? = null,
     /** Whether the page's content hash changed after this step, known after the next look. */
     val contentChanged: Boolean? = null,
+    /** Agent mode: the model's one-sentence reason, and the action as it chose it (JSON; secret values stay `{{name}}`). */
+    val thought: String? = null,
+    val action: String? = null,
 ) {
     val where: String? get() = if (xPct != null) "${xPct}%, ${yPct}%" else null
     val description: String
         get() = when (op) {
-            VisionOp.CLICK -> "Click at $where"
-            VisionOp.TYPE_TEXT -> "Type ${text?.let { "'${it.take(60)}'" } ?: "text"} at $where"
+            VisionOp.CLICK -> if (where == null && target != null) "Click $target" else "Click at $where"
+            VisionOp.TYPE_TEXT -> "Type ${text?.let { "'${it.take(60)}'" } ?: "text"} ${if (where == null && target != null) "into $target" else "at $where"}"
             VisionOp.PRESS_ENTER -> "Press Enter"
             VisionOp.SCROLL_DOWN -> "Scroll down${note?.takeIf { it.startsWith("amount") }?.let { " (${it.removePrefix("amount ")})" }.orEmpty()}"
             VisionOp.SCROLL_UP -> "Scroll up${note?.takeIf { it.startsWith("amount") }?.let { " (${it.removePrefix("amount ")})" }.orEmpty()}"
@@ -146,6 +151,8 @@ internal data class UseStep(
             VisionOp.REPLAN -> note ?: "Replanned"
             VisionOp.DONE -> "Done"
             VisionOp.BLOCKED -> "Blocked"
+            VisionOp.KEY -> "Press ${target ?: "a key"}"
+            VisionOp.NAVIGATE -> "Go to ${target ?: "a page"}"
         }
 }
 
@@ -1298,6 +1305,9 @@ internal fun UseStep.resultJson(): JsonObject = buildJsonObject {
     put("confidence", confidence)
     put("ms", ms)
     note?.let { put("note", it) }
+    thought?.let { put("thought", it) }
+    action?.let { put("action", it) }
+    target?.takeIf { thought != null }?.let { put("target", it) }
 }
 
 /** A click that was moved onto the interactive element best overlapping Jev's box. */

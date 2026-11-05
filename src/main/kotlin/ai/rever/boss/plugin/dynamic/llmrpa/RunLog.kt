@@ -171,6 +171,9 @@ class RunLogStore(private val dir: File, private val keep: Int = 50) {
         s.dialog?.let { put("dialog", it) }
         s.popup?.let { put("popup", it) }
         s.target?.let { put("target", it) }
+        s.thought?.let { put("thought", it) }
+        s.action?.let { put("action", it) }
+        s.result?.let { put("result", it) }
         if (s.refused) put("refused", true)
         s.snapped?.let { n -> putJsonObject("snapped") { put("from", n.from); put("to", n.to); put("tag", n.tag); put("label", n.label) } }
         if (s.failed) put("failed", true)

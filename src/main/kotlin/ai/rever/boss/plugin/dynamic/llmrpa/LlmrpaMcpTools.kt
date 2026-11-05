@@ -84,9 +84,12 @@ internal class LlmrpaMcpToolProvider(
         McpToolDefinition(
             name = BROWSER_USE,
             description =
-                "Do a task in the user's real, logged-in browser by looking at the page, like a person: a chat model plans the goal and " +
-                    "the page to open, Jev (a vision decision model) then clicks, types and scrolls from screenshots with a visible pointer, " +
-                    "and the result reports what happened plus the final page text. Use it to research or operate a website. " +
+                "Do a task in the user's real, logged-in browser by looking at the page, like a person. In the default agent mode one vision chat model " +
+                    "(agent_model; Claude Haiku by default) decides each step from a marked screenshot and the element list, and RPA Engine clicks, types and scrolls " +
+                    "with a visible pointer; it asks (status needs_input, blocker.question and blocker.options) for logins, codes, choices and before paying. To answer, call again " +
+                    "with the same tab_id and inputs {\"reply\":\"...\"} (or a new named input, or {\"continue\":\"yes\"}): the same run resumes with its history. Secret inputs are typed as {{name}} and never sent to the model. " +
+                    "mode fast is the older Jev loop (a chat model plans the goal and page, Jev clicks from screenshots). " +
+                    "The result reports what happened plus the final page text. Use it to research or operate a website. " +
                     "The user sees the run: the tab is opened or brought to the front in the space on screen and a labelled pointer moves over it. " +
                     "It opens a new tab at the planned page (or url), or acts on tab_id; only tabs in the space on screen can be driven. " +
                     "The run keeps its tab in front while it works: if the tab is hidden the screenshot brings it back first (a hidden tab's screen is stale), so the user should not switch away. " +
@@ -275,7 +278,8 @@ internal class LlmrpaMcpToolProvider(
             """"url":{"type":"string","description":"http(s) address to open in a new tab; replaces the page the planner would choose (the goal is still planned)"},""" +
             """"tab_id":{"type":"string","description":"Browser tab to act on (explicit; giving it skips planning). Without tab_id the run plans and opens a new tab (as with new_tab: true); the focused tab is never used"},""" +
             """"new_tab":{"type":"boolean","default":false,"description":"Open the planned page in a new tab. The default whenever tab_id is not given"},""" +
-            """"mode":{"type":"string","enum":["vision","dom"],"default":"vision","description":"vision: Jev works from screenshots; dom: the text-list runner of llmrpa_execute"},""" +
+            """"mode":{"type":"string","enum":["agent","fast","dom"],"default":"agent","description":"agent: one vision chat model decides each step from a marked screenshot and the element list (general); fast: the Jev loop with milestones and page plans; dom: the text-list runner of llmrpa_execute"},""" +
+            """"agent_model":{"type":"string","description":"agent mode: the chat model that decides each step; it must see images. Default: the newest Claude Haiku the AI Gateway lists, else the planner"},""" +
             """"model":{"type":"string","description":"Jev model; vision needs one that takes images and boxes (default typesafe/jev-1.14). In dom mode, any model id of llmrpa_execute"},""" +
             """"planner_model":{"type":"string","description":"Chat model id (from Settings → AI Providers) that plans the task and writes text for fields; defaults to the selected one"},""" +
             """"navigator_model":{"type":"string","description":"Fast chat model that plans each new page and advises (Claude Haiku via the AI Gateway by default; falls back to the planner when unavailable). It sees the marked screenshot when the gateway has vision"},""" +
@@ -424,6 +428,7 @@ internal data class BrowserUseArgs(
     val maxConsults: Int,
     val consultModel: String?,
     val navigatorModel: String?,
+    val agentModel: String?,
     val pagePlan: Boolean,
     val maxReplans: Int,
     val inputs: Map<String, String>,
@@ -437,7 +442,7 @@ internal data class BrowserUseArgs(
     val includeText: Boolean,
 ) {
     companion object {
-        private val KEYS = setOf("task", "url", "tab_id", "new_tab", "mode", "model", "planner_model", "display_name", "llm_typing", "on_stuck", "consult_below", "max_consults", "consult_model", "navigator_model", "page_plan", "max_replans", "inputs", "extract", "plan", "max_steps", "timeout_s", "wait_s", "include_text")
+        private val KEYS = setOf("task", "url", "tab_id", "new_tab", "mode", "model", "planner_model", "display_name", "llm_typing", "on_stuck", "consult_below", "max_consults", "consult_model", "navigator_model", "agent_model", "page_plan", "max_replans", "inputs", "extract", "plan", "max_steps", "timeout_s", "wait_s", "include_text")
 
         fun parse(raw: String): Result<BrowserUseArgs> = runCatching {
             val root = Json.parseToJsonElement(raw.ifBlank { "{}" }) as? JsonObject ?: error("Arguments must be a JSON object")
@@ -466,14 +471,14 @@ internal data class BrowserUseArgs(
             val inputs = (root["inputs"] as? JsonObject)?.let { o ->
                 o.mapValues { (k, v) -> (v as? JsonPrimitive)?.takeIf { it.isString }?.content ?: error("inputs.$k must be a string") }
             } ?: if (root["inputs"] != null) error("'inputs' must be an object of strings") else emptyMap()
-            val mode = str("mode") ?: "vision"
-            require(mode == "vision" || mode == "dom") { "'mode' must be vision or dom" }
+            val mode = (str("mode") ?: "agent").let { if (it == "vision") "fast" else it }
+            require(mode == "agent" || mode == "fast" || mode == "dom") { "'mode' must be agent, fast or dom" }
             BrowserUseArgs(
                 task = str("task") ?: error("Missing required argument: task"),
                 url = str("url"), tabId = str("tab_id"), newTab = bool("new_tab", false), mode = mode,
                 model = str("model"), plannerModel = str("planner_model"), displayName = str("display_name") ?: "Jev", llmTyping = bool("llm_typing", true),
                 onStuck = if (stuck == "consult") OnStuck.CONSULT else OnStuck.RETURN, consultBelow = dbl("consult_below", 0.5, 0.0, 1.0),
-                maxConsults = int("max_consults", 5, 0, 10), consultModel = str("consult_model"), navigatorModel = str("navigator_model"), pagePlan = bool("page_plan", true), maxReplans = int("max_replans", 2, 0, 5), inputs = inputs, extract = bool("extract", false),
+                maxConsults = int("max_consults", 5, 0, 10), consultModel = str("consult_model"), navigatorModel = str("navigator_model"), agentModel = str("agent_model"), pagePlan = bool("page_plan", true), maxReplans = int("max_replans", 2, 0, 5), inputs = inputs, extract = bool("extract", false),
                 plan = if (root["plan"] == null) null else bool("plan", false),
                 maxSteps = int("max_steps", 25, 1, 60), timeoutS = int("timeout_s", 180, 10, 600), waitS = int("wait_s", 45, 5, 600), includeText = bool("include_text", true),
             )

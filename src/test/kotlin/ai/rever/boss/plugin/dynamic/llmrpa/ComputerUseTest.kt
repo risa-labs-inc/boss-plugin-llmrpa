@@ -215,7 +215,7 @@ class ComputerUseTest {
     @Test
     fun `browser_use arguments are validated and clamped`() {
         val a = BrowserUseArgs.parse("""{"task":"find x"}""").getOrThrow()
-        assertEquals("vision", a.mode); assertEquals("Jev", a.displayName); assertEquals(25, a.maxSteps); assertEquals(180, a.timeoutS); assertTrue(a.includeText); assertFalse(a.newTab); assertTrue(a.llmTyping)
+        assertEquals("agent", a.mode); assertEquals("Jev", a.displayName); assertEquals(25, a.maxSteps); assertEquals(180, a.timeoutS); assertTrue(a.includeText); assertFalse(a.newTab); assertTrue(a.llmTyping)
         assertFalse(BrowserUseArgs.parse("""{"task":"t","llm_typing":false}""").getOrThrow().llmTyping)
         val b = BrowserUseArgs.parse("""{"task":"t","max_steps":500,"timeout_s":1,"display_name":"Max","new_tab":true,"mode":"dom","tab_id":"t9"}""").getOrThrow()
         assertEquals(60, b.maxSteps); assertEquals(10, b.timeoutS); assertEquals("Max", b.displayName); assertTrue(b.newTab); assertEquals("dom", b.mode); assertEquals("t9", b.tabId)
@@ -237,7 +237,7 @@ class ComputerUseTest {
     fun `the browser_use schema is closed and lists every argument`() {
         val schema = json(LlmrpaMcpToolProvider.BROWSER_USE_SCHEMA)
         assertEquals(false, (schema["additionalProperties"] as JsonPrimitive).content.toBoolean())
-        assertEquals(setOf("task", "url", "tab_id", "new_tab", "mode", "model", "planner_model", "display_name", "max_steps", "timeout_s", "include_text", "llm_typing", "on_stuck", "consult_below", "max_consults", "inputs", "extract", "plan", "wait_s", "consult_model", "max_replans", "navigator_model", "page_plan"),
+        assertEquals(setOf("task", "url", "tab_id", "new_tab", "mode", "model", "planner_model", "display_name", "max_steps", "timeout_s", "include_text", "llm_typing", "on_stuck", "consult_below", "max_consults", "inputs", "extract", "plan", "wait_s", "consult_model", "max_replans", "navigator_model", "agent_model", "page_plan"),
             schema["properties"]!!.jsonObject.keys)
         assertEquals("task", schema["required"]!!.jsonArray.single().jsonPrimitive.content)
     }
@@ -1466,7 +1466,7 @@ class ComputerUseTest {
         tabs = { emptyList() }, activeTabId = { null }, drivable = { true }, openTab = { _, _ -> "t1" }, reveal = { }, locks = TabLocks(), runs = RunHistory(), runLog = store,
         limits = RunLimits(navSettleMs = 0, stepSettleMs = 0, openWaitsMs = listOf(0)))
 
-    private fun useArgs(waitS: Int, extra: BrowserUseArgs.() -> BrowserUseArgs = { this }) = BrowserUseArgs.parse("""{"task":"find places","url":"https://sample.com/","plan":false}""").getOrThrow().copy(waitS = waitS).extra()
+    private fun useArgs(waitS: Int, extra: BrowserUseArgs.() -> BrowserUseArgs = { this }) = BrowserUseArgs.parse("""{"task":"find places","url":"https://sample.com/","plan":false,"mode":"fast"}""").getOrThrow().copy(waitS = waitS).extra()
 
     private suspend fun awaitStatus(store: RunLogStore, id: String, want: String) = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
         var status = ""
@@ -4021,7 +4021,7 @@ class ComputerUseTest {
         com.arkivanov.decompose.DefaultComponentContext(com.arkivanov.essenty.lifecycle.LifecycleRegistry()), LlmrpaInfo, provider, { gateway(requests, plan, typedJson) },
         tools = browser, llmProvider = { null }, tabLocks = TabLocks(), runHistory = RunHistory(), runLog = testRunLog(),
         io = kotlinx.coroutines.Dispatchers.Main, work = kotlinx.coroutines.Dispatchers.Main, baseLimits = RunLimits(navSettleMs = 0, stepSettleMs = 0, openWaitsMs = listOf(0)), exportDir = tmp(),
-    ).also { it.selectPanelTab(LlmrpaComponent.PanelTab.JEV) }
+    ).also { it.selectPanelTab(LlmrpaComponent.PanelTab.JEV); it.selectUseMode(LlmrpaComponent.UseMode.FAST) }
 
     private suspend fun awaitReport(c: LlmrpaComponent, scheduler: kotlinx.coroutines.test.TestCoroutineScheduler): UseReport = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
         kotlinx.coroutines.withTimeoutOrNull(15_000) {
@@ -4087,7 +4087,7 @@ class ComputerUseTest {
         val opened = mutableListOf<String>()
         val h = HeadlessRunner(browser, { gateway(requests, plan, typedJson) }, { null }, tabs = { listOf(focusedDocs) }, activeTabId = { "t9" }, drivable = { true },
             openTab = { u, _ -> opened += u; "t1" }, reveal = { }, locks = TabLocks(), runs = RunHistory(), runLog = testRunLog(), limits = RunLimits(navSettleMs = 0, stepSettleMs = 0, openWaitsMs = listOf(0)))
-        val out = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) { h.browserUse(BrowserUseArgs.parse("""{"task":"find places","wait_s":30}""").getOrThrow()).getOrThrow() }
+        val out = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) { h.browserUse(BrowserUseArgs.parse("""{"task":"find places","wait_s":30,"mode":"fast"}""").getOrThrow()).getOrThrow() }
         val report = (out as HeadlessRunner.UseOutcome.Finished).report
         assertEquals(UseStatus.DONE, report.status, report.error)
         assertEquals(1, requests.count { it.system.startsWith("You plan") })
@@ -4097,7 +4097,7 @@ class ComputerUseTest {
         val b2 = FakeBrowser(tmp(), listOf("DONE")); val r2 = mutableListOf<AiRequest>(); val o2 = mutableListOf<String>()
         val h2 = HeadlessRunner(b2, { gateway(r2, plan, typedJson) }, { null }, tabs = { listOf(focusedDocs) }, activeTabId = { "t9" }, drivable = { true },
             openTab = { u, _ -> o2 += u; "t1" }, reveal = { }, locks = TabLocks(), runs = RunHistory(), runLog = testRunLog(), limits = RunLimits(navSettleMs = 0, stepSettleMs = 0, openWaitsMs = listOf(0)))
-        val out2 = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) { h2.browserUse(BrowserUseArgs.parse("""{"task":"summarise","tab_id":"t9","wait_s":30}""").getOrThrow()).getOrThrow() }
+        val out2 = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) { h2.browserUse(BrowserUseArgs.parse("""{"task":"summarise","tab_id":"t9","wait_s":30,"mode":"fast"}""").getOrThrow()).getOrThrow() }
         assertEquals("t9", (out2 as HeadlessRunner.UseOutcome.Finished).report.tabId)
         assertEquals(0, r2.count { it.system.startsWith("You plan") }); assertTrue(o2.isEmpty())
         // The description says so.

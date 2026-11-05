@@ -92,7 +92,7 @@ internal fun JevTab(component: LlmrpaComponent) {
 @Composable
 private fun JevIntro(component: LlmrpaComponent) {
     Text(
-        "Ask for something on the web. A chat model picks the page, then Jev works the page from screenshots with a visible pointer, and a report with what happened and the final page's text lands here. Jev keeps its tab in front while it works.",
+        "Ask for something on the web. A vision model works the page from screenshots with a visible pointer, asks you for logins, choices and before paying, and a report with what happened and the final page's text lands here. The tab stays in front while it works.",
         color = RpaTokens.TextSecondary, fontSize = 12.sp,
     )
     JEV_EXAMPLES.forEach { (title, text) ->
@@ -131,7 +131,9 @@ private fun Composer(component: LlmrpaComponent, input: String, active: Boolean,
                     modifier = Modifier.height(34.dp), enabled = input.isNotBlank() && blocker == null, icon = Icons.Outlined.PlayArrow)
                 if (replying) LinkText("Start a new request", component::newUseRequest)
             }
-            Text("Every step sends a screenshot of the page to OpenRouter (Jev), and the page text to the chat model.",
+            val mode by component.useMode.collectAsState()
+            Text(if (mode == LlmrpaComponent.UseMode.AGENT) "Every step sends a screenshot of the page and its text to the agent model through the AI Gateway."
+                else "Every step sends a screenshot of the page to OpenRouter (Jev), and the page text to the chat model.",
                 color = RpaTokens.TextMuted, fontSize = 11.sp)
         }
     }
@@ -150,9 +152,33 @@ private fun ModelRow(component: LlmrpaComponent, enabled: Boolean) {
     val consultModel by component.consultModel.collectAsState()
     val navigator by component.navigatorModel.collectAsState()
     val extract by component.extract.collectAsState()
+    val mode by component.useMode.collectAsState()
+    val agentModel by component.agentModel.collectAsState()
     var menu by remember { mutableStateOf<String?>(null) }
+    val agent = mode == LlmrpaComponent.UseMode.AGENT
     FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         Box {
+            OutlineButton("Mode: ${mode.label}", { menu = "mode" }, enabled = enabled, tone = Tone.NEUTRAL, trailing = "▾")
+            if (menu == "mode") RpaMenu(onDismiss = { menu = null }, width = 280) {
+                MenuHeading("Mode")
+                MenuRow("Agent", onClick = { menu = null; component.selectUseMode(LlmrpaComponent.UseMode.AGENT) }, selected = agent, detail = "one vision model decides each step")
+                MenuRow("Fast", onClick = { menu = null; component.selectUseMode(LlmrpaComponent.UseMode.FAST) }, selected = !agent, detail = "Jev with plans and milestones")
+            }
+        }
+        if (agent) Box {
+            OutlineButton("Model: ${agentModel?.label ?: "auto"}", { menu = "agent"; component.refreshModels() }, enabled = enabled, tone = Tone.NEUTRAL, trailing = "▾")
+            if (menu == "agent") RpaMenu(onDismiss = { menu = null }, width = 300) {
+                MenuHeading("Agent model", "decides each step; must see images")
+                MenuRow("Automatic", onClick = { menu = null; component.selectAgentModel(null) }, selected = agentModel == null, detail = "Claude Haiku if offered, else the planner")
+                Column(Modifier.heightIn(max = 300.dp).verticalScroll(rememberScrollState())) {
+                    groups.filter { it.kind == ModelOption.Kind.CHAT }.forEach { g ->
+                        MenuHeading(g.providerName)
+                        g.models.take(100).forEach { m -> MenuRow(m.label, onClick = { menu = null; component.selectAgentModel(m) }, selected = m.key == agentModel?.key) }
+                    }
+                }
+            }
+        }
+        if (!agent) Box {
             OutlineButton("Jev: ${jev.substringAfter('/')}", { menu = "jev" }, enabled = enabled, tone = Tone.NEUTRAL, trailing = "▾")
             if (menu == "jev") RpaMenu(onDismiss = { menu = null }, width = 260) {
                 MenuHeading("Jev model", "needs images and a box")
@@ -179,7 +205,7 @@ private fun ModelRow(component: LlmrpaComponent, enabled: Boolean) {
                 }
             }
         }
-        Box {
+        if (!agent) Box {
             OutlineButton("Navigator: ${navigator?.label ?: "auto"}", { menu = "navigator"; component.refreshModels() }, enabled = enabled, tone = Tone.NEUTRAL, trailing = "▾")
             if (menu == "navigator") RpaMenu(onDismiss = { menu = null }, width = 300) {
                 MenuHeading("Navigator model", "plans each page; fast, sees the screenshot")
@@ -192,8 +218,8 @@ private fun ModelRow(component: LlmrpaComponent, enabled: Boolean) {
                 }
             }
         }
-        OutlineButton("When stuck: ${if (consult) "consult the LLM" else "ask me"}", { component.setConsultWhenStuck(!consult) }, enabled = enabled, tone = Tone.NEUTRAL)
-        Box {
+        if (!agent) OutlineButton("When stuck: ${if (consult) "consult the LLM" else "ask me"}", { component.setConsultWhenStuck(!consult) }, enabled = enabled, tone = Tone.NEUTRAL)
+        if (!agent) Box {
             OutlineButton("Consult: ${consultModel?.label ?: "auto"}", { menu = "consult"; component.refreshModels() }, enabled = enabled && consult, tone = Tone.NEUTRAL, trailing = "▾")
             if (menu == "consult") RpaMenu(onDismiss = { menu = null }, width = 300) {
                 MenuHeading("Consult model", "must be able to read images")
@@ -206,8 +232,8 @@ private fun ModelRow(component: LlmrpaComponent, enabled: Boolean) {
                 }
             }
         }
-        OutlineButton("Answer with LLM: ${if (extract) "on" else "off"}", { component.setExtract(!extract) }, enabled = enabled, tone = Tone.NEUTRAL)
-        OutlineButton("LLM typing: ${if (llmTyping) "on" else "off"}", { component.setLlmTyping(!llmTyping) }, enabled = enabled, tone = Tone.NEUTRAL)
+        if (!agent) OutlineButton("Answer with LLM: ${if (extract) "on" else "off"}", { component.setExtract(!extract) }, enabled = enabled, tone = Tone.NEUTRAL)
+        if (!agent) OutlineButton("LLM typing: ${if (llmTyping) "on" else "off"}", { component.setLlmTyping(!llmTyping) }, enabled = enabled, tone = Tone.NEUTRAL)
         Box {
             OutlineButton("Pointer: ${Cu.pointerLabel(pointer)}", { menu = "pointer" }, enabled = enabled, tone = Tone.NEUTRAL, trailing = "▾")
             if (menu == "pointer") RpaMenu(onDismiss = { menu = null }, width = 240) {
@@ -283,9 +309,11 @@ private fun UseStepRow(s: UseStep) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
             Text("${s.index}", color = tone.color(), fontSize = 12.sp, fontWeight = FontWeight.Bold)
             Text(s.description, color = RpaTokens.Text, fontSize = 13.sp, modifier = Modifier.weight(1f))
-            if (s.op == VisionOp.CONSULT) Pill("chat model") else Text("${TaskRunner.pct(s.confidence)} sure", color = RpaTokens.TextSecondary, fontSize = 11.sp)
+            if (s.op == VisionOp.CONSULT) Pill("chat model") else if (s.thought == null) Text("${TaskRunner.pct(s.confidence)} sure", color = RpaTokens.TextSecondary, fontSize = 11.sp)
         }
+        s.thought?.let { Text(it, color = RpaTokens.TextSecondary, fontSize = 12.sp) }
         val notes = listOfNotNull(
+            s.result?.takeIf { s.thought != null },
             s.note?.takeIf { !it.startsWith("amount") },
             s.textSource?.let { "text $it" },
             if (s.changed == false) "the screen did not change" else null,

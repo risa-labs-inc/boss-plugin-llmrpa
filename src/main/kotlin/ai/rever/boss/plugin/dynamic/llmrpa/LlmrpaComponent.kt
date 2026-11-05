@@ -595,6 +595,18 @@ class LlmrpaComponent(
     val navigatorModel: StateFlow<ModelOption?> = _navigatorModel
     fun selectNavigatorModel(option: ModelOption?) { _navigatorModel.value = option }
 
+    enum class UseMode(val label: String) { AGENT("Agent"), FAST("Fast") }
+
+    private val _useMode = MutableStateFlow(UseMode.AGENT)
+    /** Agent: one vision chat model decides each step (the default). Fast: the Jev loop with plans and milestones. */
+    val useMode: StateFlow<UseMode> = _useMode
+    fun selectUseMode(mode: UseMode) { _useMode.value = mode }
+
+    private val _agentModel = MutableStateFlow<ModelOption?>(null)
+    /** The model that decides each agent step; null = automatic (the newest Claude Haiku the gateway lists, else the planner). */
+    val agentModel: StateFlow<ModelOption?> = _agentModel
+    fun selectAgentModel(option: ModelOption?) { _agentModel.value = option }
+
     private val _plannerModel = MutableStateFlow<ModelOption?>(null)
     /** The chat model that plans the task and writes text for fields; null = the one selected in Settings. */
     val plannerModel: StateFlow<ModelOption?> = _plannerModel
@@ -616,6 +628,7 @@ class LlmrpaComponent(
     /** What stops a Jev request from starting, or null. */
     fun useBlocker(): String? = when {
         !tools.has(ToolNames.OBSERVE) || !tools.has(ToolNames.STEP) -> Blocker.ENGINE.detail
+        _useMode.value == UseMode.AGENT -> if (!aiAvailable()) "Agent mode needs a chat model that can see. " + Blocker.AI.detail else null
         !tools.has(ToolNames.JEV_DECIDE) -> Blocker.JEV.detail
         Cu.visionProblem(_jevModelId.value, tools.inputSchema(ToolNames.JEV_DECIDE)) != null ->
             Cu.visionProblem(_jevModelId.value, tools.inputSchema(ToolNames.JEV_DECIDE))
@@ -638,12 +651,27 @@ class LlmrpaComponent(
         )
     }
 
-    private fun launchUse(flow: ComputerUseFlow, request: UseRequest, run: UseRun) {
+    private fun launchUse(flow: ComputerUseFlow, request: UseRequest, run: UseRun) = launchUse(run) { flow.runComputerUse(request, run) }
+
+    private fun agentLoop(provider: ActiveTabsProvider?): AgentLoop {
+        val create: suspend (String, String) -> String? = { url, title -> provider?.let { withContext(Dispatchers.Main) { it.createBrowserTab(url, title) } } }
+        return AgentLoop(
+            tools, aiGateway, LockedTabs(tabLocks, TabLocks.Owner.PANEL, create, { id -> revealTab(provider, id) }, list = { provider?.activeTabs?.value.orEmpty().filter { it.url != null }.associate { it.tabId to it.title } }),
+            openWaitsMs = baseLimits.openWaitsMs, settleMs = baseLimits.navSettleMs, runLog = runLog,
+        )
+    }
+
+    private fun agentRequest(run: UseRun, tabId: String?, resume: Boolean, reply: String?) = AgentRequest(
+        task = run.task, tabId = tabId, model = _agentModel.value, planner = _plannerModel.value, jevModel = _jevModelId.value,
+        pointerLabel = Cu.pointerLabel(_pointerLabel.value), resume = resume, reply = reply, maxSteps = 40, timeoutMs = 10 * 60_000L,
+    )
+
+    private fun launchUse(run: UseRun, body: suspend () -> UseReport) {
         _useRun.value = run
         _errorMessage.value = null
         useJob = scope.launch {
             try {
-                withContext(work) { flow.runComputerUse(request, run) }
+                withContext(work) { body() }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Throwable) {
@@ -677,7 +705,8 @@ class LlmrpaComponent(
         if (tab == null && provider == null) return Blocker.TAB.detail
         _replyMode.value = true
         val run = UseRun(task)
-        launchUse(useFlow(provider), baseRequest(run, tab?.tabId, resume = false, advice = emptyList()), run)
+        if (_useMode.value == UseMode.AGENT) launchUse(run) { agentLoop(provider).run(agentRequest(run, tab?.tabId, resume = false, reply = null), run) }
+        else launchUse(useFlow(provider), baseRequest(run, tab?.tabId, resume = false, advice = emptyList()), run)
         return null
     }
 
@@ -690,6 +719,13 @@ class LlmrpaComponent(
         if (reply.isEmpty()) return "Type your reply first"
         if (isUsing) return "A request is already running"
         useBlocker()?.let { return it }
+        // An agent run takes the reply as the next line of its history; an option's number reads as its label.
+        if (run.agent != null) {
+            val text = blocker.options.firstOrNull { it.id == reply.trimEnd('.', ')') }?.label ?: reply
+            _useInput.value = ""
+            launchUse(run) { agentLoop(activeTabsProvider).run(agentRequest(run, tab, resume = true, reply = text), run) }
+            return null
+        }
         // "continue" or "logged in": the person did it themselves in the tab. Anything else is details Jev may type.
         val cont = Cu.isContinueReply(reply)
         // A reply to "which one do you want?": the number or the name, which the run finds again in a fresh look.
