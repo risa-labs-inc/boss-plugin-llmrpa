@@ -84,7 +84,7 @@ internal class LlmrpaMcpToolProvider(
             description =
                 "Do a task in the user's real, logged-in browser by looking at the page, like a person: a chat model plans the goal and " +
                     "the page to open, Jev (a vision decision model) then clicks, types and scrolls from screenshots with a visible pointer, " +
-                    "and the result reports what happened and the answer found on the final page. Use it to research or operate a website. " +
+                    "and the result reports what happened plus the final page text. Use it to research or operate a website. " +
                     "The user sees the run: the tab is opened or brought to the front in the space on screen and a labelled pointer moves over it. " +
                     "It opens a new tab at the planned page (or url), or acts on tab_id; only tabs in the space on screen can be driven. " +
                     "It never waits for a person: it proceeds when unsure and returns status blocked when stuck. " +
@@ -213,7 +213,7 @@ internal class LlmrpaMcpToolProvider(
             """"new_tab":{"type":"boolean","default":false,"description":"Open the planned page in a new tab"},""" +
             """"mode":{"type":"string","enum":["vision","dom"],"default":"vision","description":"vision: Jev works from screenshots; dom: the text-list runner of llmrpa_execute"},""" +
             """"model":{"type":"string","description":"Jev model; vision needs one that takes images and boxes (default typesafe/jev-1.14). In dom mode, any model id of llmrpa_execute"},""" +
-            """"planner_model":{"type":"string","description":"Chat model id (from Settings → AI Providers) that plans and writes the report; defaults to the selected one"},""" +
+            """"planner_model":{"type":"string","description":"Chat model id (from Settings → AI Providers) that plans the task and writes text for fields; defaults to the selected one"},""" +
             """"display_name":{"type":"string","default":"Jev","description":"Label on the on-page pointer (always shown)"},""" +
             """"llm_typing":{"type":"boolean","default":true,"description":"Let the planner chat model write text for a field when nothing from the task fits (never for password, PIN or card fields)"},""" +
             """"max_steps":{"type":"integer","minimum":1,"maximum":60,"default":25},""" +

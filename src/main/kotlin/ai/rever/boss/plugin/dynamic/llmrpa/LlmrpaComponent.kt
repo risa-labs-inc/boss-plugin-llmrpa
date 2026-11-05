@@ -564,7 +564,7 @@ class LlmrpaComponent(
     fun setLlmTyping(on: Boolean) { _llmTyping.value = on }
 
     private val _plannerModel = MutableStateFlow<ModelOption?>(null)
-    /** The chat model that plans and writes the report; null = the one selected in Settings. */
+    /** The chat model that plans the task and writes text for fields; null = the one selected in Settings. */
     val plannerModel: StateFlow<ModelOption?> = _plannerModel
     fun selectPlanner(option: ModelOption?) { _plannerModel.value = option }
 
