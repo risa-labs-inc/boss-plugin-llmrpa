@@ -209,7 +209,7 @@ class RunExportTest {
         val provider = LlmrpaMcpToolProvider(
             "p", component = { null },
             headless = HeadlessRunner(FakeTools { _, _ -> error("unused") }, { null }, { null }, tabs = { emptyList() }, activeTabId = { null },
-                drivable = { true }, openTab = { _, _ -> null }, locks = TabLocks(), runs = history),
+                drivable = { true }, openTab = { _, _ -> null }, reveal = { }, locks = TabLocks(), runs = history),
             runs = history, exportDir = dir,
         )
         val tool = provider.tools().first { it.name == "llmrpa_export" }

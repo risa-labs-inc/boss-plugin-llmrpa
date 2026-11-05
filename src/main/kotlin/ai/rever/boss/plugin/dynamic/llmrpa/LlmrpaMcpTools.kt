@@ -85,19 +85,20 @@ internal class LlmrpaMcpToolProvider(
                 "Do a task in the user's real, logged-in browser by looking at the page, like a person: a chat model plans the goal and " +
                     "the page to open, Jev (a vision decision model) then clicks, types and scrolls from screenshots with a visible pointer, " +
                     "and the result reports what happened and the answer found on the final page. Use it to research or operate a website. " +
+                    "The user sees the run: the tab is opened or brought to the front in the space on screen and a labelled pointer moves over it. " +
                     "It opens a new tab at the planned page (or url), or acts on tab_id; only tabs in the space on screen can be driven. " +
                     "It never waits for a person: it proceeds when unsure and returns status blocked when stuck. " +
-                    "Returns JSON {ok, status (done|blocked|error|budget), summary, answer, url, title, page_text, steps, seconds, jev_calls, " +
-                    "llm_calls, tool_calls, cost_usd, confidences, screenshot_path}; ok only means Jev reached its goal, so judge the answer from page_text.",
+                    "Returns JSON {ok, status (done|blocked|error|budget), summary (built from the steps, not a model's opinion), url, title, page_text, steps, seconds, jev_calls, " +
+                    "llm_calls, tool_calls, cost_usd, confidences, screenshot_path}; ok only means Jev reached its goal, so read the answer from page_text yourself.",
             inputSchema = BROWSER_USE_SCHEMA,
             readOnly = false,
             handler = McpToolHandler { args ->
                 val a = BrowserUseArgs.parse(args.raw).getOrElse { return@McpToolHandler McpToolResult(it.message ?: "Invalid arguments", isError = true) }
                 val timeoutMs = a.timeoutS * 1000L
                 val result = if (a.mode == "dom") {
-                    headless.browserUseDom(a.task, a.tabId, a.newTab, a.url, a.model, a.maxSteps.coerceAtMost(50), timeoutMs, a.includeText).map { it.toString() }
+                    headless.browserUseDom(a.task, a.tabId, a.newTab, a.url, a.model, a.maxSteps.coerceAtMost(50), timeoutMs, a.includeText, a.displayName).map { it.toString() }
                 } else {
-                    headless.browserUse(a.task, a.tabId, a.newTab, a.url, a.model, a.plannerModel, a.displayName, a.maxSteps, timeoutMs)
+                    headless.browserUse(a.task, a.tabId, a.newTab, a.url, a.model, a.plannerModel, a.displayName, a.maxSteps, timeoutMs, a.llmTyping)
                         .map { it.toJson(a.includeText).toString() }
                 }
                 result.fold(
@@ -213,7 +214,8 @@ internal class LlmrpaMcpToolProvider(
             """"mode":{"type":"string","enum":["vision","dom"],"default":"vision","description":"vision: Jev works from screenshots; dom: the text-list runner of llmrpa_execute"},""" +
             """"model":{"type":"string","description":"Jev model; vision needs one that takes images and boxes (default typesafe/jev-1.14). In dom mode, any model id of llmrpa_execute"},""" +
             """"planner_model":{"type":"string","description":"Chat model id (from Settings → AI Providers) that plans and writes the report; defaults to the selected one"},""" +
-            """"display_name":{"type":"string","default":"Jev","description":"Label on the on-page pointer"},""" +
+            """"display_name":{"type":"string","default":"Jev","description":"Label on the on-page pointer (always shown)"},""" +
+            """"llm_typing":{"type":"boolean","default":true,"description":"Let the planner chat model write text for a field when nothing from the task fits (never for password, PIN or card fields)"},""" +
             """"max_steps":{"type":"integer","minimum":1,"maximum":60,"default":25},""" +
             """"timeout_s":{"type":"integer","minimum":10,"maximum":600,"default":180},""" +
             """"include_text":{"type":"boolean","default":true,"description":"Include the final page's text (up to 20000 characters) as page_text"}""" +
@@ -341,12 +343,13 @@ internal data class BrowserUseArgs(
     val model: String?,
     val plannerModel: String?,
     val displayName: String,
+    val llmTyping: Boolean,
     val maxSteps: Int,
     val timeoutS: Int,
     val includeText: Boolean,
 ) {
     companion object {
-        private val KEYS = setOf("task", "url", "tab_id", "new_tab", "mode", "model", "planner_model", "display_name", "max_steps", "timeout_s", "include_text")
+        private val KEYS = setOf("task", "url", "tab_id", "new_tab", "mode", "model", "planner_model", "display_name", "llm_typing", "max_steps", "timeout_s", "include_text")
 
         fun parse(raw: String): Result<BrowserUseArgs> = runCatching {
             val root = Json.parseToJsonElement(raw.ifBlank { "{}" }) as? JsonObject ?: error("Arguments must be a JSON object")
@@ -371,7 +374,7 @@ internal data class BrowserUseArgs(
             BrowserUseArgs(
                 task = str("task") ?: error("Missing required argument: task"),
                 url = str("url"), tabId = str("tab_id"), newTab = bool("new_tab", false), mode = mode,
-                model = str("model"), plannerModel = str("planner_model"), displayName = str("display_name") ?: "Jev",
+                model = str("model"), plannerModel = str("planner_model"), displayName = str("display_name") ?: "Jev", llmTyping = bool("llm_typing", true),
                 maxSteps = int("max_steps", 25, 1, 60), timeoutS = int("timeout_s", 180, 10, 600), includeText = bool("include_text", true),
             )
         }

@@ -127,10 +127,10 @@ class PanelRenderTest {
     private fun useRun(phase: UsePhase, stepCount: Int, report: UseReport? = null, question: String? = null): UseRun {
         val run = UseRun("Find the top 10 restaurants in Palo Alto and list their ratings", startedAt = 0)
         run.phase.value = phase
-        run.plan.value = UsePlan(listOf("https://www.google.com/search?q=top+restaurants+palo+alto"), "Read the ratings of the top restaurants in the results and scroll for ten", true, emptyList())
+        run.plan.value = UsePlan(listOf("https://www.google.com/search?q=top+restaurants+palo+alto"), "Read the ratings of the top restaurants in the results and scroll for ten", emptyList())
         val all = listOf(
             UseStep(1, VisionOp.CLICK, 560, 195, 50, 25, null, 0.92, 2100, true),
-            UseStep(2, VisionOp.TYPE_TEXT, 400, 120, 36, 15, "Palo Alto", 0.88, 3400, true),
+            UseStep(2, VisionOp.TYPE_TEXT, 400, 120, 36, 15, "Palo Alto restaurants", 0.88, 3400, true, textSource = ComputerUseFlow.WRITTEN_BY_MODEL),
             UseStep(3, VisionOp.PRESS_ENTER, null, null, null, null, null, 0.81, 1800, true),
             UseStep(4, VisionOp.SCROLL_DOWN, confidence = 0.64, ms = 1500, changed = false, note = "amount medium"),
             UseStep(5, VisionOp.CLICK, 12, 12, 1, 1, null, 0.40, 900, null, "the action failed", true),
@@ -164,15 +164,19 @@ class PanelRenderTest {
             val asking = jevComponent().also { it.showUse(useRun(UsePhase.RUNNING, 4, question = "Jev is only 40% sure it should click")) }
             listOf(360, 960).forEach { render(asking, it, 1200, "jev-asking-$it") }
 
-            val list = (1..10).joinToString("\n") { "$it. Restaurant ${('A' + it - 1)} (4.${10 - it} stars, ${100 + it * 37} reviews)" }
+            val doneSteps = useRun(UsePhase.FINISHED, 4).steps.value
+            val list = (1..40).joinToString("\n") { "$it. Restaurant ${it}  4.${(it % 9) + 1} stars  ${100 + it * 37} reviews  Open now  Palo Alto" }
+            val title = "top restaurants palo alto - Google Search"
+            val pageUrl = "https://www.google.com/search?q=top+restaurants+palo+alto"
             val report = UseReport(
-                UseStatus.DONE, "Find the top 10 restaurants in Palo Alto and list their ratings", "Read the ratings", "Searched Google for top restaurants in Palo Alto, scrolled the results and read ten with their ratings.",
-                list, "https://www.google.com/search?q=top+restaurants+palo+alto", "top restaurants palo alto - Google Search", "page text", useRun(UsePhase.FINISHED, 4).steps.value, 31.4, 5, 2, 12, 0.0614, 1180,
-                "typesafe/jev-1.14", "OpenAI gpt-5", Cu.confidenceStats(useRun(UsePhase.FINISHED, 4).steps.value), "/Users/me/.boss/cache/rpaengine/shots/t1-1700000000.jpg",
+                UseStatus.DONE, "Find the top 10 restaurants in Palo Alto and list their ratings", "Read the ratings",
+                Cu.summary(UseStatus.DONE, doneSteps, 31.4, title, pageUrl, null),
+                pageUrl, title, list, doneSteps, 31.4, 5, 2, 12, 0.0614, 1180,
+                "typesafe/jev-1.14", "OpenAI gpt-5", Cu.confidenceStats(doneSteps), "/Users/me/.boss/cache/rpaengine/shots/t1-1700000000.jpg",
             )
             val done = jevComponent().also { it.showUse(useRun(UsePhase.FINISHED, 4, report = report)) }
             listOf(360, 960).forEach { render(done, it, 1500, "jev-done-$it") }
-            val blocked = jevComponent().also { it.showUse(useRun(UsePhase.FINISHED, 5, report = report.copy(status = UseStatus.BLOCKED, answer = null, error = "3 actions in a row changed nothing on screen"))) }
+            val blocked = jevComponent().also { it.showUse(useRun(UsePhase.FINISHED, 5, report = report.copy(status = UseStatus.BLOCKED, summary = Cu.summary(UseStatus.BLOCKED, useRun(UsePhase.FINISHED, 5).steps.value, 31.4, title, pageUrl, "3 actions in a row changed nothing on screen"), pageText = "No results found.", error = "3 actions in a row changed nothing on screen"))) }
             render(blocked, 360, 1300, "jev-blocked-360")
         } finally {
             Dispatchers.resetMain()

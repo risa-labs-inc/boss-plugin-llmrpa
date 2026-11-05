@@ -379,7 +379,7 @@ class StartPageTest {
 
     private fun headless(tools: FakeTools, tabs: List<ActiveTabData>, drivable: Set<String>, locks: TabLocks = TabLocks(), open: (String) -> String? = { "new1" }, opened: MutableList<String> = mutableListOf()) =
         HeadlessRunner(tools, { null }, { null }, tabs = { tabs }, activeTabId = { null }, drivable = { it in drivable },
-            openTab = { url, _ -> opened += url; open(url) }, locks = locks, runs = RunHistory(), limits = fast)
+            openTab = { url, _ -> opened += url; open(url) }, reveal = { }, locks = locks, runs = RunHistory(), limits = fast)
 
     @Test
     fun `headless new_tab opens the page, waits for it to load, and reports it`() = runTest {
@@ -428,7 +428,7 @@ class StartPageTest {
         // Focused only in the host's eyes: the drivable tabs are what it is asked about.
         val asked = mutableListOf<List<String>>()
         val focused = HeadlessRunner(FakeTools(decide = done), { null }, { null }, tabs = { tabs }, activeTabId = { c -> asked += c.map { it.tabId }; null },
-            drivable = { it == "t1" }, openTab = { _, _ -> null }, locks = TabLocks(), runs = RunHistory(), limits = fast)
+            drivable = { it == "t1" }, openTab = { _, _ -> null }, reveal = { }, locks = TabLocks(), runs = RunHistory(), limits = fast)
         val none = focused.execute("x", null, 3, null).exceptionOrNull()!!.message!!
         assertTrue(none.startsWith("No drivable tab is focused"), none)
         assertEquals(listOf(listOf("t1")), asked)
@@ -467,7 +467,7 @@ class StartPageTest {
         val waits = RunLimits(navSettleMs = 0, stepSettleMs = 0, openWaitsMs = listOf(300, 500, 800, 1_200, 2_000, 2_000, 3_000, 3_000))
         val tools = FakeTools(decide = done).apply { observeHook = { ToolReply("""{"url":"https://orders.example/","title":"Orders","elements":[]}""", false) } }
         val r = HeadlessRunner(tools, { null }, { null }, tabs = { emptyList() }, activeTabId = { null }, drivable = { true },
-            openTab = { _, _ -> "new1" }, locks = TabLocks(), runs = RunHistory(), limits = waits)
+            openTab = { _, _ -> "new1" }, reveal = { }, locks = TabLocks(), runs = RunHistory(), limits = waits)
         assertEquals(RunStatus.DONE, r.execute("Open https://orders.example/", null, 3, null, newTab = true).getOrThrow().status)
         // 300+500+800+1200+2000 = 4800 < 6400; the sixth read (6800) is the first past half.
         assertEquals(6, tools.observedTabs.size)
@@ -480,7 +480,7 @@ class StartPageTest {
         var n = 0
         tools.observeHook = { if (n++ < 4) ToolReply("""{"url":"https://mail.example/","title":"Inbox","elements":[]}""", false) else null }
         val r = HeadlessRunner(tools, { null }, { null }, tabs = { emptyList() }, activeTabId = { null }, drivable = { true },
-            openTab = { _, _ -> "new1" }, locks = TabLocks(), runs = RunHistory(), limits = waits)
+            openTab = { _, _ -> "new1" }, reveal = { }, locks = TabLocks(), runs = RunHistory(), limits = waits)
         r.execute("Open https://mail.example/", null, 3, null, newTab = true).getOrThrow()
         // Four empty reads, the rendered one, then the settled re-read the first step uses.
         assertEquals(6, tools.observedTabs.size)

@@ -128,10 +128,9 @@ class ComputerUseTest {
 
     @Test
     fun `a plan keeps the first pages, the goal and the planned text, and falls back to the task`() {
-        val p = Cu.parsePlan("""Sure: {"open":[{"url":"https://www.google.com/search?q=x"},"https://b.example"],"jev_goal":"List 10 places","answer_needed":true,"type_values":["Palo Alto"]}""", "task")
+        val p = Cu.parsePlan("""Sure: {"open":[{"url":"https://www.google.com/search?q=x"},"https://b.example"],"jev_goal":"List 10 places","type_values":["Palo Alto"]}""", "task")
         assertEquals(listOf("https://www.google.com/search?q=x", "https://b.example"), p.open)
         assertEquals("List 10 places", p.goal)
-        assertTrue(p.answerNeeded)
         assertEquals(listOf("Palo Alto"), p.typeValues)
         val bare = Cu.parsePlan("""{"open":[]}""", "do it")
         assertEquals("do it", bare.goal)
@@ -139,16 +138,35 @@ class ComputerUseTest {
     }
 
     @Test
-    fun `a report needs a summary and an answer may be null`() {
-        assertEquals("ok" to "A", Cu.parseReport("""{"summary":"ok","answer":"A"}"""))
-        assertEquals("ok" to null, Cu.parseReport("""{"summary":"ok","answer":null}"""))
-        assertTrue(runCatching { Cu.parseReport("""{"answer":"A"}""") }.isFailure)
+    fun `typed text is read from the first json object and must not be empty`() {
+        assertEquals("Palo Alto", Cu.parseTyped("""Sure!\n```json\n{"text":" Palo Alto "}\n```\nHmm {wait}"""))
+        assertTrue(runCatching { Cu.parseTyped("""{"text":""}""") }.isFailure)
+        assertTrue(runCatching { Cu.parseTyped("no json") }.isFailure)
+        assertEquals(Cu.TYPED_MAX, Cu.parseTyped("""{"text":"${"x".repeat(900)}"}""").length)
+    }
+
+    @Test
+    fun `the summary is built from the steps and names the error when it did not finish`() {
+        val steps = listOf(
+            UseStep(1, VisionOp.CLICK, confidence = 0.9, ms = 1), UseStep(2, VisionOp.CLICK, confidence = 0.9, ms = 1), UseStep(3, VisionOp.CLICK, confidence = 0.9, ms = 1),
+            UseStep(4, VisionOp.TYPE_TEXT, text = "Palo Alto", confidence = 0.9, ms = 1), UseStep(5, VisionOp.PRESS_ENTER, confidence = 0.9, ms = 1),
+            UseStep(6, VisionOp.SCROLL_DOWN, confidence = 0.9, ms = 1), UseStep(7, VisionOp.SCROLL_UP, confidence = 0.9, ms = 1),
+        )
+        assertEquals(
+            "Done in 7 steps (31.4 s) on 'Results' (shop.com). Clicked 3 times, typed 'Palo Alto', pressed Enter, scrolled 2 times.",
+            Cu.summary(UseStatus.DONE, steps, 31.4, "Results", "https://www.shop.com/s?q=1", null),
+        )
+        val blocked = Cu.summary(UseStatus.BLOCKED, steps.take(1), 5.0, null, null, "3 actions in a row changed nothing on screen")
+        assertEquals("Stopped: blocked after 1 step (5.0 s). 3 actions in a row changed nothing on screen. Clicked once.", blocked)
+        assertTrue(Cu.summary(UseStatus.ERROR, emptyList(), 1.0, null, null, "boom").startsWith("Failed after 0 steps (1.0 s). boom."))
+        assertTrue(Cu.summary(UseStatus.BUDGET, steps, 9.0, "T", "https://a.com/", "Stopped at 7 steps").startsWith("Stopped: out of budget after 7 steps"))
     }
 
     @Test
     fun `browser_use arguments are validated and clamped`() {
         val a = BrowserUseArgs.parse("""{"task":"find x"}""").getOrThrow()
-        assertEquals("vision", a.mode); assertEquals("Jev", a.displayName); assertEquals(25, a.maxSteps); assertEquals(180, a.timeoutS); assertTrue(a.includeText); assertFalse(a.newTab)
+        assertEquals("vision", a.mode); assertEquals("Jev", a.displayName); assertEquals(25, a.maxSteps); assertEquals(180, a.timeoutS); assertTrue(a.includeText); assertFalse(a.newTab); assertTrue(a.llmTyping)
+        assertFalse(BrowserUseArgs.parse("""{"task":"t","llm_typing":false}""").getOrThrow().llmTyping)
         val b = BrowserUseArgs.parse("""{"task":"t","max_steps":500,"timeout_s":1,"display_name":"Max","new_tab":true,"mode":"dom","tab_id":"t9"}""").getOrThrow()
         assertEquals(60, b.maxSteps); assertEquals(10, b.timeoutS); assertEquals("Max", b.displayName); assertTrue(b.newTab); assertEquals("dom", b.mode); assertEquals("t9", b.tabId)
         assertTrue(BrowserUseArgs.parse("""{"task":"t","bogus":1}""").exceptionOrNull()!!.message!!.contains("bogus"))
@@ -162,16 +180,19 @@ class ComputerUseTest {
     fun `the browser_use schema is closed and lists every argument`() {
         val schema = json(LlmrpaMcpToolProvider.BROWSER_USE_SCHEMA)
         assertEquals(false, (schema["additionalProperties"] as JsonPrimitive).content.toBoolean())
-        assertEquals(setOf("task", "url", "tab_id", "new_tab", "mode", "model", "planner_model", "display_name", "max_steps", "timeout_s", "include_text"),
+        assertEquals(setOf("task", "url", "tab_id", "new_tab", "mode", "model", "planner_model", "display_name", "max_steps", "timeout_s", "include_text", "llm_typing"),
             schema["properties"]!!.jsonObject.keys)
         assertEquals("task", schema["required"]!!.jsonArray.single().jsonPrimitive.content)
     }
 
     // ---- the whole flow, against fakes ----
 
+    private companion object { const val ASK = "<ask the llm>" }
+
     private class FakeBrowser(val dir: File, val script: List<String>, val textPick: String? = "Palo Alto") : ToolInvoker {
         val calls = mutableListOf<Pair<String, JsonObject>>()
         var jevCalls = 0
+        val askLlmOffered = mutableListOf<Boolean>()
         var shots = 0
         /** The screenshot content; clicks change it unless [frozen]. */
         var frozen = false
@@ -200,7 +221,8 @@ class ComputerUseTest {
                     val q = a["questions"]!!.jsonObject
                     if ("text" in q) {
                         val criteria = q["text"]!!.jsonObject["criteria"]!!.jsonObject.mapValues { it.value.jsonPrimitive.content }
-                        val key = criteria.entries.firstOrNull { it.value == textPick }?.key ?: JevDecider.NONE_OF_THESE
+                        askLlmOffered += JevDecider.ASK_LLM in criteria
+                        val key = if (textPick == ASK) JevDecider.ASK_LLM else criteria.entries.firstOrNull { it.value == textPick }?.key ?: JevDecider.NONE_OF_THESE
                         ToolReply("""{"response":{"answers":{"text":{"type":"choice","choice":"$key","probabilities":{"$key":0.95}}},"usage":{"cost":0.001}}}""", false)
                     } else {
                         val op = script[jevCalls.coerceAtMost(script.lastIndex)]
@@ -222,15 +244,17 @@ class ComputerUseTest {
     private class FakeTabs : UseTabs {
         val opened = mutableListOf<String>()
         val released = mutableListOf<String>()
+        val revealed = mutableListOf<String>()
+        override suspend fun reveal(tabId: String) { revealed += tabId }
         override suspend fun open(url: String): String? { opened += url; return "t1" }
         override fun claim(tabId: String): String? = null
         override fun release(tabId: String) { released += tabId }
     }
 
-    private fun gateway(requests: MutableList<AiRequest>, planner: String, report: String) = object : AiGatewayAPI {
+    private fun gateway(requests: MutableList<AiRequest>, planner: String, typed: String) = object : AiGatewayAPI {
         override suspend fun complete(request: AiRequest): Result<AiReply> {
             requests += request
-            return Result.success(AiReply(if (request.system.startsWith("You plan")) planner else report))
+            return Result.success(AiReply(if (request.system.startsWith("You plan")) planner else typed))
         }
         override fun stream(request: AiRequest): Flow<AiChunk> = emptyFlow()
         override suspend fun runAgent(request: AiRequest, tools: List<AiToolSpec>, budget: AiBudget, invoke: suspend (AiToolCall) -> AiToolOutcome): Result<AiAgentResult> =
@@ -239,11 +263,11 @@ class ComputerUseTest {
         override fun activeModel(): AiModelInfo? = AiModelInfo("OPENAI", "OpenAI", "gpt-5")
     }
 
-    private val plan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"Search Palo Alto restaurants and read the top ones","answer_needed":true,"type_values":["Palo Alto"]}"""
-    private val reportJson = """{"summary":"Searched and read the list.","answer":"A, B, C"}"""
+    private val plan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"Search Palo Alto restaurants and read the top ones","type_values":["Palo Alto"]}"""
+    private val typedJson = """{"text":"written text"}"""
 
     private fun flow(browser: FakeBrowser, tabs: FakeTabs, requests: MutableList<AiRequest>, plan: String = this.plan) =
-        ComputerUseFlow(browser, { gateway(requests, plan, reportJson) }, tabs, openWaitsMs = listOf(0), settleMs = 0, stepSettleMs = 0)
+        ComputerUseFlow(browser, { gateway(requests, plan, typedJson) }, tabs, openWaitsMs = listOf(0), settleMs = 0, stepSettleMs = 0)
 
     private fun tmp() = java.nio.file.Files.createTempDirectory("cu").toFile().also { it.deleteOnExit() }
 
@@ -258,6 +282,7 @@ class ComputerUseTest {
         assertTrue(report.ok)
         assertEquals(listOf("https://sample.com/"), tabs.opened)
         assertEquals(listOf("t1"), tabs.released)
+        assertEquals(listOf("t1"), tabs.revealed)
         assertEquals(listOf(VisionOp.CLICK, VisionOp.TYPE_TEXT, VisionOp.PRESS_ENTER, VisionOp.SCROLL_DOWN), report.steps.map { it.op })
         // click_at lands on the box centre of the 1120 x 780 viewport, with the pointer label
         val clicks = browser.stepArgs("click_at")
@@ -267,11 +292,12 @@ class ComputerUseTest {
         assertEquals("195", browser.stepArgs("scroll_by").single()["action"]!!.jsonObject["value"]!!.jsonPrimitive.content)
         assertEquals("Enter", browser.stepArgs("key").single()["action"]!!.jsonObject["value"]!!.jsonPrimitive.content)
         // The screenshot, and nothing with image data, is what the activity records.
-        assertEquals("A, B, C", report.answer)
         assertEquals(6, report.jevCalls) // five operations and the choice of text for the field
         assertEquals(1, requests.count { it.system.startsWith("You plan") })
-        assertEquals(1, requests.count { it.system.startsWith("You write") })
-        assertEquals(2, report.llmCalls)
+        assertEquals(0, requests.count { it.system.startsWith("You write") })
+        assertEquals(1, report.llmCalls)
+        assertEquals("Done in 4 steps", report.summary.take(15))
+        assertTrue(report.summary.contains("Clicked once, typed 'Palo Alto', pressed Enter, scrolled once."))
         assertNotNull(report.costUsd)
         assertEquals("Best: A, B, C", report.pageText)
         assertNotNull(report.screenshotPath)
@@ -281,6 +307,7 @@ class ComputerUseTest {
         assertEquals(4, j["steps"]!!.jsonArray.size)
         assertTrue("page_text" in j)
         assertFalse("page_text" in report.toJson(includeText = false))
+        assertFalse("answer" in j)
     }
 
     @Test
@@ -334,11 +361,56 @@ class ComputerUseTest {
     @Test
     fun `a private field takes only given text and is masked in the record`() = runTest {
         val browser = FakeBrowser(tmp(), listOf("TYPE_TEXT", "DONE"), textPick = null).also { it.focused = """{"tag":"input","editable":true,"label":"Password","type":"password"}""" }
-        val plan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"Sign in","answer_needed":false,"type_values":["hunter2"]}"""
+        val plan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"Sign in","type_values":["hunter2"]}"""
         val report = flow(browser, FakeTabs(), mutableListOf(), plan).runComputerUse(UseRequest("t"))
         assertEquals("hunter2", browser.stepArgs("type_text").single()["action"]!!.jsonObject["value"]!!.jsonPrimitive.content)
         assertEquals(Secrets.MASK, report.steps.single().text)
-        assertNull(report.answer)
+    }
+
+    @Test
+    fun `jev can ask the writing model for a field's text, which is recorded as an LLM call`() = runTest {
+        val browser = FakeBrowser(tmp(), listOf("TYPE_TEXT", "DONE"), textPick = ASK)
+        val requests = mutableListOf<AiRequest>()
+        val run = UseRun("t")
+        val report = flow(browser, FakeTabs(), requests).runComputerUse(UseRequest("Book a table", llmTyping = true), run)
+        assertEquals(listOf(true), browser.askLlmOffered)
+        assertEquals("written text", browser.stepArgs("type_text").single()["action"]!!.jsonObject["value"]!!.jsonPrimitive.content)
+        assertEquals(ComputerUseFlow.WRITTEN_BY_MODEL, report.steps.single().textSource)
+        assertEquals(2, report.llmCalls) // plan + typing
+        val typing = requests.single { it.system.startsWith("You write") }
+        assertTrue(typing.messages.single().text.contains("Field: label="))
+        assertTrue(run.log.entries.value.any { it.kind == ActivityKind.LLM && it.name.contains("type text") })
+        assertEquals("written by the model", report.toJson()["steps"]!!.jsonArray.single().jsonObject["text_source"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `with nothing to choose from the writing model is asked, unless typing is off or the field is private`() = runTest {
+        val noPhrases = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"Go","type_values":[]}"""
+        val on = FakeBrowser(tmp(), listOf("TYPE_TEXT", "DONE"))
+        val r1 = mutableListOf<AiRequest>()
+        flow(on, FakeTabs(), r1, noPhrases).runComputerUse(UseRequest("t"))
+        assertEquals(1, r1.count { it.system.startsWith("You write") })
+        assertEquals("written text", on.stepArgs("type_text").single()["action"]!!.jsonObject["value"]!!.jsonPrimitive.content)
+
+        val off = FakeBrowser(tmp(), listOf("TYPE_TEXT", "DONE"))
+        val r2 = mutableListOf<AiRequest>()
+        val rep = flow(off, FakeTabs(), r2, noPhrases).runComputerUse(UseRequest("t", llmTyping = false))
+        assertEquals(0, r2.count { it.system.startsWith("You write") })
+        assertEquals(0, off.stepArgs("type_text").size)
+        assertTrue(rep.steps.single().note!!.contains("no text"))
+
+        val secret = FakeBrowser(tmp(), listOf("TYPE_TEXT", "DONE")).also { it.focused = """{"tag":"input","editable":true,"label":"Card CVV","type":"text"}""" }
+        val r3 = mutableListOf<AiRequest>()
+        flow(secret, FakeTabs(), r3, noPhrases).runComputerUse(UseRequest("t"))
+        assertEquals(0, r3.count { it.system.startsWith("You write") })
+        assertEquals(0, secret.stepArgs("type_text").size)
+    }
+
+    @Test
+    fun `the choice only offers ask_llm when typing by the model is allowed`() = runTest {
+        val browser = FakeBrowser(tmp(), listOf("TYPE_TEXT", "DONE"))
+        flow(browser, FakeTabs(), mutableListOf()).runComputerUse(UseRequest("t", llmTyping = false))
+        assertEquals(listOf(false), browser.askLlmOffered)
     }
 
     @Test
@@ -381,6 +453,7 @@ class ComputerUseTest {
         val browser = FakeBrowser(tmp(), listOf("DONE"))
         val tabs = FakeTabs()
         flow(browser, tabs, mutableListOf()).runComputerUse(UseRequest("t", tabId = "t7"))
+        assertEquals(listOf("t7"), tabs.revealed)
         assertTrue(tabs.opened.isEmpty())
         assertEquals("t7", browser.stepArgs("navigate").single()["tab_id"]!!.jsonPrimitive.content)
     }

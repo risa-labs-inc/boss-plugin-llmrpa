@@ -92,7 +92,7 @@ internal fun JevTab(component: LlmrpaComponent) {
 @Composable
 private fun JevIntro(component: LlmrpaComponent) {
     Text(
-        "Ask for something on the web. A chat model picks the page, then Jev works the page from screenshots with a visible pointer, and a report with the answer lands here.",
+        "Ask for something on the web. A chat model picks the page, then Jev works the page from screenshots with a visible pointer, and a report with what happened and the final page's text lands here.",
         color = RpaTokens.TextSecondary, fontSize = 12.sp,
     )
     JEV_EXAMPLES.forEach { (title, text) ->
@@ -136,6 +136,7 @@ private fun ModelRow(component: LlmrpaComponent, enabled: Boolean) {
     val planner by component.plannerModel.collectAsState()
     val groups by component.modelGroups.collectAsState()
     val pointer by component.pointerLabel.collectAsState()
+    val llmTyping by component.llmTyping.collectAsState()
     var menu by remember { mutableStateOf<String?>(null) }
     FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         Box {
@@ -165,6 +166,7 @@ private fun ModelRow(component: LlmrpaComponent, enabled: Boolean) {
                 }
             }
         }
+        OutlineButton("LLM typing: ${if (llmTyping) "on" else "off"}", { component.setLlmTyping(!llmTyping) }, enabled = enabled, tone = Tone.NEUTRAL)
         Box {
             OutlineButton("Pointer: ${pointer.ifBlank { "Jev" }}", { menu = "pointer" }, enabled = enabled, tone = Tone.NEUTRAL, trailing = "▾")
             if (menu == "pointer") RpaMenu(onDismiss = { menu = null }, width = 240) {
@@ -236,6 +238,7 @@ private fun UseStepRow(s: UseStep) {
         }
         val notes = listOfNotNull(
             s.note?.takeIf { !it.startsWith("amount") },
+            s.textSource?.let { "text $it" },
             if (s.changed == false) "the screen did not change" else null,
         )
         if (notes.isNotEmpty()) Text(notes.joinToString(" · "), color = if (s.failed) RpaTokens.Error else RpaTokens.TextSecondary, fontSize = 12.sp)
@@ -255,13 +258,7 @@ private fun ReportCard(r: UseReport) {
             Pill(r.status.name.lowercase(), tone)
         }
         Text(r.summary, color = RpaTokens.TextSecondary, fontSize = 12.sp)
-        r.answer?.let { a ->
-            Column(Modifier.fillMaxWidth().clip(RpaTokens.Shape).background(RpaTokens.Content).padding(10.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                SectionLabel("Answer")
-                Text(a, color = RpaTokens.Text, fontSize = 13.sp)
-            }
-        }
-        r.error?.takeIf { r.status != UseStatus.DONE }?.let { Text(it, color = if (r.status == UseStatus.ERROR) RpaTokens.Error else RpaTokens.Warning, fontSize = 12.sp) }
+        r.pageText?.takeIf { it.isNotBlank() }?.let { PageTextBlock(it) }
         FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Pill("%.1f s".format(r.seconds))
             Pill("${r.steps.size} steps")
@@ -322,3 +319,20 @@ private fun ActivityRow(e: ActivityEntry) {
         Text(tail, color = if (e.failed) RpaTokens.Error else RpaTokens.TextSecondary, fontSize = 11.sp, fontFamily = RpaTokens.Mono, maxLines = 3, overflow = TextOverflow.Ellipsis)
     }
 }
+
+/** The final page's text: the first [EXCERPT_CHARS] characters, expandable to a scrollable view of all of it. */
+@Composable
+private fun PageTextBlock(text: String) {
+    var expanded by remember { mutableStateOf(false) }
+    val more = text.length > EXCERPT_CHARS
+    Column(Modifier.fillMaxWidth().clip(RpaTokens.Shape).background(RpaTokens.Content).padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        SectionLabel("Final page text")
+        val shown = if (expanded || !more) text else text.take(EXCERPT_CHARS) + "…"
+        Box(if (expanded) Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState()) else Modifier) {
+            Text(shown, color = RpaTokens.Text, fontSize = 12.sp, lineHeight = 17.sp)
+        }
+        if (more) LinkText(if (expanded) "Show less" else "Show all ${text.length} characters", { expanded = !expanded })
+    }
+}
+
+private const val EXCERPT_CHARS = 2_000

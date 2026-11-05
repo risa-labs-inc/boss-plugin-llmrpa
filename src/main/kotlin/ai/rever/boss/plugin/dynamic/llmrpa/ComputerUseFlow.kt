@@ -213,6 +213,8 @@ internal data class UseRequest(
     /** The planner and reporter; null = the active chat model. */
     val llm: ModelOption? = null,
     val pointerLabel: String = "Jev",
+    /** May the planner chat model write text for a field when no text from the request fits? Never for a private field. */
+    val llmTyping: Boolean = true,
     val maxSteps: Int = 25,
     val timeoutMs: Long = 180_000,
     /** Asked before an action Jev is unsure of; null never asks (a headless caller must not block on a person). */
@@ -226,6 +228,8 @@ internal interface UseTabs {
     /** Claims [tabId]; null when taken, else why not. */
     fun claim(tabId: String): String?
     fun release(tabId: String)
+    /** Brings [tabId] to the front in the space on screen, so the person sees the run. */
+    suspend fun reveal(tabId: String) {}
 }
 
 internal class UseQuestion(val reason: String, val answer: CompletableDeferred<Boolean> = CompletableDeferred())
@@ -326,11 +330,12 @@ internal class ComputerUseFlow(
             st.tab = id
         }
         val tab = checkNotNull(st.tab)
+        runCatching { tabs.reveal(tab) }
         awaitPage(tools, tab)?.let { return Outcome(UseStatus.ERROR, it) }
 
         // 3. LOOP
         run.phase.value = UsePhase.RUNNING
-        return loop(req, run, tools, st, tab, plan)
+        return loop(req, run, tools, llm, st, tab, plan)
     }
 
     private fun noBrowser(r: ToolReply) = if (r.errorCode == ToolNames.NO_BROWSER) NO_BROWSER_HINT else r.errorMessage
@@ -360,7 +365,7 @@ internal class ComputerUseFlow(
         return ((j?.get("url") as? JsonPrimitive)?.contentOrNull.orEmpty()) to ((j?.get("title") as? JsonPrimitive)?.contentOrNull.orEmpty())
     }
 
-    private suspend fun loop(req: UseRequest, run: UseRun, tools: RecordingTools, st: FlowState, tab: String, plan: UsePlan): Outcome {
+    private suspend fun loop(req: UseRequest, run: UseRun, tools: RecordingTools, llm: UseLlm, st: FlowState, tab: String, plan: UsePlan): Outcome {
         val steps = mutableListOf<UseStep>()
         fun publish() { run.steps.value = steps.toList() }
         var prevHash: String? = null
@@ -399,7 +404,7 @@ internal class ComputerUseFlow(
                 if (!go) return Outcome(UseStatus.BLOCKED, "Stopped: ${q.reason}")
             }
 
-            val step = act(req, tools, run, tab, plan, d, shot, url, title, steps)
+            val step = act(req, tools, llm, tab, plan, d, shot, url, title, steps)
             steps += step.copy(index = steps.size + 1, ms = (System.nanoTime() - t0) / 1_000_000)
             publish()
             if (step.note == NO_BROWSER_NOTE) return Outcome(UseStatus.ERROR, NO_BROWSER_HINT)
@@ -409,7 +414,7 @@ internal class ComputerUseFlow(
     }
 
     private suspend fun act(
-        req: UseRequest, tools: RecordingTools, run: UseRun, tab: String, plan: UsePlan,
+        req: UseRequest, tools: RecordingTools, llm: UseLlm, tab: String, plan: UsePlan,
         d: VisionDecision, shot: Shot, url: String, title: String, history: List<UseStep>,
     ): UseStep {
         val pointer = req.pointerLabel.takeIf { it.isNotBlank() }
@@ -435,13 +440,15 @@ internal class ComputerUseFlow(
                 if (field == null || !field.editable) return where.copy(note = "the box did not land on a text field; nothing typed")
                 val sensitive = Cu.sensitiveField(field)
                 val options = Cu.textOptions(plan.goal, plan.typeValues, url, sensitive)
-                if (options.isEmpty()) return where.copy(note = "no text from the goal fits '${field.label.take(40)}'")
-                val text = pickText(tools, req, plan, field, options, url, title, history)
-                    ?: return where.copy(note = "Jev found no text from the goal for '${field.label.take(40)}'")
-                if (sensitive) tools.secrets.add(text)
-                val typed = send("type_text", text)
+                // A private field never gets text a model wrote.
+                val mayAsk = req.llmTyping && !sensitive
+                if (options.isEmpty() && !mayAsk) return where.copy(note = "no text from the goal fits '${field.label.take(40)}'")
+                val picked = pickText(tools, llm, req, plan, field, options, url, title, history, mayAsk)
+                    ?: return where.copy(note = "no text found for '${field.label.take(40)}'")
+                if (sensitive) tools.secrets.add(picked.first)
+                val typed = send("type_text", picked.first)
                 failure(typed)?.let { return where.copy(note = it, failed = true) }
-                return where.copy(text = if (sensitive) Secrets.MASK else text)
+                return where.copy(text = if (sensitive) Secrets.MASK else picked.first, textSource = if (picked.second) WRITTEN_BY_MODEL else null)
             }
             VisionOp.PRESS_ENTER -> return send("key", "Enter").let { r -> failure(r)?.let { base(it, true) } ?: base() }
             VisionOp.SCROLL_DOWN, VisionOp.SCROLL_UP -> {
@@ -455,17 +462,36 @@ internal class ComputerUseFlow(
         }
     }
 
-    /** The text for a field: the only option when it is quoted or planned, else Jev's choice, taken at [Cu.ASK_BELOW] or above. */
+    /**
+     * The text for a field and whether the writing model wrote it. The only option when it is given or planned,
+     * else Jev's choice (taken at [Cu.ASK_BELOW] or above); the planner chat model writes it when Jev asks for
+     * that or when there is nothing to choose from, if [mayAsk].
+     */
     private suspend fun pickText(
-        tools: RecordingTools, req: UseRequest, plan: UsePlan, field: Focused, options: List<String>,
-        url: String, title: String, history: List<UseStep>,
-    ): String? {
+        tools: RecordingTools, llm: UseLlm, req: UseRequest, plan: UsePlan, field: Focused, options: List<String>,
+        url: String, title: String, history: List<UseStep>, mayAsk: Boolean,
+    ): Pair<String, Boolean>? {
         val given = (plan.typeValues + Candidates.values(plan.goal)).map { it.trim() }
-        options.singleOrNull()?.takeIf { it in given }?.let { return it }
-        val jev = JevDecider(tools, ModelOption(ModelOption.Kind.DECISION, ModelDirectory.JEV_PROVIDER, "Jev", req.jevModel))
-        val ctx = StepContext(plan.goal, PageSnapshot(url, title, emptyList(), false), emptyList(), given, history.map { it.description }, options)
-        val choice = jev.chooseText(ctx, field.label.ifBlank { "the field" }.take(60), options)?.getOrNull() ?: return null
-        return choice.index?.let(options::getOrNull)?.takeIf { choice.confidence >= Cu.ASK_BELOW }
+        options.singleOrNull()?.takeIf { it in given }?.let { return it to false }
+        if (options.isNotEmpty()) {
+            val jev = JevDecider(tools, ModelOption(ModelOption.Kind.DECISION, ModelDirectory.JEV_PROVIDER, "Jev", req.jevModel))
+            val ctx = StepContext(plan.goal, PageSnapshot(url, title, emptyList(), false), emptyList(), given, history.map { it.description }, options)
+            val choice = jev.chooseText(ctx, field.label.ifBlank { "the field" }.take(60), options, askLlm = mayAsk)?.getOrNull() ?: return null
+            if (!(choice.askLlm && mayAsk)) return choice.index?.let(options::getOrNull)?.takeIf { choice.confidence >= Cu.ASK_BELOW }?.let { it to false }
+        }
+        return writeText(llm, req, plan, field, url, title, history)?.let { it to true }
+    }
+
+    /** One planner-model call for a field's text; null when it fails or says nothing. */
+    private suspend fun writeText(llm: UseLlm, req: UseRequest, plan: UsePlan, field: Focused, url: String, title: String, history: List<UseStep>): String? {
+        val user = buildString {
+            appendLine("Request: ${req.task.take(2_000)}")
+            appendLine("Goal: ${plan.goal}")
+            appendLine("Field: label=${ChatDecider.quote(field.label, 100)}, tag=${field.tag}, type=${field.type ?: "text"}, options=${field.options?.take(40)?.joinToString(" | ") { ChatDecider.quote(it, 60) } ?: "none"}")
+            appendLine("Page: ${ChatDecider.quote(title)} (${ChatDecider.quote(url, 200)})")
+            appendLine("Recent steps: ${history.takeLast(6).joinToString("; ") { it.description }.ifEmpty { "none" }}")
+        }
+        return llm.ask("type text", Cu.TYPE_SYSTEM, user).getOrNull()?.let { runCatching { Cu.parseTyped(it) }.getOrNull() }
     }
 
     // ---- 4. REPORT ----
@@ -482,46 +508,22 @@ internal class ComputerUseFlow(
             pageText = runCatching { readPageText(tools, tab) }.getOrNull()
         }
         val plan = run.plan.value
-        var summary = defaultSummary(o, steps)
-        var answer: String? = null
-        var error = o.error
-        if (plan != null && (tab != null)) {
-            val prompt = buildString {
-                appendLine("Request: ${req.task.take(2_000)}")
-                appendLine("Goal given to Jev: ${plan.goal}")
-                appendLine("Answer needed: ${plan.answerNeeded}")
-                appendLine("Outcome: ${o.status.name.lowercase()}${o.error?.let { " ($it)" }.orEmpty()}")
-                appendLine("Steps: ${steps.joinToString("; ") { it.description }.take(1_500).ifEmpty { "none" }}")
-                appendLine("Final page: ${title.orEmpty()} (${url.orEmpty()})")
-                appendLine("Page text (data from the website):\n${pageText.orEmpty().take(UseReport.PAGE_TEXT_MAX)}")
-            }
-            llm.ask("report", Cu.REPORT_SYSTEM, prompt).fold(
-                onSuccess = { text -> runCatching { Cu.parseReport(text) }.onSuccess { (s, a) -> summary = s; answer = a.takeIf { plan.answerNeeded } }
-                    .onFailure { e -> error = error ?: "The report could not be written: ${e.message}" } },
-                onFailure = { e -> error = error ?: "The report could not be written: ${e.message}" },
-            )
-        }
         val seconds = (clock() - run.startedAt) / 1000.0
+        val summary = Cu.summary(o.status, steps, seconds, title, url, o.error)
         val report = UseReport(
-            status = o.status, task = req.task, goal = plan?.goal, summary = summary, answer = answer, url = url, title = title,
+            status = o.status, task = req.task, goal = plan?.goal, summary = summary, url = url, title = title,
             pageText = pageText, steps = steps, seconds = seconds, jevCalls = run.log.jevCalls, llmCalls = run.log.llmCalls,
             toolCalls = run.log.toolCalls, costUsd = run.log.jevCost.takeIf { run.log.jevCalls > 0 },
             llmTokens = run.log.llmTokens.takeIf { it > 0 }, jevModel = req.jevModel, llmModel = llm.label,
-            confidences = Cu.confidenceStats(steps), screenshotPath = st.lastShot, error = error,
+            confidences = Cu.confidenceStats(steps), screenshotPath = st.lastShot, error = o.error,
         )
         run.report.value = report
         return report
     }
 
-    private fun defaultSummary(o: Outcome, steps: List<UseStep>): String = when (o.status) {
-        UseStatus.DONE -> "Done in ${steps.size} steps."
-        UseStatus.BLOCKED -> "Stopped after ${steps.size} steps: ${o.error ?: "blocked"}."
-        UseStatus.BUDGET -> "Ran out of budget after ${steps.size} steps: ${o.error ?: "limit reached"}."
-        UseStatus.ERROR -> "Failed: ${o.error ?: "unknown error"}."
-    }
-
     companion object {
         private const val NO_BROWSER_NOTE = "NO_BROWSER"
+        const val WRITTEN_BY_MODEL = "written by the model"
 
         fun fileHash(path: String): String =
             MessageDigest.getInstance("SHA-1").digest(File(path).readBytes()).joinToString("") { "%02x".format(it) }
@@ -552,6 +554,7 @@ internal class LockedTabs(
     private val owner: TabLocks.Owner,
     /** The host's createBrowserTab, in the active space. */
     private val create: suspend (url: String, title: String) -> String?,
+    private val show: suspend (tabId: String) -> Unit = {},
 ) : UseTabs {
     override suspend fun open(url: String): String? {
         val id = create(url, StartPages.TAB_TITLE) ?: return null
@@ -560,4 +563,19 @@ internal class LockedTabs(
     }
     override fun claim(tabId: String): String? = locks.tryAcquire(tabId, owner)
     override fun release(tabId: String) = locks.release(tabId)
+    override suspend fun reveal(tabId: String) = show(tabId)
+}
+
+/**
+ * Brings [tabId] to the front of its pane in the space on screen: the host lists a new tab a moment
+ * after it creates it, so the lookup retries briefly. Never throws; a tab that cannot be found stays where it is.
+ */
+internal suspend fun revealTab(provider: ai.rever.boss.plugin.api.ActiveTabsProvider?, tabId: String, waitsMs: List<Long> = listOf(0, 100, 200, 400, 800)) {
+    val p = provider ?: return
+    for (w in waitsMs) {
+        if (w > 0) delay(w)
+        val tab = runCatching { p.activeTabs.value.firstOrNull { it.tabId == tabId } }.getOrNull() ?: continue
+        runCatching { kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) { p.selectTab(tabId, tab.panelId) } }
+        return
+    }
 }

@@ -65,6 +65,9 @@ class HeadlessRunner(
     private val drivable: (tabId: String) -> Boolean,
     /** The host's createBrowserTab, in the active space; null when it made no tab. */
     private val openTab: suspend (url: String, title: String) -> String?,
+    // No default: a forgotten one would run `browser_use` in a tab the person cannot see.
+    /** Brings a tab to the front in the space on screen. */
+    private val reveal: suspend (tabId: String) -> Unit,
     // No default: a forgotten one would give headless runs their own locks, apart from the panel's.
     private val locks: TabLocks,
     // No default, for the same reason: a forgotten one would hide headless runs from llmrpa_export.
@@ -80,8 +83,10 @@ class HeadlessRunner(
         model: String?,
         newTab: Boolean = false,
         startUrl: String? = null,
+        pointerLabel: String = "Jev",
+        show: Boolean = false,
     ): Result<RunState> = try {
-        executeUnguarded(instruction, tabId, maxSteps, model, newTab || startUrl != null, startUrl)
+        executeUnguarded(instruction, tabId, maxSteps, model, newTab || startUrl != null, startUrl, pointerLabel, show)
     } catch (e: CancellationException) {
         throw e
     } catch (e: Throwable) {
@@ -95,6 +100,8 @@ class HeadlessRunner(
         model: String?,
         newTab: Boolean,
         startUrl: String?,
+        pointerLabel: String,
+        show: Boolean,
     ): Result<RunState> {
         if (!tools.has(ToolNames.OBSERVE) || !tools.has(ToolNames.STEP)) {
             return Result.failure(IllegalStateException("RPA Engine with rpa_observe and rpa_step is not installed"))
@@ -126,10 +133,11 @@ class HeadlessRunner(
             return Result.failure(IllegalStateException("Jev is not installed or not loaded (no jev_decide tool). Install it from Toolbox, or pass a chat model."))
         }
         val decider = if (option.kind == ModelOption.Kind.DECISION) JevDecider(tools, option) else ChatDecider(gateway, option)
-        val opener = if (tab == null) NewTab(openTab, claim = { locks.tryAcquire(it, TabLocks.Owner.HEADLESS) }, startUrl = start) else null
+        val opener = if (tab == null) NewTab(if (show) ({ u, t -> openTab(u, t)?.also { id -> runCatching { reveal(id) } } }) else openTab, claim = { locks.tryAcquire(it, TabLocks.Owner.HEADLESS) }, startUrl = start) else null
         // Built before the lock, so a constructor that throws cannot leave the tab held.
-        val runner = TaskRunner(tools, decider, tab?.tabId, instruction, limits.copy(maxSteps = maxSteps), newTab = opener, pointerLabel = "Jev") { Answer.Stop }
+        val runner = TaskRunner(tools, decider, tab?.tabId, instruction, limits.copy(maxSteps = maxSteps), newTab = opener, pointerLabel = pointerLabel.ifBlank { "Jev" }) { Answer.Stop }
         tab?.let { t -> locks.tryAcquire(t.tabId, TabLocks.Owner.HEADLESS)?.let { return Result.failure(IllegalStateException(it)) } }
+        if (show) tab?.let { t -> runCatching { reveal(t.tabId) } }
         return try {
             // Bounded, so a caller that times out does not leave a run going on the user's tab.
             Result.success(withTimeoutOrNull(timeLimitMs) { runner.run() } ?: runner.also { it.timedOut(timeLimitMs) }.state.value)
@@ -154,8 +162,9 @@ class HeadlessRunner(
         pointerLabel: String,
         maxSteps: Int,
         timeoutMs: Long,
+        llmTyping: Boolean = true,
     ): Result<UseReport> = try {
-        browserUseUnguarded(task, tabId, newTab || (url != null && tabId == null), url, model, planner, pointerLabel, maxSteps, timeoutMs)
+        browserUseUnguarded(task, tabId, newTab || (url != null && tabId == null), url, model, planner, pointerLabel, maxSteps, timeoutMs, llmTyping)
     } catch (e: CancellationException) {
         throw e
     } catch (e: Throwable) {
@@ -164,7 +173,7 @@ class HeadlessRunner(
 
     private suspend fun browserUseUnguarded(
         task: String, tabId: String?, newTab: Boolean, url: String?, model: String?, planner: String?,
-        pointerLabel: String, maxSteps: Int, timeoutMs: Long,
+        pointerLabel: String, maxSteps: Int, timeoutMs: Long, llmTyping: Boolean,
     ): Result<UseReport> {
         if (!tools.has(ToolNames.OBSERVE) || !tools.has(ToolNames.STEP)) {
             return Result.failure(IllegalStateException("RPA Engine with rpa_observe and rpa_step is not installed"))
@@ -179,20 +188,21 @@ class HeadlessRunner(
                 same.singleOrNull()
             } ?: return Result.failure(IllegalArgumentException("Unknown planner_model '$id'. Pass a chat model id configured in Settings → AI Providers."))
         }
-        val flow = ComputerUseFlow(tools, gateway, LockedTabs(locks, TabLocks.Owner.HEADLESS, openTab),
+        val flow = ComputerUseFlow(tools, gateway, LockedTabs(locks, TabLocks.Owner.HEADLESS, openTab, reveal),
             openWaitsMs = limits.openWaitsMs, settleMs = limits.navSettleMs, stepSettleMs = limits.stepSettleMs)
-        val request = UseRequest(task, page, tab?.tabId, model ?: Cu.VISION_DEFAULT_MODEL, llm, pointerLabel, maxSteps, timeoutMs, confirm = null)
+        val request = UseRequest(task, page, tab?.tabId, model ?: Cu.VISION_DEFAULT_MODEL, llm, pointerLabel.ifBlank { "Jev" }, llmTyping, maxSteps, timeoutMs, confirm = null)
         return Result.success(flow.runComputerUse(request))
     }
 
     /** `browser_use` in `dom` mode: the text-list runner of `llmrpa_execute`, returned in the same JSON shape. */
     suspend fun browserUseDom(
         task: String, tabId: String?, newTab: Boolean, url: String?, model: String?, maxSteps: Int, timeoutMs: Long, includeText: Boolean,
+        pointerLabel: String = "Jev",
     ): Result<kotlinx.serialization.json.JsonObject> {
         val started = System.currentTimeMillis()
         var timedOut = false
         val state = withTimeoutOrNull(timeoutMs) {
-            execute(task, tabId, maxSteps, model, newTab, url)
+            execute(task, tabId, maxSteps, model, newTab, url, pointerLabel, show = true)
         }?.getOrElse { return Result.failure(it) } ?: run { timedOut = true; runs.recent().firstOrNull() }
         if (state == null) return Result.failure(IllegalStateException("The run timed out before it started"))
         val status = when { timedOut -> "budget"; state.status == RunStatus.DONE -> "done"; state.status == RunStatus.FAILED -> "error"; else -> "blocked" }

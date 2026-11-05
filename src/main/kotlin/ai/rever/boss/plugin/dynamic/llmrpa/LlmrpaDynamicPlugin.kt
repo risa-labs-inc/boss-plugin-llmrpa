@@ -88,6 +88,7 @@ class LlmrpaDynamicPlugin : DynamicPlugin {
                         val p = activeTabsProvider ?: error("This BOSS build exposes no tabs to plugins, so no tab can be opened")
                         withContext(Dispatchers.Main) { p.createBrowserTab(url, title) }
                     },
+                    reveal = { id -> revealTab(activeTabsProvider, id) },
                     locks = tabLocks,
                     runs = runHistory,
                 ),

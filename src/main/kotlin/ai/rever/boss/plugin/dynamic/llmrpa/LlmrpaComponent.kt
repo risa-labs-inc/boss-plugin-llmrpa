@@ -558,6 +558,11 @@ class LlmrpaComponent(
     val jevModelId: StateFlow<String> = _jevModelId
     fun selectJevModel(id: String) { _jevModelId.value = id }
 
+    private val _llmTyping = MutableStateFlow(true)
+    /** Whether the planner chat model may write text for a field when nothing from the request fits. */
+    val llmTyping: StateFlow<Boolean> = _llmTyping
+    fun setLlmTyping(on: Boolean) { _llmTyping.value = on }
+
     private val _plannerModel = MutableStateFlow<ModelOption?>(null)
     /** The chat model that plans and writes the report; null = the one selected in Settings. */
     val plannerModel: StateFlow<ModelOption?> = _plannerModel
@@ -601,13 +606,13 @@ class LlmrpaComponent(
             provider?.let { withContext(Dispatchers.Main) { it.createBrowserTab(url, title) } }
         }
         val flow = ComputerUseFlow(
-            tools, aiGateway, LockedTabs(tabLocks, TabLocks.Owner.PANEL, create),
+            tools, aiGateway, LockedTabs(tabLocks, TabLocks.Owner.PANEL, create) { id -> revealTab(provider, id) },
             openWaitsMs = baseLimits.openWaitsMs, settleMs = baseLimits.navSettleMs, stepSettleMs = baseLimits.stepSettleMs,
         )
         val run = UseRun(task)
         val request = UseRequest(
             task = task, tabId = tab?.tabId, jevModel = _jevModelId.value, llm = _plannerModel.value,
-            pointerLabel = _pointerLabel.value.ifBlank { "Jev" }, maxSteps = 25, timeoutMs = 10 * 60_000L,
+            pointerLabel = _pointerLabel.value.ifBlank { "Jev" }, llmTyping = _llmTyping.value, maxSteps = 25, timeoutMs = 10 * 60_000L,
             confirm = { _, _ -> run.question.value?.answer?.await() ?: true },
         )
         _useRun.value = run
