@@ -110,19 +110,28 @@ private fun JevIntro(component: LlmrpaComponent) {
 @Composable
 private fun Composer(component: LlmrpaComponent, input: String, active: Boolean, error: String?) {
     val blocker = component.useBlocker()
+    val run by component.useRun.collectAsState()
+    val replyMode by component.replyMode.collectAsState()
+    val report = run?.report?.collectAsState()?.value
+    // A run that stopped for input waits for a reply in this box, on the same tab.
+    val replying = replyMode && !active && report?.blocker?.tabId != null
     Column(Modifier.fillMaxWidth().background(RpaTokens.Panel).padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         RpaTextArea(
             input, component::updateUseInput, Modifier.fillMaxWidth(),
-            placeholder = "e.g. Find the top 10 restaurants in Palo Alto", label = "Request for Jev", minHeight = 44, readOnly = active,
+            placeholder = if (replying) "Reply to Jev to continue on the same page" else "e.g. Find the top 10 restaurants in Palo Alto",
+            label = if (replying) "Reply to Jev" else "Request for Jev", minHeight = 44, readOnly = active,
         )
-        if (!active) ModelRow(component, enabled = true)
+        if (!active && !replying) ModelRow(component, enabled = true)
         if (blocker != null && input.isNotBlank() && !active) Notice(blocker, Tone.WARNING)
         error?.let { Notice(it, Tone.ERROR, onDismiss = component::clearError) }
         if (active) OutlineButton("Stop", component::stopUse, tone = Tone.ERROR)
         else {
-            BossPrimaryButton("Send", onClick = { component.startUse()?.let { component.showError(it) } },
-                modifier = Modifier.height(34.dp), enabled = input.isNotBlank() && blocker == null, icon = Icons.Outlined.PlayArrow)
-            Text("Every step sends a screenshot of the page to the Jev model. The chat model sees your request, and the field and recent steps when it writes text.",
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                BossPrimaryButton(if (replying) "Reply" else "Send", onClick = { component.submitUse()?.let { component.showError(it) } },
+                    modifier = Modifier.height(34.dp), enabled = input.isNotBlank() && blocker == null, icon = Icons.Outlined.PlayArrow)
+                if (replying) LinkText("Start a new request", component::newUseRequest)
+            }
+            Text("Every step sends a screenshot of the page to OpenRouter (Jev), and the page text to the chat model.",
                 color = RpaTokens.TextMuted, fontSize = 11.sp)
         }
     }
@@ -137,6 +146,8 @@ private fun ModelRow(component: LlmrpaComponent, enabled: Boolean) {
     val groups by component.modelGroups.collectAsState()
     val pointer by component.pointerLabel.collectAsState()
     val llmTyping by component.llmTyping.collectAsState()
+    val consult by component.consultWhenStuck.collectAsState()
+    val extract by component.extract.collectAsState()
     var menu by remember { mutableStateOf<String?>(null) }
     FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         Box {
@@ -166,6 +177,8 @@ private fun ModelRow(component: LlmrpaComponent, enabled: Boolean) {
                 }
             }
         }
+        OutlineButton("When stuck: ${if (consult) "consult the LLM" else "ask me"}", { component.setConsultWhenStuck(!consult) }, enabled = enabled, tone = Tone.NEUTRAL)
+        OutlineButton("Answer with LLM: ${if (extract) "on" else "off"}", { component.setExtract(!extract) }, enabled = enabled, tone = Tone.NEUTRAL)
         OutlineButton("LLM typing: ${if (llmTyping) "on" else "off"}", { component.setLlmTyping(!llmTyping) }, enabled = enabled, tone = Tone.NEUTRAL)
         Box {
             OutlineButton("Pointer: ${pointer.ifBlank { "Jev" }}", { menu = "pointer" }, enabled = enabled, tone = Tone.NEUTRAL, trailing = "▾")
@@ -218,7 +231,9 @@ private fun JevRunView(component: LlmrpaComponent, run: UseRun, active: Boolean)
         }
     }
     if (!active) {
-        report?.let { ReportCard(it) } ?: Text("Stopped before a report was written.", color = RpaTokens.TextSecondary, fontSize = 12.sp)
+        val finished = report
+        finished?.blocker?.takeIf { finished.status == UseStatus.NEEDS_INPUT }?.let { NeedsInputCard(it) }
+        finished?.let { ReportCard(it) } ?: Text("Stopped before a report was written.", color = RpaTokens.TextSecondary, fontSize = 12.sp)
     }
     ActivitySection(activity, active)
 }
@@ -234,7 +249,7 @@ private fun UseStepRow(s: UseStep) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
             Text("${s.index}", color = tone.color(), fontSize = 12.sp, fontWeight = FontWeight.Bold)
             Text(s.description, color = RpaTokens.Text, fontSize = 13.sp, modifier = Modifier.weight(1f))
-            Text("${TaskRunner.pct(s.confidence)} sure", color = RpaTokens.TextSecondary, fontSize = 11.sp)
+            if (s.op == VisionOp.CONSULT) Pill("chat model") else Text("${TaskRunner.pct(s.confidence)} sure", color = RpaTokens.TextSecondary, fontSize = 11.sp)
         }
         val notes = listOfNotNull(
             s.note?.takeIf { !it.startsWith("amount") },
@@ -248,7 +263,7 @@ private fun UseStepRow(s: UseStep) {
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun ReportCard(r: UseReport) {
-    val tone = when (r.status) { UseStatus.DONE -> Tone.SUCCESS; UseStatus.BLOCKED, UseStatus.BUDGET -> Tone.WARNING; UseStatus.ERROR -> Tone.ERROR }
+    val tone = when (r.status) { UseStatus.DONE -> Tone.SUCCESS; UseStatus.NEEDS_INPUT, UseStatus.BLOCKED, UseStatus.BUDGET -> Tone.WARNING; UseStatus.ERROR -> Tone.ERROR }
     Column(
         Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).background(RpaTokens.Panel).border(1.dp, tone.color().copy(alpha = 0.55f), RoundedCornerShape(8.dp)).padding(12.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -258,6 +273,13 @@ private fun ReportCard(r: UseReport) {
             Pill(r.status.name.lowercase(), tone)
         }
         Text(r.summary, color = RpaTokens.TextSecondary, fontSize = 12.sp)
+        if (r.extract) {
+            Column(Modifier.fillMaxWidth().clip(RpaTokens.Shape).background(RpaTokens.Content).padding(10.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                SectionLabel("Answer (written by the LLM from the collected text)")
+                Text(r.answer ?: "The LLM gave no answer from the collected text.", color = if (r.answer != null) RpaTokens.Text else RpaTokens.TextSecondary, fontSize = 13.sp)
+            }
+        }
+        if (r.collected.isNotEmpty()) CollectedBlock(r.collected)
         r.pageText?.takeIf { it.isNotBlank() }?.let { PageTextBlock(it) }
         FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Pill("%.1f s".format(r.seconds))
@@ -336,3 +358,41 @@ private fun PageTextBlock(text: String) {
 }
 
 private const val EXCERPT_CHARS = 2_000
+
+/** A run that stopped for the person: what it needs, and where to answer. */
+@Composable
+private fun NeedsInputCard(b: UseBlocker) {
+    Column(
+        Modifier.fillMaxWidth().clip(RpaTokens.Shape).background(RpaTokens.Panel).border(1.dp, RpaTokens.Warning.copy(alpha = 0.6f), RpaTokens.Shape).padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Text("Jev needs your input", color = RpaTokens.Text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+        Text(b.question ?: b.reason, color = RpaTokens.Text, fontSize = 13.sp)
+        Text("Why it stopped: ${b.reason}", color = RpaTokens.TextSecondary, fontSize = 12.sp)
+        b.url?.let { Text("Still on $it", color = RpaTokens.TextMuted, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis) }
+        Text("Type your reply below: Jev continues on this same page, not a new one.", color = RpaTokens.TextSecondary, fontSize = 12.sp)
+    }
+}
+
+/** What the run saved from pages, one expandable row each. */
+@Composable
+private fun CollectedBlock(items: List<CollectedItem>) {
+    Column(Modifier.fillMaxWidth().clip(RpaTokens.Shape).background(RpaTokens.Content).padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        SectionLabel("Collected (${items.size} ${if (items.size == 1) "page" else "pages"})")
+        items.forEach { c ->
+            var open by remember { mutableStateOf(false) }
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Row(
+                    Modifier.fillMaxWidth().clickable(role = Role.Button) { open = !open }.pointerHoverIcon(PointerIcon.Hand),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(if (open) "▾" else "▸", color = RpaTokens.TextMuted, fontSize = 11.sp)
+                    Text(c.title.ifBlank { host(c.url) }, color = RpaTokens.Text, fontSize = 12.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                    Pill(if (c.auto) "auto" else "Jev")
+                }
+                Text("${host(c.url)} · ${c.text.length} characters", color = RpaTokens.TextMuted, fontSize = 11.sp)
+                if (open) Text(c.text.take(2_000) + if (c.text.length > 2_000) "…" else "", color = RpaTokens.TextSecondary, fontSize = 12.sp, lineHeight = 17.sp)
+            }
+        }
+    }
+}

@@ -563,6 +563,21 @@ class LlmrpaComponent(
     val llmTyping: StateFlow<Boolean> = _llmTyping
     fun setLlmTyping(on: Boolean) { _llmTyping.value = on }
 
+    private val _consultWhenStuck = MutableStateFlow(false)
+    /** When stuck: false asks the person (the default), true consults the planner chat model first. */
+    val consultWhenStuck: StateFlow<Boolean> = _consultWhenStuck
+    fun setConsultWhenStuck(on: Boolean) { _consultWhenStuck.value = on }
+
+    private val _extract = MutableStateFlow(false)
+    /** One LLM call answers the request from the collected text. */
+    val extract: StateFlow<Boolean> = _extract
+    fun setExtract(on: Boolean) { _extract.value = on }
+
+    private val _replyMode = MutableStateFlow(true)
+    /** After a run stops for input, the box replies to it (continuing on the same tab) until a new request is asked for. */
+    val replyMode: StateFlow<Boolean> = _replyMode
+    fun newUseRequest() { _replyMode.value = false; _useInput.value = "" }
+
     private val _plannerModel = MutableStateFlow<ModelOption?>(null)
     /** The chat model that plans the task and writes text for fields; null = the one selected in Settings. */
     val plannerModel: StateFlow<ModelOption?> = _plannerModel
@@ -591,30 +606,22 @@ class LlmrpaComponent(
         else -> null
     }
 
-    /** Starts a request in the Jev tab on the target tab (or a new one). Returns why it did not start, or null. */
-    fun startUse(): String? {
-        val task = _useInput.value.trim()
-        if (task.isEmpty()) return "Type what you want done first"
-        if (isUsing) return "A request is already running"
-        useBlocker()?.let { return it }
-        val tab = _selectedTab.value.takeIf { !_newTab.value }
-        if (tab != null && !canDrive(tab.tabId)) return NO_BROWSER_HINT
-        val provider = activeTabsProvider
-        if (tab == null && provider == null) return Blocker.TAB.detail
+    /** Sends the box: a reply that continues a run waiting for input, else a new request. Returns why nothing started, or null. */
+    fun submitUse(): String? =
+        if (_replyMode.value && _useRun.value?.report?.value?.blocker?.tabId != null && !isUsing) continueUse() else startUse()
+
+    private fun useFlow(provider: ActiveTabsProvider?): ComputerUseFlow {
         val create: suspend (String, String) -> String? = { url, title ->
             // On Main: the host adds the tab to its split view state.
             provider?.let { withContext(Dispatchers.Main) { it.createBrowserTab(url, title) } }
         }
-        val flow = ComputerUseFlow(
+        return ComputerUseFlow(
             tools, aiGateway, LockedTabs(tabLocks, TabLocks.Owner.PANEL, create) { id -> revealTab(provider, id) },
             openWaitsMs = baseLimits.openWaitsMs, settleMs = baseLimits.navSettleMs, stepSettleMs = baseLimits.stepSettleMs,
         )
-        val run = UseRun(task)
-        val request = UseRequest(
-            task = task, tabId = tab?.tabId, jevModel = _jevModelId.value, llm = _plannerModel.value,
-            pointerLabel = _pointerLabel.value.ifBlank { "Jev" }, llmTyping = _llmTyping.value, maxSteps = 25, timeoutMs = 10 * 60_000L,
-            confirm = { _, _ -> run.question.value?.answer?.await() ?: true },
-        )
+    }
+
+    private fun launchUse(flow: ComputerUseFlow, request: UseRequest, run: UseRun) {
         _useRun.value = run
         _errorMessage.value = null
         useJob = scope.launch {
@@ -627,6 +634,46 @@ class LlmrpaComponent(
                 _errorMessage.value = "The run failed: ${e.message ?: e::class.simpleName}"
             }
         }.also { job -> job.invokeOnCompletion { scope.launch { probeDrivable() } } }
+    }
+
+    private fun baseRequest(run: UseRun, tabId: String?, resume: Boolean, advice: List<String>) = UseRequest(
+        task = run.task, tabId = tabId, jevModel = _jevModelId.value, llm = _plannerModel.value,
+        pointerLabel = _pointerLabel.value.ifBlank { "Jev" }, llmTyping = _llmTyping.value,
+        onStuck = if (_consultWhenStuck.value) OnStuck.CONSULT else OnStuck.RETURN,
+        inputs = run.inputs.toMap(), extract = _extract.value, resume = resume, advice = advice,
+        maxSteps = 25, timeoutMs = 10 * 60_000L,
+        confirm = { _, _ -> run.question.value?.answer?.await() ?: true },
+    )
+
+    /** Starts a request in the Jev tab on the target tab (or a new one). Returns why it did not start, or null. */
+    fun startUse(): String? {
+        val task = _useInput.value.trim()
+        if (task.isEmpty()) return "Type what you want done first"
+        if (isUsing) return "A request is already running"
+        useBlocker()?.let { return it }
+        val tab = _selectedTab.value.takeIf { !_newTab.value }
+        if (tab != null && !canDrive(tab.tabId)) return NO_BROWSER_HINT
+        val provider = activeTabsProvider
+        if (tab == null && provider == null) return Blocker.TAB.detail
+        _replyMode.value = true
+        val run = UseRun(task)
+        launchUse(useFlow(provider), baseRequest(run, tab?.tabId, resume = false, advice = emptyList()), run)
+        return null
+    }
+
+    /** Continues the run that stopped for input, on the same tab: the reply is advice for Jev and an input it may type. */
+    fun continueUse(): String? {
+        val run = _useRun.value ?: return "Nothing to continue"
+        val blocker = run.report.value?.blocker
+        val tab = blocker?.tabId ?: return "That run left no tab to continue on"
+        val reply = _useInput.value.trim()
+        if (reply.isEmpty()) return "Type your reply first"
+        if (isUsing) return "A request is already running"
+        useBlocker()?.let { return it }
+        val name = generateSequence(1) { it + 1 }.map { if (it == 1) "reply" else "reply$it" }.first { it !in run.inputs }
+        run.inputs[name] = reply
+        _useInput.value = ""
+        launchUse(useFlow(activeTabsProvider), baseRequest(run, tab, resume = true, advice = listOf("The person replied: $reply")), run)
         return null
     }
 

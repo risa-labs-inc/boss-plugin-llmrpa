@@ -152,36 +152,22 @@ class HeadlessRunner(
      * choosing, never waiting for a person. [model] is the Jev model, [planner] a chat model id (default:
      * the one selected in Settings).
      */
-    internal suspend fun browserUse(
-        task: String,
-        tabId: String?,
-        newTab: Boolean,
-        url: String?,
-        model: String?,
-        planner: String?,
-        pointerLabel: String,
-        maxSteps: Int,
-        timeoutMs: Long,
-        llmTyping: Boolean = true,
-    ): Result<UseReport> = try {
-        browserUseUnguarded(task, tabId, newTab || (url != null && tabId == null), url, model, planner, pointerLabel, maxSteps, timeoutMs, llmTyping)
+    internal suspend fun browserUse(a: BrowserUseArgs): Result<UseReport> = try {
+        browserUseUnguarded(a, a.newTab || (a.url != null && a.tabId == null))
     } catch (e: CancellationException) {
         throw e
     } catch (e: Throwable) {
         Result.failure(IllegalStateException("The run failed: ${e.message ?: e::class.simpleName}", e))
     }
 
-    private suspend fun browserUseUnguarded(
-        task: String, tabId: String?, newTab: Boolean, url: String?, model: String?, planner: String?,
-        pointerLabel: String, maxSteps: Int, timeoutMs: Long, llmTyping: Boolean,
-    ): Result<UseReport> {
+    private suspend fun browserUseUnguarded(a: BrowserUseArgs, newTab: Boolean): Result<UseReport> {
         if (!tools.has(ToolNames.OBSERVE) || !tools.has(ToolNames.STEP)) {
             return Result.failure(IllegalStateException("RPA Engine with rpa_observe and rpa_step is not installed"))
         }
-        if (newTab && tabId != null) return Result.failure(IllegalArgumentException("Pass tab_id or new_tab/url, not both"))
-        val page = url?.let { StartPages.usable(it, httpsOnly = false) ?: return Result.failure(IllegalArgumentException("url must be an http(s) address with a host and no credentials")) }
-        val tab = if (newTab) null else pickTab(tabId).getOrElse { return Result.failure(it) }
-        val llm = planner?.let { id ->
+        if (newTab && a.tabId != null) return Result.failure(IllegalArgumentException("Pass tab_id or new_tab/url, not both"))
+        val page = a.url?.let { StartPages.usable(it, httpsOnly = false) ?: return Result.failure(IllegalArgumentException("url must be an http(s) address with a host and no credentials")) }
+        val tab = if (newTab) null else pickTab(a.tabId).getOrElse { return Result.failure(it) }
+        val llm = a.plannerModel?.let { id ->
             val chat = withContext(Dispatchers.IO) { ModelDirectory(tools, llmProvider, gateway).load() }.flatMap { it.models }.filter { it.kind == ModelOption.Kind.CHAT }
             chat.firstOrNull { it.key == id } ?: chat.filter { it.modelId == id }.let { same ->
                 if (same.size > 1) return Result.failure(IllegalArgumentException("'$id' is offered by more than one provider. Pass one of: ${same.joinToString { it.key }}"))
@@ -190,7 +176,12 @@ class HeadlessRunner(
         }
         val flow = ComputerUseFlow(tools, gateway, LockedTabs(locks, TabLocks.Owner.HEADLESS, openTab, reveal),
             openWaitsMs = limits.openWaitsMs, settleMs = limits.navSettleMs, stepSettleMs = limits.stepSettleMs)
-        val request = UseRequest(task, page, tab?.tabId, model ?: Cu.VISION_DEFAULT_MODEL, llm, pointerLabel.ifBlank { "Jev" }, llmTyping, maxSteps, timeoutMs, confirm = null)
+        val request = UseRequest(
+            task = a.task, url = page, tabId = tab?.tabId, jevModel = a.model ?: Cu.VISION_DEFAULT_MODEL, llm = llm,
+            pointerLabel = a.displayName.ifBlank { "Jev" }, llmTyping = a.llmTyping,
+            onStuck = a.onStuck, consultBelow = a.consultBelow, maxConsults = a.maxConsults, inputs = a.inputs, extract = a.extract,
+            maxSteps = a.maxSteps, timeoutMs = a.timeoutS * 1000L, confirm = null,
+        )
         return Result.success(flow.runComputerUse(request))
     }
 

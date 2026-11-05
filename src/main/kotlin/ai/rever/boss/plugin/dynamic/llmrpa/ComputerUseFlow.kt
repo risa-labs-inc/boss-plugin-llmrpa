@@ -18,7 +18,10 @@ import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.doubleOrNull
+import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonObject
+import kotlinx.serialization.json.Json
 import java.io.File
 import java.security.MessageDigest
 
@@ -171,18 +174,21 @@ internal class UseLlm(
     val label: String get() = option?.let { "${it.providerName} ${it.modelId}" }
         ?: runCatching { gateway()?.activeModel()?.let { "${it.providerName} ${it.modelId}" } }.getOrNull() ?: "active model"
 
-    suspend fun ask(purpose: String, system: String, user: String): Result<String> {
+    /** Whether the gateway can take a screenshot with the question. */
+    fun sees(): Boolean = runCatching { gateway()?.capabilities()?.contains(AiGatewayAPI.CAPABILITY_VISION) == true }.getOrDefault(false)
+
+    suspend fun ask(purpose: String, system: String, user: String, image: ByteArray? = null): Result<String> {
         val at = clock()
         val started = System.nanoTime()
         fun record(result: String, failed: Boolean, tokens: Int? = null) = log.add(ActivityEntry(
-            n = 0, atMs = at, kind = ActivityKind.LLM, name = "gateway chat: $purpose", args = "$label, ${user.length} chars",
+            n = 0, atMs = at, kind = ActivityKind.LLM, name = "gateway chat: $purpose", args = "$label, ${user.length} chars${if (image != null) ", screenshot" else ""}",
             result = result.take(220), durationMs = (System.nanoTime() - started) / 1_000_000, tokens = tokens, failed = failed,
         ))
         val api = runCatching { gateway() }.getOrNull()
             ?: return Result.failure<String>(IllegalStateException("The AI Gateway plugin is not available")).also { record("no gateway", true) }
         option?.let { ChatDecider.routingProblem(api, it) }?.let { return Result.failure<String>(IllegalStateException(it)).also { _ -> record(it, true) } }
         val request = AiRequest(
-            system = system, messages = listOf(AiMessage.user(user)), temperature = 0f, maxTokens = 3_000, timeoutMs = 90_000,
+            system = system, messages = listOf(userMessage(user, image)), temperature = 0f, maxTokens = 3_000, timeoutMs = 90_000,
             extras = option?.let { ChatDecider.routingExtras(it) }.orEmpty(),
         )
         return try {
@@ -199,22 +205,43 @@ internal class UseLlm(
     }
 }
 
+
+/** The user turn, with [image] attached when there is one; a gateway build that cannot take it gets the text alone. */
+private fun userMessage(text: String, image: ByteArray?): AiMessage =
+    if (image == null) AiMessage.user(text)
+    else runCatching { AiMessage(AiMessage.ROLE_USER, text, listOf(ai.rever.boss.plugin.api.AiImage(image, "image/jpeg"))) }.getOrElse { AiMessage.user(text) }
+
 // ---- The request and its live view ----
 
+internal enum class OnStuck { RETURN, CONSULT }
+
 /**
- * One computer-use request. With [tabId] the run acts on that tab; without it, it opens a new one.
- * A [url] replaces the planner's choice of page (the goal is still planned).
+ * One computer-use request. With [tabId] the run acts on that tab where it is (no navigation unless [url] is
+ * given); without it, it opens a new one. A [url] replaces the planner's choice of page (the goal is still planned).
+ * With [resume] the run continues the one in the [UseRun] it is given: its plan, steps and collected pages.
  */
 internal data class UseRequest(
     val task: String,
     val url: String? = null,
     val tabId: String? = null,
     val jevModel: String = Cu.VISION_DEFAULT_MODEL,
-    /** The planner and reporter; null = the active chat model. */
+    /** The planner, typist and consultant; null = the active chat model. */
     val llm: ModelOption? = null,
     val pointerLabel: String = "Jev",
     /** May the planner chat model write text for a field when no text from the request fits? Never for a private field. */
     val llmTyping: Boolean = true,
+    /** What to do when the run is stuck: stop and say so, or ask the chat model what to do. */
+    val onStuck: OnStuck = OnStuck.RETURN,
+    /** Jev's operation confidence below this counts as stuck. */
+    val consultBelow: Double = 0.5,
+    val maxConsults: Int = 5,
+    /** Named values the caller gives (a phone number, a code); names that sound private are only typed into private fields. */
+    val inputs: Map<String, String> = emptyMap(),
+    /** One LLM call that answers the task from the collected text. */
+    val extract: Boolean = false,
+    val resume: Boolean = false,
+    /** Direction from the person, such as the reply to a question; Jev sees it as advice. */
+    val advice: List<String> = emptyList(),
     val maxSteps: Int = 25,
     val timeoutMs: Long = 180_000,
     /** Asked before an action Jev is unsure of; null never asks (a headless caller must not block on a person). */
@@ -238,7 +265,7 @@ enum class UsePhase(val label: String) {
     IDLE("Ready"), PLANNING("Planning"), OPENING("Opening the page"), RUNNING("Jev is working"), REPORTING("Writing the report"), FINISHED("Finished")
 }
 
-/** The live state of one request: what the Jev tab shows while the flow runs and after. */
+/** The live state of one request: what the Jev tab shows while the flow runs and after. A resumed run keeps it. */
 internal class UseRun(val task: String, val startedAt: Long = System.currentTimeMillis()) {
     val log = ActivityLog()
     val phase = MutableStateFlow(UsePhase.PLANNING)
@@ -247,14 +274,24 @@ internal class UseRun(val task: String, val startedAt: Long = System.currentTime
     val question = MutableStateFlow<UseQuestion?>(null)
     val report = MutableStateFlow<UseReport?>(null)
     val pageUrl = MutableStateFlow<String?>(null)
+    val collected = MutableStateFlow<List<CollectedItem>>(emptyList())
+
+    internal val store = CollectedStore()
+    internal val visited = mutableListOf<PageVisit>()
+    internal val snapshotted = mutableSetOf<String>()
+    internal val advice = mutableListOf<String>()
+    internal var tabId: String? = null
+    internal var priorMs = 0L
+    /** Named values the person gave in replies, offered to Jev's text choice on a continued run. */
+    internal val inputs = mutableMapOf<String, String>()
 }
 
-private data class Outcome(val status: UseStatus, val error: String? = null)
+private data class Outcome(val status: UseStatus, val error: String? = null, val question: String? = null)
 
 /**
- * Plan, open, loop, report, as one function with no UI in it: `runComputerUse(request)` returns the
- * [UseReport]. The panel's Jev tab, `browser_use` and any other caller share it; [run] carries the
- * live view and the activity log.
+ * Plan, open, loop (with stuck handling and collecting), report, as one function with no UI in it:
+ * `runComputerUse(request)` returns the [UseReport]. The panel's Jev tab, `browser_use` and any other caller
+ * share it; [run] carries the live view and the activity log.
  */
 internal class ComputerUseFlow(
     private val rawTools: ToolInvoker,
@@ -270,7 +307,10 @@ internal class ComputerUseFlow(
     suspend fun runComputerUse(req: UseRequest, run: UseRun = UseRun(req.task, clock())): UseReport {
         val tools = RecordingTools(rawTools, run.log, clock)
         val llm = UseLlm(gateway, req.llm, run.log, clock)
-        val state = FlowState()
+        val state = FlowState(segmentStart = clock())
+        // A name that sounds private keeps its value out of every record.
+        req.inputs.filterKeys(Cu::secretName).values.filter { it.isNotBlank() }.forEach { tools.secrets.add(it) }
+        run.report.value = null
         var outcome = Outcome(UseStatus.ERROR, "The run did not start")
         try {
             outcome = withTimeoutOrNull(req.timeoutMs) { execute(req, run, tools, llm, state) }
@@ -292,7 +332,7 @@ internal class ComputerUseFlow(
         }
     }
 
-    private class FlowState {
+    private class FlowState(val segmentStart: Long) {
         var tab: String? = null
         var lastShot: String? = null
     }
@@ -303,15 +343,18 @@ internal class ComputerUseFlow(
         }
         Cu.visionProblem(req.jevModel, rawTools.inputSchema(ToolNames.JEV_DECIDE))?.let { return Outcome(UseStatus.ERROR, it) }
 
-        // 1. PLAN
-        run.phase.value = UsePhase.PLANNING
-        val planText = llm.ask("plan", Cu.PLAN_SYSTEM, buildString {
-            append("Request: ").append(req.task.take(2_000))
-            req.url?.let { append("\nThe page ").append(it).append(" will be opened for Jev; plan only the goal.") }
-            if (req.tabId != null && req.url == null) append("\nA page is already open in the browser; \"open\" may be empty to use it.")
-        }).getOrElse { return Outcome(UseStatus.ERROR, "Could not plan: ${it.message}") }
-        val plan = runCatching { Cu.parsePlan(planText, req.task) }.getOrElse { return Outcome(UseStatus.ERROR, "Could not plan: ${it.message}") }
-        run.plan.value = plan
+        // 1. PLAN (a resumed run keeps its plan)
+        val plan = run.plan.value.takeIf { req.resume } ?: run {
+            run.phase.value = UsePhase.PLANNING
+            val planText = llm.ask("plan", Cu.PLAN_SYSTEM, buildString {
+                append("Request: ").append(req.task.take(2_000))
+                req.url?.let { append("\nThe page ").append(it).append(" will be opened for Jev; plan only the goal.") }
+                if (req.tabId != null && req.url == null) append("\nA page is already open in the browser and Jev will continue on it; \"open\" should be empty.")
+                if (req.inputs.isNotEmpty()) append("\nThe caller gave inputs named: ").append(req.inputs.keys.joinToString(", ")).append(" (values are private; do not ask for them).")
+            }).getOrElse { return Outcome(UseStatus.ERROR, "Could not plan: ${it.message}") }
+            runCatching { Cu.parsePlan(planText, req.task) }.getOrElse { return Outcome(UseStatus.ERROR, "Could not plan: ${it.message}") }
+                .also { run.plan.value = it }
+        }
 
         // 2. OPEN
         run.phase.value = UsePhase.OPENING
@@ -320,8 +363,9 @@ internal class ComputerUseFlow(
         if (req.tabId != null) {
             tabs.claim(req.tabId)?.let { return Outcome(UseStatus.ERROR, it) }
             st.tab = req.tabId
-            if (target != null) {
-                val r = tools.invoke(ToolNames.STEP, Cu.step(req.tabId, "navigate", target))
+            // On a tab the caller named, stay where it is unless a url says otherwise: a continued run must not start over.
+            req.url?.let { StartPages.usable(it, httpsOnly = false) }?.let { u ->
+                val r = tools.invoke(ToolNames.STEP, Cu.step(req.tabId, "navigate", u))
                 if (r.isError) return Outcome(UseStatus.ERROR, noBrowser(r))
             }
         } else {
@@ -330,6 +374,7 @@ internal class ComputerUseFlow(
             st.tab = id
         }
         val tab = checkNotNull(st.tab)
+        run.tabId = tab
         runCatching { tabs.reveal(tab) }
         awaitPage(tools, tab)?.let { return Outcome(UseStatus.ERROR, it) }
 
@@ -346,11 +391,7 @@ internal class ComputerUseFlow(
         for (w in openWaitsMs) {
             delay(w)
             val r = tools.invoke(ToolNames.OBSERVE, buildJsonObject { put("tab_id", tab) })
-            if (r.isError) {
-                last = noBrowser(r)
-                if (r.errorCode == ToolNames.NO_BROWSER) continue
-                continue
-            }
+            if (r.isError) { last = noBrowser(r); continue }
             val url = (r.json?.get("url") as? JsonPrimitive)?.contentOrNull.orEmpty()
             if (url.isBlank() || url == "about:blank") { last = "it is still blank"; continue }
             delay(settleMs)
@@ -365,11 +406,18 @@ internal class ComputerUseFlow(
         return ((j?.get("url") as? JsonPrimitive)?.contentOrNull.orEmpty()) to ((j?.get("title") as? JsonPrimitive)?.contentOrNull.orEmpty())
     }
 
+    /** A page's address without its fragment: one snapshot per page, not per anchor. */
+    private fun pageKey(url: String) = url.substringBefore('#')
+
     private suspend fun loop(req: UseRequest, run: UseRun, tools: RecordingTools, llm: UseLlm, st: FlowState, tab: String, plan: UsePlan): Outcome {
-        val steps = mutableListOf<UseStep>()
+        val steps = run.steps.value.toMutableList()
         fun publish() { run.steps.value = steps.toList() }
+        // Stuck signals look only at steps since the last consult or reply.
+        var mark = steps.size
+        var consults = 0
         var prevHash: String? = null
         var failures = 0
+        run.advice += req.advice
         while (true) {
             val shotReply = tools.invoke(ToolNames.STEP, Cu.step(tab, "screenshot"))
             if (shotReply.isError) return Outcome(UseStatus.ERROR, noBrowser(shotReply))
@@ -379,42 +427,186 @@ internal class ComputerUseFlow(
             val h = runCatching { hash(shot.path) }.getOrDefault(shot.path + steps.size)
             if (prevHash != null && steps.isNotEmpty()) { steps[steps.lastIndex] = steps.last().copy(changed = h != prevHash); publish() }
             prevHash = h
-            if (Cu.stalled(steps)) return Outcome(UseStatus.BLOCKED, "3 actions in a row changed nothing on screen")
             if (steps.size >= req.maxSteps) return Outcome(UseStatus.BUDGET, "Stopped at ${req.maxSteps} steps")
 
             val (url, title) = observe(tools, tab)
             run.pageUrl.value = url
-            val t0 = System.nanoTime()
-            val reply = tools.invoke(ToolNames.JEV_DECIDE, Cu.decideArgs(req.jevModel, plan.goal, url, title, steps.map(Cu::recentAction), shot.path))
-            if (reply.isError) return Outcome(UseStatus.ERROR, "Jev could not decide: ${reply.errorMessage}")
-            val d = runCatching { Cu.parseDecision(reply.json ?: error("Jev returned no JSON")) }
-                .getOrElse { return Outcome(UseStatus.ERROR, "Jev could not decide: ${it.message}") }
-            when (d.op) {
-                VisionOp.DONE -> return Outcome(UseStatus.DONE)
-                VisionOp.BLOCKED -> return Outcome(UseStatus.BLOCKED, "Jev found no operation that makes progress")
-                else -> Unit
+            if (run.visited.lastOrNull()?.url != url) run.visited += PageVisit(url, title, steps.size)
+            val now = Seen(url, shot.scrollY, h)
+
+            // Stuck before asking Jev again: the page is where it was.
+            var stuck: String? = Cu.noProgress(steps.drop(mark), now)
+            var d: VisionDecision? = null
+            var t0 = System.nanoTime()
+            if (stuck == null) {
+                t0 = System.nanoTime()
+                val reply = tools.invoke(ToolNames.JEV_DECIDE, Cu.decideArgs(req.jevModel, plan.goal, url, title, steps.map(Cu::recentAction), shot.path, run.advice.toList()))
+                if (reply.isError) return Outcome(UseStatus.ERROR, "Jev could not decide: ${reply.errorMessage}")
+                d = runCatching { Cu.parseDecision(reply.json ?: error("Jev returned no JSON")) }
+                    .getOrElse { return Outcome(UseStatus.ERROR, "Jev could not decide: ${it.message}") }
+                stuck = when {
+                    d.op == VisionOp.BLOCKED -> "Jev found no operation that makes progress"
+                    d.confidence < req.consultBelow -> "Jev is only ${TaskRunner.pct(d.confidence)} sure what to do next"
+                    else -> null
+                }
             }
+            if (stuck != null) {
+                if (req.onStuck == OnStuck.CONSULT && consults < req.maxConsults) {
+                    consults++
+                    when (val r = consult(req, run, tools, llm, tab, plan, shot, url, title, steps, stuck)) {
+                        is ConsultResult.Stepped -> {
+                            steps += r.step.copy(index = steps.size + 1, before = now)
+                            publish()
+                            mark = steps.size
+                            prevHash = null
+                            delay(stepSettleMs)
+                            continue
+                        }
+                        is ConsultResult.Stop -> return r.outcome
+                    }
+                }
+                val tail = if (req.onStuck == OnStuck.CONSULT) " (already consulted ${req.maxConsults} times)" else ""
+                return Outcome(UseStatus.NEEDS_INPUT, stuck + tail,
+                    "Jev is stuck: $stuck. Tell it what to do next, or give it the details it needs (for example a phone number or a code).")
+            }
+            val dec = checkNotNull(d)
+            if (dec.op == VisionOp.DONE) return Outcome(UseStatus.DONE)
 
             // Unsure: ask the person when one is there; a headless run never waits for anyone.
             val ask = req.confirm
-            if (ask != null && d.confidence < Cu.ASK_BELOW) {
-                val q = UseQuestion("Jev is only ${TaskRunner.pct(d.confidence)} sure it should ${d.op.name.lowercase().replace('_', ' ')}")
+            if (ask != null && dec.confidence < Cu.ASK_BELOW) {
+                val q = UseQuestion("Jev is only ${TaskRunner.pct(dec.confidence)} sure it should ${dec.op.name.lowercase().replace('_', ' ')}")
                 run.question.value = q
-                val go = try { ask(q.reason, d.confidence) } finally { run.question.value = null }
+                val go = try { ask(q.reason, dec.confidence) } finally { run.question.value = null }
                 if (!go) return Outcome(UseStatus.BLOCKED, "Stopped: ${q.reason}")
             }
 
-            val step = act(req, tools, llm, tab, plan, d, shot, url, title, steps)
-            steps += step.copy(index = steps.size + 1, ms = (System.nanoTime() - t0) / 1_000_000)
+            // The page about to be left, saved once per address.
+            if (dec.op == VisionOp.CLICK || dec.op == VisionOp.TYPE_TEXT || dec.op == VisionOp.PRESS_ENTER) {
+                snapshot(tools, run, tab, url, title, steps.size + 1, shot.path, auto = true)
+            }
+            val step = act(req, tools, llm, run, tab, plan, dec, shot, url, title, steps)
+            steps += step.copy(index = steps.size + 1, ms = (System.nanoTime() - t0) / 1_000_000, before = now)
             publish()
             if (step.note == NO_BROWSER_NOTE) return Outcome(UseStatus.ERROR, NO_BROWSER_HINT)
             if (step.failed) { if (++failures >= 2) return Outcome(UseStatus.ERROR, "Two actions failed in a row: ${step.note}") } else failures = 0
-            delay(if (d.op == VisionOp.WAIT) 500 else stepSettleMs)
+            delay(if (dec.op == VisionOp.WAIT) 500 else stepSettleMs)
         }
     }
 
+    /** Saves the page text of [url] once per address; [auto] marks the runner's own snapshots. */
+    private suspend fun snapshot(tools: RecordingTools, run: UseRun, tab: String, url: String, title: String, step: Int, shotPath: String?, auto: Boolean): Boolean {
+        val key = pageKey(url)
+        if (auto && key in run.snapshotted) return false
+        run.snapshotted += key
+        val text = runCatching { readPageText(tools, tab) }.getOrNull().orEmpty()
+        val added = run.store.add(CollectedItem(step, url, title, text, shotPath, auto))
+        run.collected.value = run.store.list
+        return added
+    }
+
+    // ---- consulting the chat model ----
+
+    private sealed interface ConsultResult {
+        data class Stepped(val step: UseStep) : ConsultResult
+        data class Stop(val outcome: Outcome) : ConsultResult
+    }
+
+    /**
+     * Asks the planner chat model what to do about [reason]: with the screenshot when the gateway takes images, and
+     * the page's elements as RPA Engine lists them. Its action runs through `rpa_step` with the element's selector.
+     */
+    private suspend fun consult(
+        req: UseRequest, run: UseRun, tools: RecordingTools, llm: UseLlm, tab: String, plan: UsePlan, shot: Shot,
+        url: String, title: String, steps: List<UseStep>, reason: String,
+    ): ConsultResult {
+        val t0 = System.nanoTime()
+        val page = tools.invoke(ToolNames.OBSERVE, buildJsonObject { put("tab_id", tab) }).json?.let(PageSnapshot::parse)
+        val elements = page?.elements.orEmpty().take(MAX_CONSULT_ELEMENTS)
+        val image = if (llm.sees()) runCatching { File(shot.path).readBytes() }.getOrNull() else null
+        val user = buildString {
+            appendLine("Request: ${req.task.take(2_000)}")
+            appendLine("Goal given to Jev: ${plan.goal}")
+            appendLine("Why Jev is stuck: $reason")
+            appendLine("Page: ${ChatDecider.quote(title)} (${ChatDecider.quote(url, 200)})")
+            appendLine("Recent steps: ${steps.takeLast(8).joinToString("; ") { it.description }.ifEmpty { "none" }}")
+            if (run.advice.isNotEmpty()) appendLine("Advice so far: ${run.advice.takeLast(3).joinToString("; ") { ChatDecider.quote(it, 200) }}")
+            if (req.inputs.isNotEmpty()) appendLine("Inputs the person gave (use \"{{name}}\" as a value): " +
+                req.inputs.entries.joinToString(", ") { (k, v) -> if (Cu.secretName(k)) "$k (private)" else "$k=${ChatDecider.quote(v, 60)}" })
+            appendLine("Interactive elements (id | role | label):")
+            elements.forEach { e ->
+                appendLine("${e.id} | ${e.role} | ${ChatDecider.quote(e.label.orEmpty(), 80)}${if (e.sensitive) " | private field" else ""}${if (e.options.isNotEmpty()) " | options: ${e.options.take(8).joinToString(", ")}" else ""}")
+            }
+            if (elements.isEmpty()) appendLine("(none listed)")
+        }
+        val text = llm.ask("consult", Cu.CONSULT_SYSTEM, user, image).getOrElse {
+            return ConsultResult.Stop(Outcome(UseStatus.NEEDS_INPUT, "$reason; consulting ${llm.label} failed: ${it.message}",
+                "Jev is stuck: $reason. Tell it what to do next."))
+        }
+        val reply = runCatching { Cu.parseConsult(text) }.getOrElse {
+            return ConsultResult.Stop(Outcome(UseStatus.NEEDS_INPUT, "$reason; ${it.message}", "Jev is stuck: $reason. Tell it what to do next."))
+        }
+        val who = "Consulted ${llm.label}"
+        fun step(note: String, failed: Boolean = false) = ConsultResult.Stepped(UseStep(0, VisionOp.CONSULT, confidence = 1.0, ms = (System.nanoTime() - t0) / 1_000_000, failed = failed, consult = "$who: $note"))
+        return when (reply) {
+            is Cu.Consult.Hint -> { run.advice += reply.text; step("hint '${reply.text.take(120)}'") }
+            is Cu.Consult.NeedInput -> ConsultResult.Stop(Outcome(UseStatus.NEEDS_INPUT, reason, reply.question))
+            is Cu.Consult.Done -> ConsultResult.Stop(Outcome(UseStatus.DONE, "Consulted ${llm.label}: ${reply.reason}"))
+            is Cu.Consult.GiveUp -> ConsultResult.Stop(Outcome(UseStatus.BLOCKED, "Consulted ${llm.label}: ${reply.reason}"))
+            is Cu.Consult.Act -> {
+                val (what, failed) = runConsultAction(req, tools, tab, shot, page, reply)
+                step(what, failed)
+            }
+        }
+    }
+
+    /** Runs a consulted action through `rpa_step`, with the element's selector and the pointer. Returns what happened. */
+    private suspend fun runConsultAction(req: UseRequest, tools: RecordingTools, tab: String, shot: Shot, page: PageSnapshot?, a: Cu.Consult.Act): Pair<String, Boolean> {
+        val pointer = req.pointerLabel.takeIf { it.isNotBlank() }
+        fun failedReply(r: ToolReply): String? =
+            if (r.isError) noBrowser(r) else if ((r.json?.get("ok") as? JsonPrimitive)?.booleanOrNull == false) (r.json?.get("error") as? JsonPrimitive)?.contentOrNull ?: "the action failed" else null
+        when (a.type) {
+            "navigate" -> {
+                val u = StartPages.usable(Cu.fillInputs(a.value, req.inputs), httpsOnly = true) ?: return "navigate refused (not an https address)" to true
+                return (failedReply(tools.invoke(ToolNames.STEP, Cu.step(tab, "navigate", u, pointer)))?.let { "navigate failed: $it" } ?: "navigate to ${host(u)}") to false
+            }
+            "scroll" -> {
+                val dy = a.value?.trim()?.toIntOrNull() ?: Cu.scrollDelta(if (a.value?.trim().equals("up", true)) VisionOp.SCROLL_UP else VisionOp.SCROLL_DOWN, "medium", shot.cssHeight)
+                return (failedReply(tools.invoke(ToolNames.STEP, Cu.step(tab, "scroll_by", dy.toString(), pointer)))?.let { "scroll failed: $it" } ?: "scroll ${if (dy < 0) "up" else "down"}") to false
+            }
+            "keypress" -> {
+                val key = a.value?.trim().orEmpty().ifEmpty { "Enter" }
+                return (failedReply(tools.invoke(ToolNames.STEP, Cu.step(tab, "key", key, pointer)))?.let { "key failed: $it" } ?: "press $key") to false
+            }
+        }
+        val el = page?.elements?.firstOrNull { it.id == a.element } ?: return "element '${a.element}' is not on the page" to true
+        val label = "'${el.label?.take(40) ?: el.role}'"
+        val fromInput = a.value?.let { Regex("""\{\{.*}}""").containsMatchIn(it) } == true
+        var value = Cu.fillInputs(a.value, req.inputs)
+        if (a.value != null && value == null) return "an input named in the value was not given" to true
+        if (a.type == "input" || a.type == "select") {
+            // A private field only takes what the person gave; text a model wrote never goes there. Model-written text needs typing allowed.
+            if (a.type == "input" && el.sensitive && !fromInput) return "refused: only a value the person gave goes into $label" to true
+            if (a.type == "input" && !fromInput && !req.llmTyping) return "refused: typing by the model is off" to true
+            if (el.sensitive) value?.let { tools.secrets.add(it) }
+        }
+        val reply = tools.invoke(ToolNames.STEP, buildJsonObject {
+            put("tab_id", tab)
+            if (el.sensitive && fromInput) put("allow_sensitive", true)
+            putJsonObject("action") {
+                put("type", a.type)
+                putJsonObject("selector") { put("type", el.selector.type); el.selector.value?.let { put("value", it) } }
+                value?.let { put("value", it) }
+            }
+            pointer?.let { l -> putJsonObject("pointer") { put("label", l) } }
+        })
+        val shownValue = if (el.sensitive) Secrets.MASK else value?.take(60)
+        val what = when (a.type) { "input" -> "type '$shownValue' into $label"; "select" -> "select '$shownValue' in $label"; else -> "click $label" }
+        return (failedReply(reply)?.let { "$what failed: $it" } ?: what) to false
+    }
+
     private suspend fun act(
-        req: UseRequest, tools: RecordingTools, llm: UseLlm, tab: String, plan: UsePlan,
+        req: UseRequest, tools: RecordingTools, llm: UseLlm, run: UseRun, tab: String, plan: UsePlan,
         d: VisionDecision, shot: Shot, url: String, title: String, history: List<UseStep>,
     ): UseStep {
         val pointer = req.pointerLabel.takeIf { it.isNotBlank() }
@@ -439,7 +631,7 @@ internal class ComputerUseFlow(
                 val field = fr.json?.let(Cu::parseFocused)
                 if (field == null || !field.editable) return where.copy(note = "the box did not land on a text field; nothing typed")
                 val sensitive = Cu.sensitiveField(field)
-                val options = Cu.textOptions(plan.goal, plan.typeValues, url, sensitive)
+                val options = Cu.textOptions(plan.goal, plan.typeValues, url, sensitive, req.inputs)
                 // A private field never gets text a model wrote.
                 val mayAsk = req.llmTyping && !sensitive
                 if (options.isEmpty() && !mayAsk) return where.copy(note = "no text from the goal fits '${field.label.take(40)}'")
@@ -457,6 +649,10 @@ internal class ComputerUseFlow(
                     failure(r)?.let { base(it, true) } ?: base("amount ${d.scroll ?: "medium"}")
                 }
             }
+            VisionOp.COLLECT -> {
+                val added = snapshot(tools, run, tab, url, title, history.size + 1, shot.path, auto = false)
+                return base(if (added) "saved" else "already saved")
+            }
             VisionOp.WAIT -> return base()
             else -> return base("not an action", true)
         }
@@ -471,7 +667,7 @@ internal class ComputerUseFlow(
         tools: RecordingTools, llm: UseLlm, req: UseRequest, plan: UsePlan, field: Focused, options: List<String>,
         url: String, title: String, history: List<UseStep>, mayAsk: Boolean,
     ): Pair<String, Boolean>? {
-        val given = (plan.typeValues + Candidates.values(plan.goal)).map { it.trim() }
+        val given = (plan.typeValues + req.inputs.values + Candidates.values(plan.goal)).map { it.trim() }
         options.singleOrNull()?.takeIf { it in given }?.let { return it to false }
         if (options.isNotEmpty()) {
             val jev = JevDecider(tools, ModelOption(ModelOption.Kind.DECISION, ModelDirectory.JEV_PROVIDER, "Jev", req.jevModel))
@@ -490,6 +686,7 @@ internal class ComputerUseFlow(
             appendLine("Field: label=${ChatDecider.quote(field.label, 100)}, tag=${field.tag}, type=${field.type ?: "text"}, options=${field.options?.take(40)?.joinToString(" | ") { ChatDecider.quote(it, 60) } ?: "none"}")
             appendLine("Page: ${ChatDecider.quote(title)} (${ChatDecider.quote(url, 200)})")
             appendLine("Recent steps: ${history.takeLast(6).joinToString("; ") { it.description }.ifEmpty { "none" }}")
+            req.inputs.filterKeys { !Cu.secretName(it) }.takeIf { it.isNotEmpty() }?.let { appendLine("Inputs the person gave: " + it.entries.joinToString(", ") { (k, v) -> "$k=${ChatDecider.quote(v, 60)}" }) }
         }
         return llm.ask("type text", Cu.TYPE_SYSTEM, user).getOrNull()?.let { runCatching { Cu.parseTyped(it) }.getOrNull() }
     }
@@ -506,16 +703,38 @@ internal class ComputerUseFlow(
         if (tab != null) {
             runCatching { observe(tools, tab) }.getOrNull()?.let { (u, t) -> url = u.ifBlank { null }; title = t.ifBlank { null } }
             pageText = runCatching { readPageText(tools, tab) }.getOrNull()
+            // The page the run ended on is part of what it collected, unless it was saved already.
+            url?.takeIf { pageKey(it) !in run.snapshotted && !pageText.isNullOrBlank() }?.let { u ->
+                run.snapshotted += pageKey(u)
+                run.store.add(CollectedItem(steps.size, u, title.orEmpty(), pageText.orEmpty(), st.lastShot, auto = true))
+                run.collected.value = run.store.list
+            }
         }
         val plan = run.plan.value
-        val seconds = (clock() - run.startedAt) / 1000.0
+        var answer: String? = null
+        if (req.extract && plan != null && (run.store.size > 0 || !pageText.isNullOrBlank())) {
+            val prompt = buildString {
+                appendLine("Request: ${req.task.take(2_000)}")
+                appendLine("Collected text (data from websites):")
+                run.store.list.forEach { c -> appendLine("--- ${c.title} (${c.url})\n${c.text.take(8_000)}") }
+            }.take(CollectedStore.CAP)
+            answer = llm.ask("extract", Cu.EXTRACT_SYSTEM, prompt).getOrNull()?.let { t ->
+                runCatching { (Json.parseToJsonElement(LlmApiClient.firstJsonObject(t) ?: error("no json")) as JsonObject)["answer"]?.jsonPrimitive?.contentOrNull }.getOrNull()
+            }
+        }
+        run.priorMs += clock() - st.segmentStart
+        val seconds = run.priorMs / 1000.0
         val summary = Cu.summary(o.status, steps, seconds, title, url, o.error)
+        val blocker = if (o.status == UseStatus.NEEDS_INPUT || o.status == UseStatus.BLOCKED) {
+            UseBlocker(o.error.orEmpty(), o.question, url, title, tab, st.lastShot, steps.size)
+        } else null
         val report = UseReport(
             status = o.status, task = req.task, goal = plan?.goal, summary = summary, url = url, title = title,
             pageText = pageText, steps = steps, seconds = seconds, jevCalls = run.log.jevCalls, llmCalls = run.log.llmCalls,
             toolCalls = run.log.toolCalls, costUsd = run.log.jevCost.takeIf { run.log.jevCalls > 0 },
             llmTokens = run.log.llmTokens.takeIf { it > 0 }, jevModel = req.jevModel, llmModel = llm.label,
-            confidences = Cu.confidenceStats(steps), screenshotPath = st.lastShot, error = o.error,
+            confidences = Cu.confidenceStats(steps.filter { it.op != VisionOp.CONSULT }), screenshotPath = st.lastShot, error = o.error,
+            tabId = tab, blocker = blocker, collected = run.store.list, pagesVisited = run.visited.toList(), answer = answer, extract = req.extract,
         )
         run.report.value = report
         return report
@@ -523,6 +742,7 @@ internal class ComputerUseFlow(
 
     companion object {
         private const val NO_BROWSER_NOTE = "NO_BROWSER"
+        private const val MAX_CONSULT_ELEMENTS = 80
         const val WRITTEN_BY_MODEL = "written by the model"
 
         fun fileHash(path: String): String =

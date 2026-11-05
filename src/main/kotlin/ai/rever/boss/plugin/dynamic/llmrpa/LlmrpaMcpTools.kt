@@ -14,6 +14,7 @@ import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.doubleOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.put
 
@@ -87,8 +88,10 @@ internal class LlmrpaMcpToolProvider(
                     "and the result reports what happened plus the final page text. Use it to research or operate a website. " +
                     "The user sees the run: the tab is opened or brought to the front in the space on screen and a labelled pointer moves over it. " +
                     "It opens a new tab at the planned page (or url), or acts on tab_id; only tabs in the space on screen can be driven. " +
-                    "It never waits for a person: it proceeds when unsure and returns status blocked when stuck. " +
-                    "Returns JSON {ok, status (done|blocked|error|budget), summary (built from the steps, not a model's opinion), url, title, page_text, steps, seconds, jev_calls, " +
+                    "It never waits for a person. When it is stuck (no progress, Jev blocked or unsure) it stops with status needs_input and a blocker, leaving the tab open: " +
+                    "call it again with the same tab_id, task and inputs (named values such as phone or code) to continue where it stopped; with on_stuck consult it asks the planner chat model what to do first. " +
+                    "Information on the pages it passes is saved in collected[]. " +
+                    "Returns JSON {ok, status (done|needs_input|blocked|budget|error), summary (built from the steps, not a model's opinion), url, title, tab_id, page_text, collected[] (text saved from pages), pages_visited[], blocker {reason, question, url, title, tab_id, screenshot_path, step} when it stopped, answer (only with extract), steps, seconds, jev_calls, " +
                     "llm_calls, tool_calls, cost_usd, confidences, screenshot_path}; ok only means Jev reached its goal, so read the answer from page_text yourself.",
             inputSchema = BROWSER_USE_SCHEMA,
             readOnly = false,
@@ -98,7 +101,7 @@ internal class LlmrpaMcpToolProvider(
                 val result = if (a.mode == "dom") {
                     headless.browserUseDom(a.task, a.tabId, a.newTab, a.url, a.model, a.maxSteps.coerceAtMost(50), timeoutMs, a.includeText, a.displayName).map { it.toString() }
                 } else {
-                    headless.browserUse(a.task, a.tabId, a.newTab, a.url, a.model, a.plannerModel, a.displayName, a.maxSteps, timeoutMs, a.llmTyping)
+                    headless.browserUse(a)
                         .map { it.toJson(a.includeText).toString() }
                 }
                 result.fold(
@@ -215,6 +218,11 @@ internal class LlmrpaMcpToolProvider(
             """"model":{"type":"string","description":"Jev model; vision needs one that takes images and boxes (default typesafe/jev-1.14). In dom mode, any model id of llmrpa_execute"},""" +
             """"planner_model":{"type":"string","description":"Chat model id (from Settings → AI Providers) that plans the task and writes text for fields; defaults to the selected one"},""" +
             """"display_name":{"type":"string","default":"Jev","description":"Label on the on-page pointer (always shown)"},""" +
+            """"on_stuck":{"type":"string","enum":["return","consult"],"default":"return","description":"When stuck: return stops with status needs_input and a blocker (the tab stays open; call again with the same tab_id, task and inputs to continue); consult asks the planner chat model what to do, up to max_consults times"},""" +
+            """"consult_below":{"type":"number","minimum":0,"maximum":1,"default":0.5,"description":"Jev operation confidence below this counts as stuck"},""" +
+            """"max_consults":{"type":"integer","minimum":0,"maximum":10,"default":5},""" +
+            """"inputs":{"type":"object","additionalProperties":{"type":"string"},"description":"Named values for Jev to type when asked, e.g. {\"phone\":\"...\"}; names that sound private (password, code, otp, card) are only typed into private fields and masked in the record"},""" +
+            """"extract":{"type":"boolean","default":false,"description":"One LLM call answers the task only from the collected and final page text and returns it as answer"},""" +
             """"llm_typing":{"type":"boolean","default":true,"description":"Let the planner chat model write text for a field when nothing from the task fits (never for password, PIN or card fields)"},""" +
             """"max_steps":{"type":"integer","minimum":1,"maximum":60,"default":25},""" +
             """"timeout_s":{"type":"integer","minimum":10,"maximum":600,"default":180},""" +
@@ -344,12 +352,17 @@ internal data class BrowserUseArgs(
     val plannerModel: String?,
     val displayName: String,
     val llmTyping: Boolean,
+    val onStuck: OnStuck,
+    val consultBelow: Double,
+    val maxConsults: Int,
+    val inputs: Map<String, String>,
+    val extract: Boolean,
     val maxSteps: Int,
     val timeoutS: Int,
     val includeText: Boolean,
 ) {
     companion object {
-        private val KEYS = setOf("task", "url", "tab_id", "new_tab", "mode", "model", "planner_model", "display_name", "llm_typing", "max_steps", "timeout_s", "include_text")
+        private val KEYS = setOf("task", "url", "tab_id", "new_tab", "mode", "model", "planner_model", "display_name", "llm_typing", "on_stuck", "consult_below", "max_consults", "inputs", "extract", "max_steps", "timeout_s", "include_text")
 
         fun parse(raw: String): Result<BrowserUseArgs> = runCatching {
             val root = Json.parseToJsonElement(raw.ifBlank { "{}" }) as? JsonObject ?: error("Arguments must be a JSON object")
@@ -369,12 +382,23 @@ internal data class BrowserUseArgs(
                 val v = root[k] ?: return default
                 return ((v as? JsonPrimitive)?.intOrNull ?: error("'$k' must be an integer")).coerceIn(min, max)
             }
+            fun dbl(k: String, default: Double, min: Double, max: Double): Double {
+                val v = root[k] ?: return default
+                return ((v as? JsonPrimitive)?.doubleOrNull ?: error("'$k' must be a number")).coerceIn(min, max)
+            }
+            val stuck = str("on_stuck") ?: "return"
+            require(stuck == "return" || stuck == "consult") { "'on_stuck' must be return or consult" }
+            val inputs = (root["inputs"] as? JsonObject)?.let { o ->
+                o.mapValues { (k, v) -> (v as? JsonPrimitive)?.takeIf { it.isString }?.content ?: error("inputs.$k must be a string") }
+            } ?: if (root["inputs"] != null) error("'inputs' must be an object of strings") else emptyMap()
             val mode = str("mode") ?: "vision"
             require(mode == "vision" || mode == "dom") { "'mode' must be vision or dom" }
             BrowserUseArgs(
                 task = str("task") ?: error("Missing required argument: task"),
                 url = str("url"), tabId = str("tab_id"), newTab = bool("new_tab", false), mode = mode,
                 model = str("model"), plannerModel = str("planner_model"), displayName = str("display_name") ?: "Jev", llmTyping = bool("llm_typing", true),
+                onStuck = if (stuck == "consult") OnStuck.CONSULT else OnStuck.RETURN, consultBelow = dbl("consult_below", 0.5, 0.0, 1.0),
+                maxConsults = int("max_consults", 5, 0, 10), inputs = inputs, extract = bool("extract", false),
                 maxSteps = int("max_steps", 25, 1, 60), timeoutS = int("timeout_s", 180, 10, 600), includeText = bool("include_text", true),
             )
         }

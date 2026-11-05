@@ -184,6 +184,49 @@ class PanelRenderTest {
     }
 
     @Test
+    fun `renders the Jev tab stuck, consulted and with collected items`() {
+        Dispatchers.setMain(UnconfinedTestDispatcher())
+        try {
+            val seen = Seen("https://www.zomato.com/", 0.0, "h")
+            val steps = listOf(
+                UseStep(1, VisionOp.SCROLL_DOWN, confidence = 0.71, ms = 1500, changed = false, note = "amount medium", before = seen),
+                UseStep(2, VisionOp.SCROLL_UP, confidence = 0.66, ms = 1400, changed = false, note = "amount medium", before = seen),
+                UseStep(3, VisionOp.SCROLL_DOWN, confidence = 0.62, ms = 1500, changed = false, note = "amount small", before = seen),
+                UseStep(4, VisionOp.CONSULT, confidence = 1.0, ms = 2600, consult = "Consulted OpenAI gpt-5: click 'Log in'", before = seen),
+                UseStep(5, VisionOp.COLLECT, confidence = 0.9, ms = 1800, note = "saved", before = seen),
+            )
+            val title = "Zomato - Restaurant Delivery"
+            val url = "https://www.zomato.com/"
+            fun base(status: UseStatus, summaryError: String?, blocker: UseBlocker?, extract: Boolean = false, answer: String? = null) = UseReport(
+                status, "Log in to Zomato", "Log in to Zomato", Cu.summary(status, steps, 41.2, title, url, summaryError), url, title,
+                "Log in\nSign up\nOrder food online from the best restaurants", steps, 41.2, 6, 2, 17, 0.0731, 640, "typesafe/jev-1.14", "OpenAI gpt-5",
+                Cu.confidenceStats(steps.filter { it.op != VisionOp.CONSULT }), "/Users/me/.boss/cache/rpaengine/shots/t1-1700000000.jpg", summaryError,
+                tabId = "t1", blocker = blocker, extract = extract, answer = answer,
+                collected = listOf(
+                    CollectedItem(5, url, title, "Zomato\nOrder food online from the best restaurants in your city.\nLog in\nSign up", null, false),
+                    CollectedItem(2, "https://www.zomato.com/palo-alto/restaurants", "Best restaurants in Palo Alto", (1..30).joinToString("\n") { "$it. Restaurant $it 4.${it % 9 + 1}" }, null, true),
+                ),
+                pagesVisited = listOf(PageVisit("https://www.zomato.com/palo-alto/restaurants", "Best restaurants in Palo Alto", 2), PageVisit(url, title, 5)),
+            )
+            fun runOf(report: UseReport): UseRun = useRun(UsePhase.FINISHED, 0).also { r ->
+                r.steps.value = steps
+                r.report.value = report
+            }
+            val reason = "3 actions in a row left the page where it was (same address, same scroll position)"
+            val question = "The page ignores scrolling and shows no way in. Do you want to log in with your phone number? If so, what is it?"
+            val stuck = jevComponent().also { it.showUse(runOf(base(UseStatus.NEEDS_INPUT, reason, UseBlocker(reason, question, url, title, "t1", "/Users/me/shots/t1.jpg", 3)))) }
+            listOf(360, 960).forEach { render(stuck, it, 1500, "jev-needs-input-$it") }
+            stuck.updateUseInput("My phone is 555 0100")
+            render(stuck, 360, 1500, "jev-needs-input-typed-360")
+
+            val extracted = jevComponent().also { it.showUse(runOf(base(UseStatus.DONE, null, null, extract = true, answer = "The top restaurants in Palo Alto on Zomato are Restaurant 1 (4.2) and Restaurant 2 (4.3)."))) }
+            listOf(360, 960).forEach { render(extracted, it, 1500, "jev-collected-$it") }
+        } finally {
+            Dispatchers.resetMain()
+        }
+    }
+
+    @Test
     fun `readiness recovers when Jev registers after the panel opened`() {
         Dispatchers.setMain(UnconfinedTestDispatcher())
         try {
