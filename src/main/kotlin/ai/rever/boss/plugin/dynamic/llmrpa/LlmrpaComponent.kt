@@ -63,6 +63,8 @@ class LlmrpaComponent(
     private val tabLocks: TabLocks,
     /** Shared with `llmrpa_execute`, so `llmrpa_export` reaches panel runs too. No default, for the same reason. */
     private val runHistory: RunHistory,
+    /** Where computer-use runs are logged, shared with `browser_use`. No default, for the same reason. */
+    private val runLog: RunLogStore,
     /** Where catalog reads run; tests pass the test Main so the model list lands synchronously. */
     private val io: CoroutineDispatcher = Dispatchers.IO,
     /** Where a run's loop runs, off the UI thread: each step parses the page and builds candidates. */
@@ -616,8 +618,8 @@ class LlmrpaComponent(
             provider?.let { withContext(Dispatchers.Main) { it.createBrowserTab(url, title) } }
         }
         return ComputerUseFlow(
-            tools, aiGateway, LockedTabs(tabLocks, TabLocks.Owner.PANEL, create) { id -> revealTab(provider, id) },
-            openWaitsMs = baseLimits.openWaitsMs, settleMs = baseLimits.navSettleMs, stepSettleMs = baseLimits.stepSettleMs,
+            tools, aiGateway, LockedTabs(tabLocks, TabLocks.Owner.PANEL, create, { id -> revealTab(provider, id) }, list = { provider?.activeTabs?.value.orEmpty().filter { it.url != null }.associate { it.tabId to it.title } }),
+            openWaitsMs = baseLimits.openWaitsMs, settleMs = baseLimits.navSettleMs, stepSettleMs = baseLimits.stepSettleMs, runLog = runLog,
         )
     }
 
@@ -641,6 +643,8 @@ class LlmrpaComponent(
         pointerLabel = _pointerLabel.value.ifBlank { "Jev" }, llmTyping = _llmTyping.value,
         onStuck = if (_consultWhenStuck.value) OnStuck.CONSULT else OnStuck.RETURN,
         inputs = run.inputs.toMap(), extract = _extract.value, resume = resume, advice = advice,
+        // The panel plans only when no tab is targeted.
+        planWithLlm = tabId == null,
         maxSteps = 25, timeoutMs = 10 * 60_000L,
         confirm = { _, _ -> run.question.value?.answer?.await() ?: true },
     )

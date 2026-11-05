@@ -299,6 +299,7 @@ private fun ReportCard(r: UseReport) {
             }
         }
         Text("${r.jevModel} · ${r.llmModel}", color = RpaTokens.TextMuted, fontSize = 11.sp)
+        r.runId?.let { Text("Run $it", color = RpaTokens.TextMuted, fontSize = 11.sp, fontFamily = RpaTokens.Mono) }
         r.screenshotPath?.let { Text(it, color = RpaTokens.TextMuted, fontSize = 11.sp, fontFamily = RpaTokens.Mono, maxLines = 1, overflow = TextOverflow.Ellipsis) }
     }
 }

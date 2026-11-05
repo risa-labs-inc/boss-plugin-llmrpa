@@ -30,6 +30,7 @@ internal class LlmrpaMcpToolProvider(
     private val component: () -> LlmrpaComponent?,
     private val headless: HeadlessRunner,
     private val runs: RunHistory,
+    private val runLog: RunLogStore,
     /** Where `llmrpa_export` writes; tests pass a temp directory. */
     private val exportDir: java.io.File = RpaEngineHandoff.defaultConfigDir,
 ) : McpToolProvider {
@@ -111,6 +112,35 @@ internal class LlmrpaMcpToolProvider(
             },
         ),
         McpToolDefinition(
+            name = BROWSER_USE_STATUS,
+            description =
+                "Read the log of browser_use and Jev-tab runs (they are kept in ~/.boss/cache/llmrpa/runs, the newest 50). With run_id: that run's record, live if it is still running " +
+                    "(task, plan, input names, status, every step with its tab, screenshot, consult, popup and dialog notes, the report, tool-call counts and cost). " +
+                    "Without: the live run, if any, and a list of the last runs. Use it to see where a run stopped or went wrong. Private text is masked; no image data is stored, only screenshot paths.",
+            inputSchema = BROWSER_USE_STATUS_SCHEMA,
+            readOnly = true,
+            handler = McpToolHandler { args ->
+                val root = runCatching { Json.parseToJsonElement(args.raw.ifBlank { "{}" }) as JsonObject }.getOrNull()
+                    ?: return@McpToolHandler McpToolResult("Arguments must be a JSON object", isError = true)
+                val unknown = root.keys - setOf("run_id", "limit", "include_activity")
+                if (unknown.isNotEmpty()) return@McpToolHandler McpToolResult("Unknown argument ${unknown.sorted().joinToString()}. Allowed: run_id, limit, include_activity", isError = true)
+                val limit = ((root["limit"] as? JsonPrimitive)?.intOrNull ?: 5).coerceIn(1, 50)
+                val withActivity = (root["include_activity"] as? JsonPrimitive)?.booleanOrNull ?: false
+                val id = (root["run_id"] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }
+                if (id != null) {
+                    val rec = runLog.read(id) ?: return@McpToolHandler McpToolResult(
+                        "No run '$id'. Recent runs: ${runLog.list(10).joinToString { (it["run_id"] as? JsonPrimitive)?.content.orEmpty() }.ifEmpty { "none" }}", isError = true)
+                    McpToolResult(statusRecord(rec, withActivity).toString())
+                } else {
+                    val live = runLog.liveRuns().lastOrNull()?.let { runLog.record(it) }
+                    McpToolResult(buildJsonObject {
+                        if (live != null) put("live", statusRecord(live, withActivity)) else put("live", kotlinx.serialization.json.JsonNull)
+                        put("runs", buildJsonArray { runLog.list(limit).forEach { add(it) } })
+                    }.toString())
+                }
+            },
+        ),
+        McpToolDefinition(
             name = "llmrpa_status",
             description =
                 "Report the LLM RPA panel's state: the live run (status, steps, summary, model calls per step) and the last drafted plan. " +
@@ -134,6 +164,7 @@ internal class LlmrpaMcpToolProvider(
                         "draft: generating=${c.isGenerating.value} history=${c.executionHistory.value.size} " +
                         "last=${last?.status?.name ?: "none"} " +
                         "actions=${last?.generatedActions?.size ?: 0}\n" +
+                        "jev_run=${runLog.liveRuns().lastOrNull()?.let { "${it.id} (running)" } ?: runLog.list(1).firstOrNull()?.let { r -> "${(r["run_id"] as? JsonPrimitive)?.content} (${(r["status"] as? JsonPrimitive)?.content})" } ?: "none"} (see browser_use_status)\n" +
                         "plan=${c.handoffPath.value ?: "not written"}\n" +
                         "message=${last?.message ?: "none"}\n" +
                         "error=${last?.error ?: c.errorMessage.value ?: "none"}\n" +
@@ -208,6 +239,19 @@ internal class LlmrpaMcpToolProvider(
 
     companion object {
         internal const val BROWSER_USE = "browser_use"
+        internal const val BROWSER_USE_STATUS = "browser_use_status"
+
+        internal const val BROWSER_USE_STATUS_SCHEMA = """{"type":"object","additionalProperties":false,"properties":{""" +
+            """"run_id":{"type":"string","description":"The run_id browser_use returned; omit to see the live run and the latest runs"},""" +
+            """"limit":{"type":"integer","minimum":1,"maximum":50,"default":5,"description":"How many recent runs to list"},""" +
+            """"include_activity":{"type":"boolean","default":false,"description":"Add every tool call (rpa_step, jev_decide, gateway chat) with timing, result and cost"}}}"""
+
+        /** A run's record with the activity list cut to its count unless [withActivity]. */
+        internal fun statusRecord(rec: JsonObject, withActivity: Boolean): JsonObject = buildJsonObject {
+            rec.forEach { (k, v) ->
+                if (k == "activity" && !withActivity) put("activity_count", (v as? kotlinx.serialization.json.JsonArray)?.size ?: 0) else put(k, v)
+            }
+        }
 
         internal const val BROWSER_USE_SCHEMA = """{"type":"object","additionalProperties":false,"properties":{""" +
             """"task":{"type":"string","description":"What to do or find, in plain language, e.g. find the top 10 restaurants in Palo Alto"},""" +
@@ -223,6 +267,7 @@ internal class LlmrpaMcpToolProvider(
             """"max_consults":{"type":"integer","minimum":0,"maximum":10,"default":5},""" +
             """"inputs":{"type":"object","additionalProperties":{"type":"string"},"description":"Named values for Jev to type when asked, e.g. {\"phone\":\"...\"}; names that sound private (password, code, otp, card) are only typed into private fields and masked in the record"},""" +
             """"extract":{"type":"boolean","default":false,"description":"One LLM call answers the task only from the collected and final page text and returns it as answer"},""" +
+            """"plan":{"type":"boolean","description":"Ask the planner chat model for the goal and page first. Default: false when url or tab_id is given (the task is the goal), true otherwise"},""" +
             """"llm_typing":{"type":"boolean","default":true,"description":"Let the planner chat model write text for a field when nothing from the task fits (never for password, PIN or card fields)"},""" +
             """"max_steps":{"type":"integer","minimum":1,"maximum":60,"default":25},""" +
             """"timeout_s":{"type":"integer","minimum":10,"maximum":600,"default":180},""" +
@@ -357,12 +402,14 @@ internal data class BrowserUseArgs(
     val maxConsults: Int,
     val inputs: Map<String, String>,
     val extract: Boolean,
+    /** Plan with the chat model; null = only when no url or tab_id was given. */
+    val plan: Boolean?,
     val maxSteps: Int,
     val timeoutS: Int,
     val includeText: Boolean,
 ) {
     companion object {
-        private val KEYS = setOf("task", "url", "tab_id", "new_tab", "mode", "model", "planner_model", "display_name", "llm_typing", "on_stuck", "consult_below", "max_consults", "inputs", "extract", "max_steps", "timeout_s", "include_text")
+        private val KEYS = setOf("task", "url", "tab_id", "new_tab", "mode", "model", "planner_model", "display_name", "llm_typing", "on_stuck", "consult_below", "max_consults", "inputs", "extract", "plan", "max_steps", "timeout_s", "include_text")
 
         fun parse(raw: String): Result<BrowserUseArgs> = runCatching {
             val root = Json.parseToJsonElement(raw.ifBlank { "{}" }) as? JsonObject ?: error("Arguments must be a JSON object")
@@ -399,6 +446,7 @@ internal data class BrowserUseArgs(
                 model = str("model"), plannerModel = str("planner_model"), displayName = str("display_name") ?: "Jev", llmTyping = bool("llm_typing", true),
                 onStuck = if (stuck == "consult") OnStuck.CONSULT else OnStuck.RETURN, consultBelow = dbl("consult_below", 0.5, 0.0, 1.0),
                 maxConsults = int("max_consults", 5, 0, 10), inputs = inputs, extract = bool("extract", false),
+                plan = if (root["plan"] == null) null else bool("plan", false),
                 maxSteps = int("max_steps", 25, 1, 60), timeoutS = int("timeout_s", 180, 10, 600), includeText = bool("include_text", true),
             )
         }

@@ -27,6 +27,7 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 
 class ComputerUseTest {
@@ -231,7 +232,7 @@ class ComputerUseTest {
     fun `the browser_use schema is closed and lists every argument`() {
         val schema = json(LlmrpaMcpToolProvider.BROWSER_USE_SCHEMA)
         assertEquals(false, (schema["additionalProperties"] as JsonPrimitive).content.toBoolean())
-        assertEquals(setOf("task", "url", "tab_id", "new_tab", "mode", "model", "planner_model", "display_name", "max_steps", "timeout_s", "include_text", "llm_typing", "on_stuck", "consult_below", "max_consults", "inputs", "extract"),
+        assertEquals(setOf("task", "url", "tab_id", "new_tab", "mode", "model", "planner_model", "display_name", "max_steps", "timeout_s", "include_text", "llm_typing", "on_stuck", "consult_below", "max_consults", "inputs", "extract", "plan"),
             schema["properties"]!!.jsonObject.keys)
         assertEquals("task", schema["required"]!!.jsonArray.single().jsonPrimitive.content)
     }
@@ -256,6 +257,17 @@ class ComputerUseTest {
         var wheelWorks = true
         val pageTexts = mutableMapOf<String, String>()
         val jevArgs = mutableListOf<JsonObject>()
+        /** RPA Engine's content hash of the visible text and form state; null = not reported. */
+        var contentHash: (() -> String?)? = null
+        /** The pending browser dialog, as `rpa_step` reports it; null = none. */
+        var dialog: String? = null
+        val dialogAnswers = mutableListOf<String>()
+        var dialogPick = "OK"
+        var dialogP = 0.9
+        var dialogJevCalls = 0
+        val urlByTab = mutableMapOf<String, String>()
+        /** Called for each rpa_step action with its type and tab, before the reply is built. */
+        var onAction: ((String, String) -> Unit)? = null
         var elements = """[{"id":"e1","role":"button","tag":"button","label":"Sign in","options":null,"sensitive":false,"in_viewport":true,"selector":{"type":"css","value":"#signin"}},""" +
             """{"id":"e2","role":"textbox","tag":"input","label":"Phone","options":null,"sensitive":false,"in_viewport":true,"selector":{"type":"css","value":"#phone"}},""" +
             """{"id":"e3","role":"textbox","tag":"input","label":"Password","options":null,"sensitive":true,"in_viewport":true,"selector":{"type":"css","value":"#pw"}}]"""
@@ -265,18 +277,24 @@ class ComputerUseTest {
         override suspend fun invoke(toolName: String, arguments: JsonElement): ToolReply {
             val a = arguments.jsonObject
             calls += toolName to a
+            val tabArg = a["tab_id"]?.jsonPrimitive?.content ?: "t1"
+            val pageUrl = urlByTab[tabArg] ?: url
             return when (toolName) {
-                ToolNames.OBSERVE -> ToolReply("""{"tab_id":"t1","url":"$url","title":"S","elements":$elements}""", false)
+                ToolNames.OBSERVE -> ToolReply("""{"tab_id":"$tabArg","url":"$pageUrl","title":"S","elements":$elements}""", false)
                 ToolNames.STEP -> {
                     val action = a["action"]!!.jsonObject
+                    onAction?.invoke(action["type"]!!.jsonPrimitive.content, tabArg)
+                    val dlg = dialog?.let { ""","dialog":$it""" }.orEmpty()
                     when (action["type"]!!.jsonPrimitive.content) {
+                        "dialog_answer" -> { dialogAnswers += action["value"]!!.jsonPrimitive.content; dialog = null; ToolReply("""{"ok":true}""", false) }
+                        "cu_end" -> ToolReply("""{"ok":true}""", false)
                         "screenshot" -> {
                             val f = File(dir, "shot-${if (frozen) 0 else shots++}.jpg").also { it.writeText("shot ${if (frozen) 0 else shots}") }
-                            ToolReply("""{"ok":true,"screenshot":{"path":"${f.absolutePath}","width":560,"height":390,"css_width":1120,"css_height":780,"dpr":2${if (reportScroll) ""","scroll":{"x":0,"y":$scrollY,"max_y":5000}""" else ""}}}""", false)
+                            ToolReply("""{"ok":true,"screenshot":{"path":"${f.absolutePath}","width":560,"height":390,"css_width":1120,"css_height":780,"dpr":2${if (reportScroll) ""","scroll":{"x":0,"y":$scrollY,"max_y":5000}""" else ""}${contentHash?.invoke()?.let { ""","content_hash":"$it"""" }.orEmpty()}}$dlg}""", false)
                         }
                         "focused" -> ToolReply("""{"ok":true,"focused":$focused}""", false)
-                        "page_text" -> ToolReply("""{"ok":true,"text":"${pageTexts[url] ?: if (url == "https://sample.com/") "Best: A, B, C" else "Text of $url"}"}""", false)
-                        "click_at" -> { clickPages.removeFirstOrNull()?.let { url = it }; ToolReply("""{"ok":true}""", false) }
+                        "page_text" -> ToolReply("""{"ok":true,"text":"${pageTexts[pageUrl] ?: if (pageUrl == "https://sample.com/") "Best: A, B, C" else "Text of $pageUrl"}"}""", false)
+                        "click_at" -> { clickPages.removeFirstOrNull()?.let { url = it }; ToolReply("""{"ok":true$dlg}""", false) }
                         "navigate" -> { url = action["value"]!!.jsonPrimitive.content; ToolReply("""{"ok":true}""", false) }
                         "scroll_by" -> { if (wheelWorks) scrollY = (scrollY + action["value"]!!.jsonPrimitive.content.toDouble()).coerceAtLeast(0.0); ToolReply("""{"ok":true}""", false) }
                         else -> ToolReply("""{"ok":true}""", false)
@@ -284,7 +302,11 @@ class ComputerUseTest {
                 }
                 ToolNames.JEV_DECIDE -> {
                     val q = a["questions"]!!.jsonObject
-                    if ("text" in q) {
+                    if ("dialog" in q) {
+                        dialogJevCalls++
+                        jevArgs += a
+                        ToolReply("""{"response":{"answers":{"dialog":{"type":"choice","choice":"$dialogPick","probabilities":{"$dialogPick":$dialogP}}},"usage":{"cost":0.002}}}""", false)
+                    } else if ("text" in q) {
                         val criteria = q["text"]!!.jsonObject["criteria"]!!.jsonObject.mapValues { it.value.jsonPrimitive.content }
                         askLlmOffered += JevDecider.ASK_LLM in criteria
                         val key = if (textPick == ASK) JevDecider.ASK_LLM else criteria.entries.firstOrNull { it.value == textPick }?.key ?: JevDecider.NONE_OF_THESE
@@ -311,10 +333,15 @@ class ComputerUseTest {
         val opened = mutableListOf<String>()
         val released = mutableListOf<String>()
         val revealed = mutableListOf<String>()
+        val claimed = mutableListOf<String>()
+        /** The browser tabs of the space on screen; a test changes it as a popup opens or closes. */
+        var now: Map<String, String> = emptyMap()
+        var refuse = emptySet<String>()
         override suspend fun reveal(tabId: String) { revealed += tabId }
         override suspend fun open(url: String): String? { opened += url; return "t1" }
-        override fun claim(tabId: String): String? = null
+        override fun claim(tabId: String): String? = if (tabId in refuse) "taken" else null.also { claimed += tabId }
         override fun release(tabId: String) { released += tabId }
+        override suspend fun snapshot(): Map<String, String> = now
     }
 
     private var consultReplies = ArrayDeque<String>()
@@ -341,8 +368,8 @@ class ComputerUseTest {
     private val plan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"Search Palo Alto restaurants and read the top ones","type_values":["Palo Alto"]}"""
     private val typedJson = """{"text":"written text"}"""
 
-    private fun flow(browser: FakeBrowser, tabs: FakeTabs, requests: MutableList<AiRequest>, plan: String = this.plan) =
-        ComputerUseFlow(browser, { gateway(requests, plan, typedJson) }, tabs, openWaitsMs = listOf(0), settleMs = 0, stepSettleMs = 0)
+    private fun flow(browser: FakeBrowser, tabs: FakeTabs, requests: MutableList<AiRequest>, plan: String = this.plan, log: RunLogStore? = null) =
+        ComputerUseFlow(browser, { gateway(requests, plan, typedJson) }, tabs, openWaitsMs = listOf(0), settleMs = 0, stepSettleMs = 0, runLog = log, popupWaitMs = 0, popupPollMs = 0)
 
     private fun tmp() = java.nio.file.Files.createTempDirectory("cu").toFile().also { it.deleteOnExit() }
 
@@ -837,6 +864,394 @@ class ComputerUseTest {
     @Test
     fun `needs_input and the other statuses read right in the summary`() {
         assertTrue(Cu.summary(UseStatus.NEEDS_INPUT, emptyList(), 3.0, "Zomato", "https://www.zomato.com/", "scrolling down and up in turn").startsWith("Stopped: needs your input after 0 steps (3.0 s) on 'Zomato' (zomato.com). scrolling down and up in turn."))
+    }
+
+    // ---- content hash, scroll position, scroll wording ----
+
+    @Test
+    fun `clicking the same spot while the content changes is progress, and a fixed content with moving pixels is not`() = runTest {
+        // The shop: "+" clicked on the same spot three times, the cart changing each time; URL and scroll never move.
+        var cart = 0
+        val shop = FakeBrowser(tmp(), listOf("CLICK", "CLICK", "CLICK", "DONE")).also {
+            it.reportScroll = true
+            it.contentHash = { "cart-${cart}" }
+            it.onAction = { type, _ -> if (type == "click_at") cart++ }
+        }
+        val ok = flow(shop, FakeTabs(), mutableListOf()).runComputerUse(UseRequest("add two mugs, then check out", maxSteps = 10))
+        assertEquals(UseStatus.DONE, ok.status)
+        assertEquals(3, ok.steps.size)
+
+        // Zomato: every pixel changes (a video), the content hash and the scroll position do not.
+        val video = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "SCROLL_UP", "SCROLL_DOWN", "DONE")).also { it.reportScroll = true; it.wheelWorks = false; it.contentHash = { "hero" } }
+        val stuck = flow(video, FakeTabs(), mutableListOf()).runComputerUse(UseRequest("log in", maxSteps = 10))
+        assertEquals(UseStatus.NEEDS_INPUT, stuck.status)
+        assertEquals(3, stuck.steps.size)
+    }
+
+    @Test
+    fun `the content hash decides when it is there and the old rules when it is not`() {
+        fun seen(content: String?, y: Double? = 0.0, hash: String = "h") = Seen("https://a.com/", y, hash, content)
+        val now = seen("c3")
+        // Content changed since each action: not stuck, even with the same URL, scroll and spot.
+        val moving = listOf("c0", "c1", "c2").map { act(VisionOp.CLICK, seen(it), 50, 25) }
+        assertNull(Cu.noProgress(moving, now))
+        // Unchanged content, scroll and address: stuck, however the pixels move.
+        val fixed = List(3) { act(VisionOp.SCROLL_DOWN, seen("c3", 0.0, "pixels-$it")) }
+        assertNotNull(Cu.noProgress(fixed, now))
+        // Same content but the page scrolled: progress.
+        assertNull(Cu.noProgress(List(3) { act(VisionOp.SCROLL_DOWN, seen("c3", 400.0 * it)) }, now))
+        // No content hash on either side: the previous rule (scroll position) still applies.
+        assertNotNull(Cu.noProgress(List(3) { act(VisionOp.SCROLL_DOWN, seen(null, 0.0, "p$it")) }, seen(null)))
+        // The same spot clicked three times with the content unchanged is stuck; changed content is not.
+        assertNotNull(Cu.noProgress(List(3) { act(VisionOp.CLICK, seen("c3", it * 100.0), 50, 25) }, now.copy(scrollY = 10.0)))
+        assertNull(Cu.noProgress(listOf("c0", "c1", "c3").map { act(VisionOp.CLICK, seen(it, 0.0), 50, 25) }, now))
+    }
+
+    @Test
+    fun `the state tells Jev where the page is scrolled to, and recent scrolls read as progress`() {
+        assertEquals(36, ScrollPos(1800.0, 5000.0).percentDown)
+        assertEquals(0, ScrollPos(0.0, 0.0).percentDown)
+        assertTrue(ScrollPos(4997.0, 5000.0).atBottom)
+        assertFalse(ScrollPos(1800.0, 5000.0).atBottom)
+        val mid = Cu.decideArgs("m", "g", "https://a.com/", "A", emptyList(), "/x.jpg", position = ScrollPos(1700.0, 5000.0))["state"]!!.jsonObject["scroll"]!!.jsonObject
+        assertEquals(1700.0, mid["y"]!!.jsonPrimitive.content.toDouble())
+        assertEquals(5000.0, mid["max_y"]!!.jsonPrimitive.content.toDouble())
+        assertEquals(34, mid["percent_down"]!!.jsonPrimitive.content.toInt())
+        assertFalse("position" in mid)
+        val bottom = Cu.decideArgs("m", "g", "u", "t", emptyList(), "/x.jpg", position = ScrollPos(4998.0, 5000.0))["state"]!!.jsonObject["scroll"]!!.jsonObject
+        assertTrue(bottom["position"]!!.jsonPrimitive.content.contains("at the bottom of the page"))
+        assertNull(Cu.decideArgs("m", "g", "u", "t", emptyList(), "/x.jpg")["state"]!!.jsonObject["scroll"])
+        val scrolled = UseStep(1, VisionOp.SCROLL_DOWN, confidence = 0.9, ms = 1, scrolledTo = ScrollPos(1700.0, 5000.0))
+        assertEquals("scrolled to 34% of the page", Cu.recentAction(scrolled)["result"]!!.jsonPrimitive.content)
+        assertTrue(Cu.recentAction(scrolled.copy(scrolledTo = ScrollPos(4999.0, 5000.0)))["result"]!!.jsonPrimitive.content.contains("the bottom of the page"))
+        assertNull(Cu.recentAction(scrolled.copy(scrolledTo = null))["result"])
+    }
+
+    @Test
+    fun `the flow sends the scroll state and the position each scroll reached`() = runTest {
+        val browser = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "SCROLL_DOWN", "DONE")).also { it.reportScroll = true }
+        flow(browser, FakeTabs(), mutableListOf()).runComputerUse(UseRequest("find item 87", maxSteps = 10))
+        val first = browser.jevArgs[0]["state"]!!.jsonObject
+        assertEquals(0, first["scroll"]!!.jsonObject["percent_down"]!!.jsonPrimitive.content.toInt())
+        val last = browser.jevArgs.last()["state"]!!.jsonObject
+        assertEquals(7, last["scroll"]!!.jsonObject["percent_down"]!!.jsonPrimitive.content.toInt()) // 2 x 195 px of 5000
+        assertEquals("scrolled to 7% of the page", last["recent_actions"]!!.jsonArray.last().jsonObject["result"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `the scroll wording prefers large for a far target and small only for something cut off`() {
+        val rules = Cu.SCROLL_RULES
+        assertTrue(rules.contains("large (nearly a full screen) when the target is not visible and its distance is unknown or far"))
+        assertTrue(rules.contains("medium when it is probably within a screen"))
+        assertTrue(rules.contains("small only to reveal something cut off at the edge"))
+        assertFalse(rules.contains("close by"))
+        assertEquals(listOf(0.25, 0.5, 0.9), Cu.SCROLL_AMOUNTS.values.toList())
+    }
+
+    // ---- a dropdown, the model label, planning ----
+
+    @Test
+    fun `a focused select takes its option by type-ahead, chosen from its options`() = runTest {
+        val browser = FakeBrowser(tmp(), listOf("TYPE_TEXT", "DONE"), textPick = "Support").also {
+            it.focused = """{"tag":"select","editable":false,"label":"Topic","options":["Billing","Support","Sales"]}"""
+        }
+        val requests = mutableListOf<AiRequest>()
+        val report = flow(browser, FakeTabs(), requests, plan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"Support request","type_values":[]}""")
+            .runComputerUse(UseRequest("Support request"))
+        assertEquals("Support", browser.stepArgs("type_text").single()["action"]!!.jsonObject["value"]!!.jsonPrimitive.content)
+        assertEquals(VisionOp.TYPE_TEXT, report.steps.single().op)
+        assertNull(report.steps.single().note)
+        // The choice offered the dropdown's options, and the writing model was not asked.
+        assertEquals(listOf(false), browser.askLlmOffered)
+        assertEquals(0, requests.count { it.system.startsWith("You write") })
+    }
+
+    @Test
+    fun `a model label does not say the provider twice`() {
+        assertEquals("Claude Code CLI", modelLabel("Claude Code CLI", "Claude Code CLI"))
+        assertEquals("claude-opus-4", modelLabel("Anthropic", "claude-opus-4").let { if (it == "Anthropic claude-opus-4") "claude-opus-4" else it })
+        assertEquals("OpenAI gpt-5", modelLabel("OpenAI", "gpt-5"))
+        assertEquals("openai/gpt-5", modelLabel("OpenAI", "openai/gpt-5"))
+    }
+
+    @Test
+    fun `with the page given there is no plan call, the task is the goal, and nothing asks a model unless typing needs it`() = runTest {
+        val browser = FakeBrowser(tmp(), listOf("CLICK", "DONE"))
+        val requests = mutableListOf<AiRequest>()
+        val report = flow(browser, FakeTabs(), requests).runComputerUse(UseRequest("click the red square", url = "https://sample.com/", planWithLlm = false))
+        assertEquals(UseStatus.DONE, report.status)
+        assertEquals(0, requests.size)
+        assertEquals(0, report.llmCalls)
+        assertEquals("click the red square", report.goal)
+        assertTrue(browser.jevArgs.first()["questions"]!!.jsonObject["operation"]!!.jsonObject["instructions"]!!.jsonPrimitive.content.contains("click the red square"))
+        // Forcing a plan brings the call back; the default of a request is to plan.
+        val planned = mutableListOf<AiRequest>()
+        flow(FakeBrowser(tmp(), listOf("DONE")), FakeTabs(), planned).runComputerUse(UseRequest("t", url = "https://sample.com/"))
+        assertEquals(1, planned.count { it.system.startsWith("You plan") })
+        // Nothing to open and no plan: a clear error, not a guess.
+        val none = flow(FakeBrowser(tmp(), listOf("DONE")), FakeTabs(), mutableListOf()).runComputerUse(UseRequest("t", planWithLlm = false))
+        assertEquals(UseStatus.ERROR, none.status)
+        assertTrue(none.error!!.contains("give url or tab_id"))
+        // A given tab skips the plan too.
+        val onTab = mutableListOf<AiRequest>()
+        flow(FakeBrowser(tmp(), listOf("DONE")), FakeTabs(), onTab).runComputerUse(UseRequest("t", tabId = "t7", planWithLlm = false))
+        assertEquals(0, onTab.size)
+    }
+
+    @Test
+    fun `the plan argument defaults by whether a page was given`() {
+        assertNull(BrowserUseArgs.parse("""{"task":"t"}""").getOrThrow().plan)
+        assertEquals(true, BrowserUseArgs.parse("""{"task":"t","plan":true}""").getOrThrow().plan)
+        assertEquals(false, BrowserUseArgs.parse("""{"task":"t","url":"https://a.com","plan":false}""").getOrThrow().plan)
+        assertTrue(BrowserUseArgs.parse("""{"task":"t","plan":"yes"}""").isFailure)
+    }
+
+    // ---- popup windows ----
+
+    @Test
+    fun `a popup that opens is followed, driven with the pointer and left for the opener when it closes`() = runTest {
+        val tabs = FakeTabs().also { it.now = mapOf("t1" to "Main") }
+        val browser = FakeBrowser(tmp(), listOf("CLICK", "CLICK", "DONE")).also { b ->
+            b.urlByTab["t2"] = "https://accounts.sample.com/signin"
+            var opened = false
+            b.onAction = { type, tab ->
+                if (type == "click_at" && tab == "t1" && !opened) { opened = true; tabs.now = mapOf("t1" to "Main", "t2" to "Sign in") }
+                if (type == "click_at" && tab == "t2") tabs.now = mapOf("t1" to "Main")
+            }
+        }
+        val report = flow(browser, tabs, mutableListOf()).runComputerUse(UseRequest("sign in with the popup", pointerLabel = "Max", maxSteps = 10))
+        assertEquals(UseStatus.DONE, report.status)
+        assertEquals("Switched to popup 'Sign in'", report.steps[0].popup)
+        assertEquals("Popup closed, back on 'Main'", report.steps[1].popup)
+        assertEquals(listOf("t1", "t2"), report.steps.map { it.tabId })
+        assertTrue(tabs.revealed.containsAll(listOf("t1", "t2")))
+        assertEquals(listOf("t2"), tabs.claimed.filter { it == "t2" })
+        // Screenshots follow the tab being driven: t1, then t2, then back on t1.
+        val shotTabs = browser.calls.filter { it.first == ToolNames.STEP && it.second["action"]!!.jsonObject["type"]!!.jsonPrimitive.content == "screenshot" }.map { it.second["tab_id"]!!.jsonPrimitive.content }
+        assertEquals(listOf("t1", "t2", "t1"), shotTabs)
+        assertEquals("Max", browser.stepArgs("click_at")[1]["pointer"]!!.jsonObject["label"]!!.jsonPrimitive.content)
+        assertEquals(listOf("t1" to "opened", "t2" to "popup"), report.tabs.map { it.tabId to it.kind })
+        // Every tab touched is told the run is over; the locks go back.
+        assertEquals(setOf("t1", "t2"), browser.stepArgs("cu_end").map { it["tab_id"]!!.jsonPrimitive.content }.toSet())
+        assertTrue(tabs.released.containsAll(listOf("t1", "t2")))
+        assertEquals("t1", report.tabId)
+    }
+
+    @Test
+    fun `a tab that was already open, or that another run holds, is never taken over`() = runTest {
+        // t9 was there before the action: not a popup of ours.
+        val before = FakeTabs().also { it.now = mapOf("t1" to "Main", "t9" to "Somebody else's") }
+        val b1 = FakeBrowser(tmp(), listOf("CLICK", "DONE"))
+        val r1 = flow(b1, before, mutableListOf()).runComputerUse(UseRequest("t"))
+        assertEquals(listOf("t1"), r1.tabs.map { it.tabId })
+        assertNull(r1.steps.single().popup)
+        // A new tab whose lock another run holds is left alone.
+        val taken = FakeTabs().also { it.now = mapOf("t1" to "Main"); it.refuse = setOf("t2") }
+        val b2 = FakeBrowser(tmp(), listOf("CLICK", "DONE")).also { b -> b.onAction = { type, _ -> if (type == "click_at") taken.now = mapOf("t1" to "Main", "t2" to "Other run") } }
+        val r2 = flow(b2, taken, mutableListOf()).runComputerUse(UseRequest("t"))
+        assertNull(r2.steps.single().popup)
+        assertEquals(0, b2.calls.count { it.second["tab_id"]?.jsonPrimitive?.content == "t2" })
+        // The tab being driven closing with nothing to go back to is just an ordinary failure, not a switch.
+        val lone = FakeTabs().also { it.now = mapOf("t1" to "Main", "t6" to "Not ours") }
+        val b3 = FakeBrowser(tmp(), listOf("CLICK", "DONE")).also { b -> b.onAction = { type, _ -> if (type == "click_at") lone.now = mapOf("t6" to "Not ours") } }
+        val r3 = flow(b3, lone, mutableListOf()).runComputerUse(UseRequest("t"))
+        assertEquals(0, b3.calls.count { it.second["tab_id"]?.jsonPrimitive?.content == "t6" })
+        assertNull(r3.steps.firstOrNull()?.popup?.takeIf { it.startsWith("Popup closed") })
+    }
+
+    // ---- browser dialogs ----
+
+    private val confirmDialog = """{"type":"confirm","message":"Delete this item?","ok_text":"OK","cancel_text":"Cancel","url":"https://sample.com/"}"""
+
+    @Test
+    fun `an alert is accepted without asking, a confirm goes to Jev, and every touched tab gets cu_end`() = runTest {
+        val alert = FakeBrowser(tmp(), listOf("CLICK", "DONE")).also { b -> b.onAction = { type, _ -> if (type == "click_at") b.dialog = """{"type":"alert","message":"Heads up","url":"https://sample.com/"}""" } }
+        val r1 = flow(alert, FakeTabs(), mutableListOf()).runComputerUse(UseRequest("t"))
+        assertEquals(UseStatus.DONE, r1.status)
+        assertEquals(listOf("ok"), alert.dialogAnswers)
+        assertEquals(0, alert.dialogJevCalls)
+        assertEquals(VisionOp.DIALOG, r1.steps[1].op)
+        assertEquals("Dialog 'Heads up': OK", r1.steps[1].description)
+        assertEquals(1, alert.stepArgs("cu_end").size)
+
+        val confirm = FakeBrowser(tmp(), listOf("CLICK", "DONE")).also { b ->
+            b.dialogPick = "CANCEL"
+            b.onAction = { type, _ -> if (type == "click_at") b.dialog = confirmDialog }
+        }
+        val r2 = flow(confirm, FakeTabs(), mutableListOf()).runComputerUse(UseRequest("remove nothing"))
+        assertEquals(listOf("cancel"), confirm.dialogAnswers)
+        assertEquals(1, confirm.dialogJevCalls)
+        assertEquals("Dialog 'Delete this item?': CANCEL", r2.steps[1].description)
+        // Jev saw the dialog in its state and was asked OK or CANCEL.
+        val args = confirm.jevArgs.first { "dialog" in it["questions"]!!.jsonObject }
+        assertEquals("confirm", args["state"]!!.jsonObject["dialog"]!!.jsonObject["type"]!!.jsonPrimitive.content)
+        assertEquals("Delete this item?", args["state"]!!.jsonObject["dialog"]!!.jsonObject["message"]!!.jsonPrimitive.content)
+        assertEquals(listOf("OK", "CANCEL"), args["questions"]!!.jsonObject["dialog"]!!.jsonObject["criteria"]!!.jsonObject.keys.toList())
+        assertEquals(UseStatus.DONE, r2.status)
+    }
+
+    @Test
+    fun `a prompt is answered with the caller's input, and a prompt with nothing to type is cancelled when typing is off`() = runTest {
+        val prompt = FakeBrowser(tmp(), listOf("CLICK", "DONE"), textPick = "Ada").also { b ->
+            b.onAction = { type, _ -> if (type == "click_at") b.dialog = """{"type":"prompt","message":"What is your name?","default_value":"","url":"https://sample.com/"}""" }
+        }
+        val r1 = flow(prompt, FakeTabs(), mutableListOf(), plan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"Say hello","type_values":[]}""")
+            .runComputerUse(UseRequest("Say hello", inputs = mapOf("name" to "Ada")))
+        assertEquals(listOf("ok:Ada"), prompt.dialogAnswers)
+        assertEquals("Dialog 'What is your name?': OK 'Ada'", r1.steps[1].description)
+        assertEquals("Ada", r1.steps[1].text)
+
+        val none = FakeBrowser(tmp(), listOf("CLICK", "DONE")).also { b ->
+            b.onAction = { type, _ -> if (type == "click_at") b.dialog = """{"type":"prompt","message":"Your nickname?","url":"https://sample.com/"}""" }
+        }
+        val r2 = flow(none, FakeTabs(), mutableListOf(), plan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"Go","type_values":[]}""")
+            .runComputerUse(UseRequest("Go", llmTyping = false))
+        assertEquals(listOf("cancel"), none.dialogAnswers)
+        assertTrue(r2.steps[1].note!!.contains("no text for the prompt"))
+    }
+
+    @Test
+    fun `beforeunload is accepted unless the goal says to stay, and a doubtful dialog answer counts as stuck`() = runTest {
+        fun unload() = FakeBrowser(tmp(), listOf("CLICK", "DONE")).also { b -> b.onAction = { type, _ -> if (type == "click_at") b.dialog = """{"type":"beforeunload","message":"Leave site?","url":"https://sample.com/"}""" } }
+        val leave = unload()
+        flow(leave, FakeTabs(), mutableListOf()).runComputerUse(UseRequest("Open the next page"))
+        assertEquals(listOf("ok"), leave.dialogAnswers)
+        assertEquals(0, leave.dialogJevCalls)
+        val stay = unload().also { it.dialogPick = "CANCEL" }
+        flow(stay, FakeTabs(), mutableListOf(), plan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"Edit the draft and stay on the page","type_values":[]}""").runComputerUse(UseRequest("t"))
+        assertEquals(1, stay.dialogJevCalls)
+        assertEquals(listOf("cancel"), stay.dialogAnswers)
+
+        val unsure = FakeBrowser(tmp(), listOf("CLICK", "DONE")).also { b -> b.dialogP = 0.3; b.onAction = { type, _ -> if (type == "click_at") b.dialog = confirmDialog } }
+        val r = flow(unsure, FakeTabs(), mutableListOf()).runComputerUse(UseRequest("t"))
+        assertEquals(UseStatus.NEEDS_INPUT, r.status)
+        assertTrue(r.blocker!!.reason.contains("30% sure how to answer the confirm dialog"))
+        assertEquals(0, unsure.dialogAnswers.size)
+        // The run still ends cleanly on the tab: cu_end goes out even when it stopped.
+        assertEquals(1, unsure.stepArgs("cu_end").size)
+    }
+
+    @Test
+    fun `a dialog that keeps coming back is a loop`() {
+        val d = List(3) { UseStep(it + 1, VisionOp.DIALOG, confidence = 1.0, ms = 1, dialog = "Dialog 'x': OK") }
+        assertTrue(Cu.noProgress(d, Seen("u", 0.0, "h"))!!.contains("dialog keeps coming back"))
+        assertEquals(Cu.DialogInfo("prompt", "Name?", "x", "Send", "Skip", "https://a.com"),
+            Cu.parseDialog(json("""{"dialog":{"type":"prompt","message":"Name?","default_value":"x","ok_text":"Send","cancel_text":"Skip","url":"https://a.com"}}""")))
+        assertNull(Cu.parseDialog(json("""{"ok":true}""")))
+        assertNull(Cu.parseDialog(json("""{"dialog":{"type":"weird","message":"m"}}""")))
+    }
+
+    // ---- run log ----
+
+    @Test
+    fun `a run is written while it runs and at the end, masked, with names only for inputs and no image data`() = runTest {
+        val store = testRunLog()
+        val run = UseRun("log in as ada")
+        val seenWhileRunning = mutableListOf<String>()
+        val browser = FakeBrowser(tmp(), listOf("TYPE_TEXT", "SCROLL_DOWN", "DONE"), textPick = null).also { b ->
+            b.focused = """{"tag":"input","editable":true,"label":"Password","type":"password"}"""
+            b.onAction = { type, _ -> if (type == "scroll_by") store.read(run.id)?.let { seenWhileRunning += (it["status"] as JsonPrimitive).content + ":" + (it["steps_count"] as JsonPrimitive).content } }
+        }
+        val report = flow(browser, FakeTabs(), mutableListOf(), plan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"Sign in","type_values":[]}""", log = store)
+            .runComputerUse(UseRequest("log in as ada", inputs = mapOf("password" to "zz-secret-99")), run)
+        assertEquals(run.id, report.runId)
+        assertEquals(run.id, report.toJson()["run_id"]!!.jsonPrimitive.content)
+        assertEquals(listOf("running:1"), seenWhileRunning)
+        val file = java.io.File(storeDir(store), run.id + ".json")
+        assertTrue(file.exists())
+        val text = file.readText()
+        assertFalse(text.contains("zz-secret-99"))
+        assertFalse(text.contains("base64"))
+        val rec = json(text)
+        assertEquals("done", rec["status"]!!.jsonPrimitive.content)
+        assertEquals(setOf("password"), rec["inputs"]!!.jsonArray.map { it.jsonPrimitive.content }.toSet())
+        assertEquals("log in as ada", rec["task"]!!.jsonPrimitive.content)
+        assertEquals(2, rec["steps"]!!.jsonArray.size)
+        val first = rec["steps"]!!.jsonArray[0].jsonObject
+        assertEquals("TYPE_TEXT", first["op"]!!.jsonPrimitive.content)
+        assertEquals(Secrets.MASK, first["text"]!!.jsonPrimitive.content)
+        assertEquals("t1", first["tab_id"]!!.jsonPrimitive.content)
+        assertTrue("box" in first && "screenshot_path" in first && "x_pct" in first && "url" in first)
+        assertTrue(rec["activity"]!!.jsonArray.isNotEmpty())
+        assertEquals("done", rec["report"]!!.jsonObject["status"]!!.jsonPrimitive.content)
+        assertEquals(1, rec["llm_calls"]!!.jsonPrimitive.content.toInt())
+        assertEquals(setOf("t1"), rec["tabs"]!!.jsonArray.map { it.jsonObject["tab_id"]!!.jsonPrimitive.content }.toSet())
+    }
+
+    private fun storeDir(store: RunLogStore): java.io.File {
+        val f = RunLogStore::class.java.getDeclaredField("dir"); f.isAccessible = true
+        return f.get(store) as java.io.File
+    }
+
+    @Test
+    fun `the log keeps the newest runs, refuses bad ids and lists newest first`() {
+        val store = testRunLog(keep = 3)
+        (1..5).forEach { i ->
+            store.writeRaw("run-$i", buildJsonObject { put("run_id", "run-$i"); put("task", "t$i"); put("status", "done"); put("started_at_ms", 1000L * i); put("steps_count", i) })
+            java.io.File(storeDir(store), "run-$i.json").setLastModified(1_700_000_000_000L + i * 1000)
+        }
+        // writeRaw prunes before the new mtime is set, so one more write settles the order.
+        store.writeRaw("run-6", buildJsonObject { put("run_id", "run-6"); put("task", "t6"); put("status", "error"); put("started_at_ms", 6000L) })
+        val names = (storeDir(store).listFiles()!!.map { it.name }).sorted()
+        assertEquals(3, names.size)
+        assertTrue("run-6.json" in names && "run-1.json" !in names)
+        assertNull(store.read("../etc/passwd"))
+        assertNull(store.read("nope"))
+        val listed = store.list(2)
+        assertEquals(2, listed.size)
+        assertEquals("run-6", listed[0]["run_id"]!!.jsonPrimitive.content)
+        assertEquals(setOf("run_id", "task", "status", "started_at_ms").intersect(listed[0].keys) + "x", listed[0].keys.let { setOf("run_id", "task", "status") + "x" })
+    }
+
+    @Test
+    fun `browser_use_status shows one run, the live one and the recent runs`() = runTest {
+        val store = testRunLog()
+        val provider = LlmrpaMcpToolProvider("p", component = { null },
+            headless = HeadlessRunner(FakeTools { _, _ -> error("unused") }, { null }, { null }, tabs = { emptyList() }, activeTabId = { null }, drivable = { true },
+                openTab = { _, _ -> null }, reveal = { }, locks = TabLocks(), runs = RunHistory(), runLog = store),
+            runs = RunHistory(), runLog = store)
+        val tool = provider.tools().first { it.name == "browser_use_status" }
+        assertTrue(tool.readOnly)
+        suspend fun call(raw: String) = tool.handler.call(ai.rever.boss.plugin.api.McpToolArgs(emptyMap(), raw))
+        val schema = json(tool.inputSchema)
+        assertEquals(setOf("run_id", "limit", "include_activity"), schema["properties"]!!.jsonObject.keys)
+        assertFalse(schema["additionalProperties"]!!.jsonPrimitive.content.toBoolean())
+
+        // Nothing yet.
+        val empty = json(call("{}").text)
+        assertTrue(empty["live"] is kotlinx.serialization.json.JsonNull)
+        assertEquals(0, empty["runs"]!!.jsonArray.size)
+
+        val run = UseRun("find x")
+        val browser = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "DONE"))
+        var liveText = ""
+        browser.onAction = { type, _ -> if (type == "scroll_by") liveText = kotlinx.coroutines.runBlocking { call("{}").text } }
+        val report = flow(browser, FakeTabs(), mutableListOf(), log = store).runComputerUse(UseRequest("find x"), run)
+        // While it ran: the live run, with its activity cut to a count.
+        val live = json(liveText)["live"]!!.jsonObject
+        assertEquals(run.id, live["run_id"]!!.jsonPrimitive.content)
+        assertEquals("running", live["status"]!!.jsonPrimitive.content)
+        assertTrue("activity_count" in live && "activity" !in live)
+
+        // One run by id: full record; activity on request.
+        val one = json(call("""{"run_id":"${run.id}"}""").text)
+        assertEquals("done", one["status"]!!.jsonPrimitive.content)
+        assertEquals(report.runId, one["run_id"]!!.jsonPrimitive.content)
+        assertTrue("steps" in one && "activity" !in one && "activity_count" in one)
+        assertTrue("activity" in json(call("""{"run_id":"${run.id}","include_activity":true}""").text))
+        // Without an id: nothing live now, and the run listed.
+        val list = json(call("""{"limit":3}""").text)
+        assertTrue(list["live"] is kotlinx.serialization.json.JsonNull)
+        val row = list["runs"]!!.jsonArray.single().jsonObject
+        assertEquals(run.id, row["run_id"]!!.jsonPrimitive.content)
+        assertEquals("done", row["status"]!!.jsonPrimitive.content)
+        assertEquals("find x", row["task"]!!.jsonPrimitive.content)
+        assertEquals(1, row["steps_count"]!!.jsonPrimitive.content.toInt())
+        assertTrue("seconds" in row && "cost_usd" in row)
+        // Unknown id and unknown argument are errors that say what to do.
+        val bad = call("""{"run_id":"run-nope"}""")
+        assertTrue(bad.isError && bad.text.contains(run.id))
+        assertTrue(call("""{"bogus":1}""").isError)
     }
 
     @Test

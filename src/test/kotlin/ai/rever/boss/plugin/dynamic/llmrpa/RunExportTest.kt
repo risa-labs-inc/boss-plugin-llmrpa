@@ -206,11 +206,12 @@ class RunExportTest {
     @Test
     fun `llmrpa_export writes the last run and reports its path and action count`() = runTest {
         val history = RunHistory()
+        val log = testRunLog()
         val provider = LlmrpaMcpToolProvider(
             "p", component = { null },
             headless = HeadlessRunner(FakeTools { _, _ -> error("unused") }, { null }, { null }, tabs = { emptyList() }, activeTabId = { null },
-                drivable = { true }, openTab = { _, _ -> null }, reveal = { }, locks = TabLocks(), runs = history),
-            runs = history, exportDir = dir,
+                drivable = { true }, openTab = { _, _ -> null }, reveal = { }, locks = TabLocks(), runs = history, runLog = log),
+            runs = history, runLog = log, exportDir = dir,
         )
         val tool = provider.tools().first { it.name == "llmrpa_export" }
         assertFalse(tool.readOnly)
@@ -242,7 +243,7 @@ class RunExportTest {
             val tab = ActiveTabData("t1", "fluck", "Shop", "w", "Work", "p", "win", url = "https://shop.example/")
             val history = RunHistory()
             val c = LlmrpaComponent(DefaultComponentContext(LifecycleRegistry()), LlmrpaInfo, FakeTabs(listOf(tab), focused = { "t1" }), { null },
-                tools = tools, llmProvider = { null }, tabLocks = TabLocks(), runHistory = history,
+                tools = tools, llmProvider = { null }, tabLocks = TabLocks(), runHistory = history, runLog = testRunLog(),
                 io = Dispatchers.Main, work = Dispatchers.Main, baseLimits = RunLimits(navSettleMs = 0, stepSettleMs = 0), exportDir = dir)
             c.updateInstruction("Sign in to the shop")
             assertEquals(null, c.startRun())

@@ -72,6 +72,8 @@ class HeadlessRunner(
     private val locks: TabLocks,
     // No default, for the same reason: a forgotten one would hide headless runs from llmrpa_export.
     private val runs: RunHistory,
+    // No default, for the same reason: a forgotten one would leave Jev runs with no log to debug from.
+    internal val runLog: RunLogStore,
     private val timeLimitMs: Long = TIME_LIMIT_MS,
     private val limits: RunLimits = RunLimits(),
 ) {
@@ -174,13 +176,15 @@ class HeadlessRunner(
                 same.singleOrNull()
             } ?: return Result.failure(IllegalArgumentException("Unknown planner_model '$id'. Pass a chat model id configured in Settings → AI Providers."))
         }
-        val flow = ComputerUseFlow(tools, gateway, LockedTabs(locks, TabLocks.Owner.HEADLESS, openTab, reveal),
-            openWaitsMs = limits.openWaitsMs, settleMs = limits.navSettleMs, stepSettleMs = limits.stepSettleMs)
+        val flow = ComputerUseFlow(tools, gateway, LockedTabs(locks, TabLocks.Owner.HEADLESS, openTab, reveal, list = { tabs().filter { it.url != null }.associate { it.tabId to it.title } }),
+            openWaitsMs = limits.openWaitsMs, settleMs = limits.navSettleMs, stepSettleMs = limits.stepSettleMs, runLog = runLog)
         val request = UseRequest(
             task = a.task, url = page, tabId = tab?.tabId, jevModel = a.model ?: Cu.VISION_DEFAULT_MODEL, llm = llm,
             pointerLabel = a.displayName.ifBlank { "Jev" }, llmTyping = a.llmTyping,
             onStuck = a.onStuck, consultBelow = a.consultBelow, maxConsults = a.maxConsults, inputs = a.inputs, extract = a.extract,
             maxSteps = a.maxSteps, timeoutMs = a.timeoutS * 1000L, confirm = null,
+            // A caller that names the page needs no plan; `plan` forces one either way.
+            planWithLlm = a.plan ?: (page == null && tab == null),
         )
         return Result.success(flow.runComputerUse(request))
     }
@@ -191,15 +195,24 @@ class HeadlessRunner(
         pointerLabel: String = "Jev",
     ): Result<kotlinx.serialization.json.JsonObject> {
         val started = System.currentTimeMillis()
+        val runId = RunLogStore.newId()
+        fun logRecord(status: String, extra: kotlinx.serialization.json.JsonObject? = null) = buildJsonObject {
+            put("run_id", runId); put("mode", "dom"); put("task", task); put("status", status)
+            put("started_at", java.time.Instant.ofEpochMilli(started).toString()); put("started_at_ms", started)
+            put("seconds", (System.currentTimeMillis() - started) / 1000.0)
+            extra?.forEach { (k, v) -> put(k, v) }
+        }
+        runLog.writeRaw(runId, logRecord("running"))
         var timedOut = false
         val state = withTimeoutOrNull(timeoutMs) {
             execute(task, tabId, maxSteps, model, newTab, url, pointerLabel, show = true)
-        }?.getOrElse { return Result.failure(it) } ?: run { timedOut = true; runs.recent().firstOrNull() }
+        }?.getOrElse { runLog.writeRaw(runId, logRecord("error", buildJsonObject { put("error", it.message ?: "failed") })); return Result.failure(it) } ?: run { timedOut = true; runs.recent().firstOrNull() }
         if (state == null) return Result.failure(IllegalStateException("The run timed out before it started"))
         val status = when { timedOut -> "budget"; state.status == RunStatus.DONE -> "done"; state.status == RunStatus.FAILED -> "error"; else -> "blocked" }
         val text = state.tabId?.let { runCatching { readPageText(tools, it) }.getOrNull() }
         val obs = state.tabId?.let { runCatching { tools.invoke(ToolNames.OBSERVE, buildJsonObject { put("tab_id", it) }).json }.getOrNull() }
-        return Result.success(buildJsonObject {
+        val result = buildJsonObject {
+            put("run_id", runId)
             put("ok", status == "done")
             put("status", status)
             put("mode", "dom")
@@ -218,7 +231,14 @@ class HeadlessRunner(
             put("llm_calls", state.modelCalls.count { it.tool == ModelCall.GATEWAY })
             put("tool_calls", state.steps.size)
             if (state.costUsd > 0) put("cost_usd", state.costUsd)
-        })
+        }
+        runLog.writeRaw(runId, logRecord(status, buildJsonObject {
+            put("steps_count", state.steps.size)
+            put("steps", buildJsonArray { state.steps.forEach { st -> add(buildJsonObject { put("index", st.index); put("description", st.description); put("confidence", st.confidence); put("result", st.outcome.name.lowercase()); st.detail?.let { d -> put("note", d) } }) } })
+            put("report", result)
+            put("jev_calls", state.modelCalls.count { it.tool == ToolNames.JEV_DECIDE }); put("llm_calls", state.modelCalls.count { it.tool == ModelCall.GATEWAY })
+        }))
+        return Result.success(result)
     }
 
     /** The tab to act on: the named one, else the focused one, never an arbitrary one. */

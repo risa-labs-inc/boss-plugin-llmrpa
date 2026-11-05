@@ -35,7 +35,7 @@ class PanelRenderTest {
     private val exportDir = Files.createTempDirectory("render-export").toFile().apply { deleteOnExit() }
 
     private fun component(tools: ToolInvoker, openTabs: List<ActiveTabData> = listOf(tab)) =
-        LlmrpaComponent(DefaultComponentContext(LifecycleRegistry()), LlmrpaInfo, tabs(openTabs), { null }, tools = tools, llmProvider = { null }, tabLocks = TabLocks(), runHistory = RunHistory(),
+        LlmrpaComponent(DefaultComponentContext(LifecycleRegistry()), LlmrpaInfo, tabs(openTabs), { null }, tools = tools, llmProvider = { null }, tabLocks = TabLocks(), runHistory = RunHistory(), runLog = testRunLog(),
             io = Dispatchers.Main, work = Dispatchers.Main, baseLimits = RunLimits(navSettleMs = 0, stepSettleMs = 0), exportDir = exportDir)
 
     @Test
@@ -91,7 +91,7 @@ class PanelRenderTest {
             render(noTab, 360, 800, "no-tab-360")
 
             val opened = LlmrpaComponent(DefaultComponentContext(LifecycleRegistry()), LlmrpaInfo, FakeTabs(emptyList(), create = { "new1" }), { null },
-                tools = FakeTools { _, _ -> Triple("The task is complete", 0.9, null) }, llmProvider = { null }, tabLocks = TabLocks(), runHistory = RunHistory(),
+                tools = FakeTools { _, _ -> Triple("The task is complete", 0.9, null) }, llmProvider = { null }, tabLocks = TabLocks(), runHistory = RunHistory(), runLog = testRunLog(),
                 io = Dispatchers.Main, work = Dispatchers.Main, baseLimits = RunLimits(navSettleMs = 0, stepSettleMs = 0, openWaitsMs = listOf(0)))
             opened.updateInstruction("Check the weather in Paris")
             assertEquals(null, opened.startRun())
@@ -117,7 +117,7 @@ class PanelRenderTest {
         }
         val api = jevGateway()
         return LlmrpaComponent(DefaultComponentContext(LifecycleRegistry()), LlmrpaInfo, tabs(listOf(tab)), { api }, tools = tools, llmProvider = { null },
-            tabLocks = TabLocks(), runHistory = RunHistory(), io = Dispatchers.Main, work = Dispatchers.Main,
+            tabLocks = TabLocks(), runHistory = RunHistory(), runLog = testRunLog(), io = Dispatchers.Main, work = Dispatchers.Main,
             baseLimits = RunLimits(navSettleMs = 0, stepSettleMs = 0), exportDir = exportDir).also { it.selectPanelTab(LlmrpaComponent.PanelTab.JEV) }
     }
 

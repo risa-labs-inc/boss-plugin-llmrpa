@@ -45,6 +45,7 @@ class LlmrpaDynamicPlugin : DynamicPlugin {
         val llmProvider = { runCatching { context.llmProvider }.getOrNull() }
         val tabLocks = TabLocks()
         val runHistory = RunHistory()
+        val runLog = RunLogStore(RunLogStore.defaultDir)
 
         context.panelRegistry.registerPanel(LlmrpaInfo) { ctx, panelInfo ->
             LlmrpaComponent(
@@ -63,6 +64,7 @@ class LlmrpaDynamicPlugin : DynamicPlugin {
                 llmProvider,
                 tabLocks,
                 runHistory,
+                runLog,
             ).also { comp ->
                 lastComponent = comp
                 // Clear on panel close: a destroyed component's scope is cancelled,
@@ -91,8 +93,10 @@ class LlmrpaDynamicPlugin : DynamicPlugin {
                     reveal = { id -> revealTab(activeTabsProvider, id) },
                     locks = tabLocks,
                     runs = runHistory,
+                    runLog = runLog,
                 ),
                 runs = runHistory,
+                runLog = runLog,
             ),
         )
     }
