@@ -113,6 +113,8 @@ class RunLogStore(private val dir: File, private val keep: Int = 50) {
                 putJsonObject("plan") {
                     putJsonArray("open") { p.open.forEach { add(JsonPrimitive(it)) } }
                     put("goal", p.goal)
+                    putJsonArray("entities") { p.entities.forEach { add(JsonPrimitive(it)) } }
+                    p.stopWhen?.let { put("stop_when", it) }
                     putJsonArray("type_values") { p.typeValues.forEach { add(JsonPrimitive(it)) } }
                     putJsonArray("milestones") { p.milestones.forEachIndexed { i, m -> add(buildJsonObject { put("text", m); put("done", i < run.doneMilestones.size) }) } }
                 }
@@ -168,6 +170,8 @@ class RunLogStore(private val dir: File, private val keep: Int = 50) {
         s.consult?.let { put("consult", it) }
         s.dialog?.let { put("dialog", it) }
         s.popup?.let { put("popup", it) }
+        s.target?.let { put("target", it) }
+        if (s.refused) put("refused", true)
         s.snapped?.let { n -> putJsonObject("snapped") { put("from", n.from); put("to", n.to); put("tag", n.tag); put("label", n.label) } }
         if (s.failed) put("failed", true)
     }

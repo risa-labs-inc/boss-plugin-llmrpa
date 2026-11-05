@@ -192,7 +192,7 @@ class HeadlessRunner(
         val llm = a.plannerModel?.let { resolveChat(it, "planner_model").getOrElse { e -> return Result.failure(e) } }
         val consultModel = a.consultModel?.let { resolveChat(it, "consult_model").getOrElse { e -> return Result.failure(e) } }
         val flow = ComputerUseFlow(tools, gateway, LockedTabs(locks, TabLocks.Owner.HEADLESS, openTab, reveal, list = { tabs().filter { it.url != null }.associate { it.tabId to it.title } }),
-            openWaitsMs = limits.openWaitsMs, settleMs = limits.navSettleMs, stepSettleMs = limits.stepSettleMs, runLog = runLog)
+            openWaitsMs = limits.openWaitsMs, settleMs = limits.navSettleMs, runLog = runLog)
         val request = UseRequest(
             task = a.task, url = page, tabId = tab?.tabId, jevModel = a.model ?: Cu.VISION_DEFAULT_MODEL, llm = llm,
             pointerLabel = Cu.pointerLabel(a.displayName), llmTyping = a.llmTyping,

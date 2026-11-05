@@ -624,7 +624,7 @@ class LlmrpaComponent(
         }
         return ComputerUseFlow(
             tools, aiGateway, LockedTabs(tabLocks, TabLocks.Owner.PANEL, create, { id -> revealTab(provider, id) }, list = { provider?.activeTabs?.value.orEmpty().filter { it.url != null }.associate { it.tabId to it.title } }),
-            openWaitsMs = baseLimits.openWaitsMs, settleMs = baseLimits.navSettleMs, stepSettleMs = baseLimits.stepSettleMs, runLog = runLog,
+            openWaitsMs = baseLimits.openWaitsMs, settleMs = baseLimits.navSettleMs, runLog = runLog,
         )
     }
 

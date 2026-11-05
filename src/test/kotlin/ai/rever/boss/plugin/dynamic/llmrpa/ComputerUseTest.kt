@@ -310,6 +310,22 @@ class ComputerUseTest {
         /** One entry per screenshot call, in order: (revealed, visible) as the engine reports them; none = the plain reply. */
         val screenshotFlags = ArrayDeque<Pair<Boolean?, Boolean?>>()
         var pageTextFn: (() -> String)? = null
+        /** RPA Engine's `look` verb: false answers like an older engine (unknown action type). */
+        var lookSupported = false
+        /** Write real JPEGs (the marks are drawn on them) instead of a text stand-in. */
+        var realImages = false
+        /** The `elements` a look returns (a JSON array), and the options each look was asked with. */
+        var lookElements = "[]"
+        val lookArgs = mutableListOf<JsonObject>()
+        /** Which mark Jev picks for click_target / type_target when those questions are asked; null = NONE. */
+        var clickPick: String? = null
+        var typePick: String? = null
+        /** The box Jev answers with. */
+        var boxJson = """{"top":0.2,"bottom":0.3,"left":0.4,"right":0.6}"""
+        /** The next click_at replies fail with this error (the engine's disabled / covered refusal). */
+        val clickErrors = ArrayDeque<String>()
+        /** The question keys of every decision call. */
+        val questionKeys = mutableListOf<Set<String>>()
 
         override suspend fun invoke(toolName: String, arguments: JsonElement): ToolReply {
             val r = invoke0(toolName, arguments)
@@ -341,13 +357,29 @@ class ComputerUseTest {
                         "locate_text" -> locateReply?.let { ToolReply(it(action["value"]!!.jsonPrimitive.content), false) } ?: ToolReply("""{"ok":false,"error":"Unknown action type locate_text"}""", false)
                         "dialog_answer" -> { dialogAnswers += action["value"]!!.jsonPrimitive.content; dialog = null; ToolReply("""{"ok":true}""", false) }
                         "cu_end" -> ToolReply("""{"ok":true}""", false)
-                        "screenshot" -> {
-                            val f = File(dir, "shot-${if (frozen) 0 else shots++}.jpg").also { it.writeText("shot ${if (frozen) 0 else shots}") }
-                            ToolReply("""{"ok":true,"screenshot":{"path":"${f.absolutePath}","width":560,"height":390,"css_width":1120,"css_height":780,"dpr":2${if (shotMeta) ""","url":"$pageUrl","title":"Shot title"""" else ""}${if (reportScroll) ""","scroll":{"x":0,"y":$scrollY,"max_y":5000}""" else ""}${contentHash?.invoke()?.let { ""","content_hash":"$it"""" }.orEmpty()}${shotModalLabel?.let { ""","modal":{"label":"$it"}""" }.orEmpty()}}${screenshotFlags.removeFirstOrNull()?.let { (r, v) -> listOfNotNull(r?.let { ""","revealed":$it""" }, v?.let { ""","visible":$it""" }).joinToString("") }.orEmpty()}$dlg}""", false)
+                        "screenshot" -> ToolReply(screenshotText(pageUrl, dlg), false)
+                        "look" -> if (!lookSupported) ToolReply("""{"ok":false,"error":"Unknown action type look"}""", false) else {
+                            val opts = kotlinx.serialization.json.Json.parseToJsonElement(action["value"]!!.jsonPrimitive.content).jsonObject
+                            lookArgs += opts
+                            val b = kotlinx.serialization.json.Json.parseToJsonElement(screenshotText(pageUrl, dlg)).jsonObject
+                            val located = buildJsonObject {
+                                (opts["locate"] as? JsonArray).orEmpty().forEach { ph ->
+                                    val phrase = ph.jsonPrimitive.content
+                                    val l = locateReply?.let { f -> kotlinx.serialization.json.Json.parseToJsonElement(f(phrase)).jsonObject["located"] } ?: kotlinx.serialization.json.Json.parseToJsonElement("""{"found":false,"count":0,"in_view":false}""")
+                                    put(phrase, l ?: JsonPrimitive(false))
+                                }
+                            }
+                            val look = buildJsonObject {
+                                put("screenshot", b["screenshot"]!!)
+                                put("located", located)
+                                put("elements", kotlinx.serialization.json.Json.parseToJsonElement(lookElements))
+                                if (opts["page_text"]?.jsonPrimitive?.content == "true") put("page_text", JsonPrimitive(pageTextFn?.invoke() ?: pageTexts[pageUrl] ?: if (pageUrl == "https://sample.com/") "Best: A, B, C" else "Text of $pageUrl"))
+                            }
+                            ToolReply(JsonObject(b - "screenshot" + ("look" to look)).toString(), false)
                         }
                         "focused" -> ToolReply("""{"ok":true,"focused":$focused}""", false)
                         "page_text" -> ToolReply("""{"ok":true,"text":"${pageTextFn?.invoke() ?: pageTexts[pageUrl] ?: if (pageUrl == "https://sample.com/") "Best: A, B, C" else "Text of $pageUrl"}"}""", false)
-                        "click_at" -> { clickPages.removeFirstOrNull()?.let { url = it }; if (strictDialogs && armedDialogOnClick != null) { armedDialog = armedDialogOnClick; armedDialogOnClick = null }; ToolReply("""{"ok":true${autoDialogs?.let { ""","dialog_auto":$it""" }.orEmpty()}${snapReply?.let { ""","snapped":$it""" }.orEmpty()}$dlg}""", false) }
+                        "click_at" -> if (clickErrors.isNotEmpty()) ToolReply("""{"ok":false,"error":"${clickErrors.removeFirst()}"}""", false) else { clickPages.removeFirstOrNull()?.let { url = it }; if (strictDialogs && armedDialogOnClick != null) { armedDialog = armedDialogOnClick; armedDialogOnClick = null }; ToolReply("""{"ok":true${autoDialogs?.let { ""","dialog_auto":$it""" }.orEmpty()}${snapReply?.let { ""","snapped":$it""" }.orEmpty()}$dlg}""", false) }
                         "navigate" -> { url = action["value"]!!.jsonPrimitive.content; ToolReply("""{"ok":true}""", false) }
                         "scroll_by" -> { if (wheelWorks) scrollY = (scrollY + action["value"]!!.jsonPrimitive.content.toDouble()).coerceAtLeast(0.0); ToolReply("""{"ok":true}""", false) }
                         else -> ToolReply("""{"ok":true}""", false)
@@ -370,19 +402,30 @@ class ComputerUseTest {
                         ToolReply("""{"response":{"answers":{"text":{"type":"choice","choice":"$key","probabilities":{"$key":0.95}}},"usage":{"cost":0.001}}}""", false)
                     } else {
                         jevArgs += a
+                        questionKeys += q.keys
                         if (jevDelayMs > 0) kotlinx.coroutines.delay(jevDelayMs)
                         val op = script[jevCalls.coerceAtMost(script.lastIndex)]
                         jevCalls++
                         val p = when { op.endsWith("@low") -> 0.3; op.endsWith("@mid") -> 0.55; else -> 0.9 }
-                        ToolReply(reply(op.removeSuffix("@low").removeSuffix("@mid"), p, milestoneScript.getOrNull(jevCalls - 1)), false)
+                        ToolReply(reply(op.removeSuffix("@low").removeSuffix("@mid"), p, milestoneScript.getOrNull(jevCalls - 1), q), false)
                     }
                 }
                 else -> ToolReply("unknown", true)
             }
         }
-        private fun reply(op: String, p: Double, milestone: Double? = null) =
-            """{"response":{"answers":{${milestone?.let { """"milestone":{"type":"noul","noul":$it},""" }.orEmpty()}"operation":{"type":"choice","choice":"$op","probabilities":{"$op":$p}},""" +
-                """"target":{"type":"box","box":{"top":0.2,"bottom":0.3,"left":0.4,"right":0.6},"confidence":0.8},"scroll":{"type":"choice","choice":"small"}},"usage":{"cost":0.01}}}"""
+        private fun screenshotText(pageUrl: String, dlg: String): String {
+            val n = if (frozen) 0 else shots++
+            val f = File(dir, "shot-$n.jpg").also {
+                if (!realImages) it.writeText("shot ${if (frozen) 0 else shots}")
+                else javax.imageio.ImageIO.write(java.awt.image.BufferedImage(560, 390, java.awt.image.BufferedImage.TYPE_INT_RGB).also { img -> img.createGraphics().apply { color = java.awt.Color.WHITE; fillRect(0, 0, 560, 390); color = java.awt.Color(n % 255, 0, 0); fillRect(0, 0, 10, 10); dispose() } }, "jpg", it)
+            }
+            return """{"ok":true,"screenshot":{"path":"${f.absolutePath}","width":560,"height":390,"css_width":1120,"css_height":780,"dpr":2${if (shotMeta) ""","url":"$pageUrl","title":"Shot title"""" else ""}${if (reportScroll) ""","scroll":{"x":0,"y":$scrollY,"max_y":5000}""" else ""}${contentHash?.invoke()?.let { ""","content_hash":"$it"""" }.orEmpty()}${shotModalLabel?.let { ""","modal":{"label":"$it"}""" }.orEmpty()}}${screenshotFlags.removeFirstOrNull()?.let { (r, v) -> listOfNotNull(r?.let { ""","revealed":$it""" }, v?.let { ""","visible":$it""" }).joinToString("") }.orEmpty()}$dlg}"""
+        }
+        private fun pickJson(key: String, pick: String?, q: JsonObject?) =
+            if (q != null && key in q) """"$key":{"type":"choice","choice":"${pick ?: Marks.NONE}","probabilities":{"${pick ?: Marks.NONE}":0.9}},""" else ""
+        private fun reply(op: String, p: Double, milestone: Double? = null, q: JsonObject? = null) =
+            """{"response":{"answers":{${milestone?.let { """"milestone":{"type":"noul","noul":$it},""" }.orEmpty()}${pickJson("click_target", clickPick, q)}${pickJson("type_target", typePick, q)}"operation":{"type":"choice","choice":"$op","probabilities":{"$op":$p}},""" +
+                """"target":{"type":"box","box":$boxJson,"confidence":0.8},"scroll":{"type":"choice","choice":"small"}},"usage":{"cost":0.01}}}"""
         fun stepTypes() = calls.filter { it.first == ToolNames.STEP }.map { it.second["action"]!!.jsonObject["type"]!!.jsonPrimitive.content }
         fun stepArgs(type: String) = calls.filter { it.first == ToolNames.STEP && it.second["action"]!!.jsonObject["type"]!!.jsonPrimitive.content == type }.map { it.second }
     }
@@ -399,7 +442,10 @@ class ComputerUseTest {
         override suspend fun open(url: String): String? { opened += url; return "t1" }
         override fun claim(tabId: String): String? = if (tabId in refuse) "taken" else null.also { claimed += tabId }
         override fun release(tabId: String) { released += tabId }
-        override suspend fun snapshot(): Map<String, String> = now
+        var snapshots = 0
+        /** Called with the call number before each snapshot is returned, so a tab can appear between two checks. */
+        var onSnapshot: ((Int) -> Unit)? = null
+        override suspend fun snapshot(): Map<String, String> { onSnapshot?.invoke(++snapshots); return now }
     }
 
     private var consultReplies = ArrayDeque<String>()
@@ -433,7 +479,7 @@ class ComputerUseTest {
     private val typedJson = """{"text":"written text"}"""
 
     private fun flow(browser: FakeBrowser, tabs: FakeTabs, requests: MutableList<AiRequest>, plan: String = this.plan, log: RunLogStore? = null) =
-        ComputerUseFlow(browser, { gateway(requests, plan, typedJson) }, tabs, openWaitsMs = listOf(0), settleMs = 0, stepSettleMs = 0, runLog = log, popupWaitMs = 0, popupPollMs = 0)
+        ComputerUseFlow(browser, { gateway(requests, plan, typedJson) }, tabs, openWaitsMs = listOf(0), settleMs = 0, runLog = log, popupRecheckMs = 0)
 
     private fun tmp() = java.nio.file.Files.createTempDirectory("cu").toFile().also { it.deleteOnExit() }
 
@@ -1308,19 +1354,29 @@ class ComputerUseTest {
     }
 
     @Test
-    fun `the direct scroll needs exactly one found target, 2 screens or more, in the direction Jev chose`() {
-        val far = Cu.Target("a", Cu.Located(true, 1, false, "down", 2.5))
-        assertEquals(2.0, Cu.scrollToTarget(listOf(far), VisionOp.SCROLL_DOWN)!!.second)
-        assertEquals(-3.0, Cu.scrollToTarget(listOf(Cu.Target("a", Cu.Located(true, 1, false, "up", 9.0))), VisionOp.SCROLL_UP)!!.second)
-        assertNull(Cu.scrollToTarget(listOf(far), VisionOp.SCROLL_UP)) // the other way
-        assertNull(Cu.scrollToTarget(listOf(Cu.Target("a", Cu.Located(true, 1, false, "down", 1.9))), VisionOp.SCROLL_DOWN)) // under 2 screens
-        assertNull(Cu.scrollToTarget(listOf(far, Cu.Target("b", Cu.Located(true, 1, false, "down", 6.0))), VisionOp.SCROLL_DOWN)) // two found
-        assertEquals(2.0, Cu.scrollToTarget(listOf(far, Cu.Target("b", Cu.Located(false, 0, false, null, null))), VisionOp.SCROLL_DOWN)!!.second) // the other is not on the page
-        assertNull(Cu.scrollToTarget(listOf(Cu.Target("a", Cu.Located(true, 1, true, null, 0.0))), VisionOp.SCROLL_DOWN))
-        assertNull(Cu.scrollToTarget(emptyList(), VisionOp.SCROLL_DOWN))
+    fun `the direct scroll goes to the first off-screen target the current milestone names, toward it, at least half a screen`() {
+        val far = Cu.Target("Tres Leches", Cu.Located(true, 1, false, "down", 2.5))
+        assertEquals(2.0, Cu.scrollToTarget(listOf(far), VisionOp.SCROLL_DOWN, "Tres Leches is in the cart")!!.second)
+        assertEquals(-3.0, Cu.scrollToTarget(listOf(Cu.Target("Tres Leches", Cu.Located(true, 1, false, "up", 9.0))), VisionOp.SCROLL_UP, "Tres Leches is in the cart")!!.second)
+        // Toward the target, whatever direction Jev chose; a near one still moves half a screen.
+        assertEquals(2.0, Cu.scrollToTarget(listOf(far), VisionOp.SCROLL_UP, "Tres Leches is in the cart")!!.second)
+        assertEquals(0.5, Cu.scrollToTarget(listOf(Cu.Target("Tres Leches", Cu.Located(true, 1, false, "down", 0.8))), VisionOp.SCROLL_DOWN, "Tres Leches")!!.second)
+        // Several found: the first one the milestone names and that is not in view, not "none because two".
+        val magnolia = Cu.Target("Magnolia Bakery", Cu.Located(true, 1, false, "up", 6.0))
+        val inView = Cu.Target("Brownie", Cu.Located(true, 1, true, null, 0.0))
+        val pick = Cu.scrollToTarget(listOf(magnolia, inView, far), VisionOp.SCROLL_DOWN, "Tres Leches is in the cart")!!
+        assertEquals("Tres Leches", pick.first.text)
+        assertEquals(2.0, pick.second)
+        // Nothing the milestone names is off screen: Jev's own amount stands.
+        assertNull(Cu.scrollToTarget(listOf(magnolia, inView), VisionOp.SCROLL_DOWN, "Tres Leches is in the cart"))
+        assertNull(Cu.scrollToTarget(listOf(Cu.Target("Tres Leches", Cu.Located(true, 1, true, null, 0.0))), VisionOp.SCROLL_DOWN, "Tres Leches"))
+        assertNull(Cu.scrollToTarget(listOf(Cu.Target("Tres Leches", Cu.Located(false, 0, false, null, null))), VisionOp.SCROLL_DOWN, "Tres Leches"))
+        assertNull(Cu.scrollToTarget(emptyList(), VisionOp.SCROLL_DOWN, "Tres Leches"))
+        assertNull(Cu.scrollToTarget(listOf(far), VisionOp.CLICK, "Tres Leches"))
+        // With no milestone only a single off-screen target counts.
+        assertEquals(2.0, Cu.scrollToTarget(listOf(far, inView), VisionOp.SCROLL_DOWN, null)!!.second)
+        assertNull(Cu.scrollToTarget(listOf(far, magnolia), VisionOp.SCROLL_DOWN, null))
     }
-
-    // ---- research tasks: auto-collect, state.collected, partial extract, the planner prompt ----
 
     @Test
     fun `text is saved whenever the content changed after an action, once per page state, without COLLECT`() = runTest {
@@ -2148,11 +2204,13 @@ class ComputerUseTest {
         assertTrue(p.contains("2 to 6 steps in order, each at most 12 words and checkable from a screenshot"))
         assertTrue(p.contains("Tres Leches is in the cart"))
         assertTrue(p.contains("the overall aim in at most 25 words"))
-        assertTrue(p.contains("the LAST milestone says it: \"stop at the login or payment step\""))
+        assertTrue(p.contains("\"entities\":[\"...\"],\"stop_when\":\"...\""))
+        assertTrue(p.contains("It is NOT a milestone: never repeat it in milestones"))
+        assertFalse(p.contains("the LAST milestone says it"))
         assertTrue(p.contains("Reply with only JSON"))
         assertTrue(p.contains("short and literal"))
         val r = Cu.REPLAN_SYSTEM
-        assertTrue(r.contains("\"open\":[{\"url\":\"https://...\"}],\"milestones\":[\"...\"],\"jev_goal\":\"...\""))
+        assertTrue(r.contains("\"open\":[{\"url\":\"https://...\"}],\"milestones\":[\"...\"],\"entities\":[\"...\"],\"stop_when\":\"...\",\"jev_goal\":\"...\""))
         assertTrue(r.contains("only the milestones still to do"))
         assertTrue(r.contains("Never guess a site's internal search or deep URL"))
     }
@@ -2181,18 +2239,18 @@ class ComputerUseTest {
     private val milestonePlan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"Order Tres Leches from Magnolia Bakery","milestones":["Magnolia Bakery's page is open","Tres Leches is in the cart","the login or checkout step is shown"],"type_values":[]}"""
 
     @Test
-    fun `DONE moves to the next milestone and only the last one ends the run`() = runTest {
-        val browser = FakeBrowser(tmp(), listOf("DONE", "DONE", "DONE"))
+    fun `DONE moves to the next milestone, which needs an action of this run, and only the last one ends the run`() = runTest {
+        val browser = FakeBrowser(tmp(), listOf("DONE", "CLICK", "DONE", "CLICK", "DONE"))
         val report = flow(browser, FakeTabs(), mutableListOf(), plan = milestonePlan).runComputerUse(UseRequest("order a cake", maxSteps = 10))
         assertEquals(UseStatus.DONE, report.status)
-        assertEquals(3, browser.jevCalls)
-        assertEquals(listOf(VisionOp.MILESTONE, VisionOp.MILESTONE), report.steps.map { it.op })
+        assertEquals(5, browser.jevCalls)
+        assertEquals(listOf(VisionOp.MILESTONE, VisionOp.CLICK, VisionOp.MILESTONE, VisionOp.CLICK), report.steps.map { it.op })
         assertEquals("milestone 1 done: Magnolia Bakery's page is open", report.steps[0].note)
-        assertEquals("milestone 2 done: Tres Leches is in the cart", report.steps[1].note)
+        assertEquals("milestone 2 done: Tres Leches is in the cart", report.steps[2].note)
         // Jev saw each one in turn, with those done so far.
         val states = browser.jevArgs.map { it["state"]!!.jsonObject }
-        assertEquals(listOf("1 of 3: Magnolia Bakery's page is open", "2 of 3: Tres Leches is in the cart", "3 of 3: the login or checkout step is shown"), states.map { it["milestone"]!!.jsonPrimitive.content })
-        assertEquals(listOf(0, 1, 2), states.map { it["done_milestones"]!!.jsonArray.size })
+        assertEquals(listOf("1 of 3: Magnolia Bakery's page is open", "2 of 3: Tres Leches is in the cart", "2 of 3: Tres Leches is in the cart", "3 of 3: the login or checkout step is shown", "3 of 3: the login or checkout step is shown"), states.map { it["milestone"]!!.jsonPrimitive.content })
+        assertEquals(listOf(0, 1, 1, 2, 2), states.map { it["done_milestones"]!!.jsonArray.size })
         assertEquals("milestone 1 done: Magnolia Bakery's page is open", states[1]["recent_actions"]!!.jsonArray.single().jsonObject["result"]!!.jsonPrimitive.content)
         // The report lists them, all reached.
         val ms = report.toJson()["milestones"]!!.jsonArray.map { it.jsonObject["text"]!!.jsonPrimitive.content to it.jsonObject["done"]!!.jsonPrimitive.content.toBoolean() }
@@ -2217,7 +2275,7 @@ class ComputerUseTest {
     @Test
     fun `a dead end asks the planner for a better start, navigates there, and goes on with the new milestones`() = runTest {
         replanReplies = ArrayDeque(listOf(replanReply()))
-        val browser = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "BLOCKED", "DONE", "DONE")).also { it.pageTextFn = { "Bharat Baker's\nKesari Nandan" } }
+        val browser = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "BLOCKED", "DONE", "CLICK", "DONE")).also { it.pageTextFn = { "Bharat Baker's\nKesari Nandan" } }
         val requests = mutableListOf<AiRequest>()
         val run = UseRun("Order tres leches from Magolia bakery on zomato")
         val report = flow(browser, FakeTabs(), requests, plan = milestonePlan).runComputerUse(UseRequest("Order tres leches from Magolia bakery on zomato", maxSteps = 10), run)
@@ -2307,23 +2365,26 @@ class ComputerUseTest {
 
     @Test
     fun `every look asks whether the current milestone is true, at 0_7 it is reached and the next one is asked next`() = runTest {
-        val browser = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "SCROLL_DOWN", "SCROLL_DOWN", "SCROLL_DOWN", "DONE")).also {
-            // call 1: not yet; call 2: reached (0.8); call 3: not yet (0.4) for the next one; call 4: 0.69 is not enough; call 5: DONE
-            it.milestoneScript = listOf(0.3, 0.8, 0.4, 0.69, null)
+        val browser = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "SCROLL_DOWN", "CLICK", "SCROLL_DOWN", "DONE", "CLICK", "DONE", "DONE")).also {
+            // call 1: not yet; call 2: reached (0.8), and the scroll is acted on; call 3: a click, not yet (0.4) for the next one; call 4: 0.69 is not enough;
+            // call 5: DONE (the click since the last milestone makes it creditable); call 6: a click; call 7: DONE for the cart; call 8: DONE ends the run.
+            it.milestoneScript = listOf(0.3, 0.8, 0.4, 0.69, null, null, null, null)
         }
         val report = flow(browser, FakeTabs(), mutableListOf(), plan = orderPlan).runComputerUse(UseRequest("order a cake", maxSteps = 12))
         assertEquals(UseStatus.DONE, report.status, report.error)
         // Each call carried the question for the milestone then current.
-        val asked = browser.jevArgs.map { it["questions"]!!.jsonObject["milestone"]!!.jsonObject["instructions"]!!.jsonPrimitive.content }
+        val asked = browser.jevArgs.mapNotNull { it["questions"]!!.jsonObject["milestone"]?.jsonObject?.get("instructions")?.jsonPrimitive?.content }
         assertTrue(asked[0].contains("'A Magnolia Bakery Zomato order page is open'"))
         assertTrue(asked[1].contains("'A Magnolia Bakery Zomato order page is open'"))
         assertTrue(asked[2].contains("'Tres Leches is visible on the menu'"), asked[2]) // re-asked about the next one on the next look
         assertEquals("noul", browser.jevArgs[0]["questions"]!!.jsonObject["milestone"]!!.jsonObject["type"]!!.jsonPrimitive.content)
         assertEquals(setOf("true", "false"), browser.jevArgs[0]["questions"]!!.jsonObject["milestone"]!!.jsonObject["criteria"]!!.jsonObject.keys)
         val notes = report.steps.filter { it.op == VisionOp.MILESTONE }.map { it.note }
-        // The first by Jev's own answer, the next two by DONE, which stays an alternative way to advance; the last one ends the run.
+        // The first by Jev's own answer, the next two by DONE, which stays an alternative way to advance; the stop_when ends the run (it is no milestone).
         assertEquals(listOf("milestone 1 done: A Magnolia Bakery Zomato order page is open", "milestone 2 done: Tres Leches is visible on the menu", "milestone 3 done: Tres Leches is in the cart"), notes)
-        assertEquals(7, browser.jevCalls)
+        // The milestone's own decision was acted on: the scroll that came with the 0.8 answer happened.
+        assertEquals(listOf(VisionOp.SCROLL_DOWN, VisionOp.SCROLL_DOWN), report.steps.filter { it.op == VisionOp.SCROLL_DOWN }.map { it.op }.take(2))
+        assertEquals(8, browser.jevCalls)
         // No call of its own: the same number of calls as without it (one per look).
         assertEquals(browser.jevCalls, browser.jevArgs.size)
         // The question is asked of nothing when there are no milestones.
@@ -2333,21 +2394,29 @@ class ComputerUseTest {
     }
 
     @Test
-    fun `a last milestone that says to stop at the login ends as the person's when the page asks, else done`() = runTest {
-        val twoStep = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"Order a cake","milestones":["Tres Leches is in the cart","Stop at the login or payment step"],"type_values":[]}"""
-        val wall = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "SCROLL_DOWN")).also {
-            it.milestoneScript = listOf(0.9, 0.95); it.modalLabel = "Login"; it.pageTextFn = { "Login\nPhone number\nSend one time password" }
-        }
+    fun `a stop_when ends as the person's when the page asks, a planner that writes it as the last milestone is read the same way`() = runTest {
+        val twoStep = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"Order a cake","milestones":["Tres Leches is in the cart"],"stop_when":"login or payment step","type_values":[]}"""
+        val legacy = Cu.parsePlan("""{"open":[],"jev_goal":"g","milestones":["Tres Leches is in the cart","Stop at the login or payment step"]}""", "t")
+        assertEquals(listOf("Tres Leches is in the cart"), legacy.milestones)
+        assertEquals("login or payment step", legacy.stopWhen)
+        val explicit = Cu.parsePlan(twoStep, "t")
+        assertEquals(listOf("Tres Leches is in the cart"), explicit.milestones)
+        assertEquals("login or payment step", explicit.stopWhen)
+        // The page puts up a login after a click: the run ends for the person.
+        val wall = FakeBrowser(tmp(), listOf("CLICK", "CLICK", "CLICK")).also { it.pageTextFn = { "Login\nPhone number\nSend one time password" } }
+        wall.onAction = { type, _ -> if (type == "click_at") wall.shotModalLabel = "Login" }
         val r = flow(wall, FakeTabs(), mutableListOf(), plan = twoStep).runComputerUse(UseRequest("t", maxSteps = 8))
         assertEquals(UseStatus.NEEDS_INPUT, r.status)
         assertTrue(r.blocker!!.question!!.contains("is asking you to"))
-        assertEquals(listOf(true, true), r.toJson()["milestones"]!!.jsonArray.map { it.jsonObject["done"]!!.jsonPrimitive.content.toBoolean() })
-        // The page shows no wall: the aim is reached, so the run is done.
-        val none = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "SCROLL_DOWN")).also { it.milestoneScript = listOf(0.9, 0.95) }
-        assertEquals(UseStatus.DONE, flow(none, FakeTabs(), mutableListOf(), plan = twoStep).runComputerUse(UseRequest("t", maxSteps = 8)).status)
+        assertEquals(1, wall.jevCalls) // the second look found the wall: no decision was made on it
+        // The page shows no wall: the last milestone is credited (a click changed the page), and Jev's DONE after it ends the run.
+        val none = FakeBrowser(tmp(), listOf("CLICK", "CLICK", "DONE")).also { it.milestoneScript = listOf(null, 0.9, null) }
+        val done = flow(none, FakeTabs(), mutableListOf(), plan = twoStep).runComputerUse(UseRequest("t", maxSteps = 8))
+        assertEquals(UseStatus.DONE, done.status)
+        assertEquals(listOf(true), done.toJson()["milestones"]!!.jsonArray.map { it.jsonObject["done"]!!.jsonPrimitive.content.toBoolean() })
         // An ordinary last milestone is done when reached.
         val ordinary = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"g","milestones":["Page open","Item visible"],"type_values":[]}"""
-        val o = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "SCROLL_DOWN")).also { it.milestoneScript = listOf(0.9, 0.9) }
+        val o = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "CLICK", "SCROLL_DOWN")).also { it.milestoneScript = listOf(0.9, null, 0.9) }
         assertEquals(UseStatus.DONE, flow(o, FakeTabs(), mutableListOf(), plan = ordinary).runComputerUse(UseRequest("t", maxSteps = 8)).status)
         assertTrue(Cu.isStopMilestone("Stop at the login or payment step"))
         assertTrue(Cu.isStopMilestone("stop before ordering"))
@@ -2451,7 +2520,7 @@ class ComputerUseTest {
     fun `stuck on the right site the planner gives advice by text, with no navigate, the hint reaches Jev and the named element becomes a target`() = runTest {
         replanReplies = ArrayDeque(listOf(adviceReply))
         val located = mutableListOf<String>()
-        val browser = FakeBrowser(tmp(), listOf("BLOCKED", "DONE", "DONE", "DONE", "DONE")).also { b ->
+        val browser = FakeBrowser(tmp(), listOf("BLOCKED", "DONE", "CLICK", "DONE", "CLICK", "DONE", "DONE")).also { b ->
             b.currentUrlOverride = lazyUrl; b.urlByTab["t1"] = lazyUrl; b.currentTitle = "Magnolia Bakery - Zomato"
             b.elements = orderOnlineElements; b.modalLabel = "Cookie banner"
             b.pageTextFn = { "Overview\nMenu\nPhotos\nOrder Online" }
@@ -2535,7 +2604,7 @@ class ComputerUseTest {
     fun `the last stop-at-login milestone reads the screenshot's own dialog, so a login dialog is needs_input not done`() = runTest {
         // The live miss: observe and the page text knew nothing of the dialog; only the screenshot said "Login" is open.
         val b = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "SCROLL_DOWN")).also {
-            it.milestoneScript = listOf(0.9, 0.95); it.shotModalLabel = "Login"; it.pageTextFn = { "Your Order (1)\nSubtotal \u20B9500" }
+            it.shotModalLabel = "Login"; it.pageTextFn = { "Your Order (1)\nSubtotal \u20B9500" }
         }
         val r = flow(b, FakeTabs(), mutableListOf(), plan = stopPlan).runComputerUse(UseRequest("order", maxSteps = 8))
         assertEquals(UseStatus.NEEDS_INPUT, r.status)
@@ -2544,7 +2613,7 @@ class ComputerUseTest {
         assertTrue(q.contains("then reply 'continue'"))
         // The login wording wins over the one-time password it mentions.
         val otp = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "SCROLL_DOWN")).also {
-            it.milestoneScript = listOf(0.9, 0.95); it.shotModalLabel = "Login"; it.pageTextFn = { "Login\nPhone number\nSend One Time Password\nContinue with Email\nContinue with Google" }
+            it.shotModalLabel = "Login"; it.pageTextFn = { "Login\nPhone number\nSend One Time Password\nContinue with Email\nContinue with Google" }
         }
         val q2 = flow(otp, FakeTabs(), mutableListOf(), plan = stopPlan).runComputerUse(UseRequest("order", maxSteps = 8)).blocker!!.question!!
         assertTrue(q2.contains("is asking you to log in."), q2)
@@ -2554,7 +2623,7 @@ class ComputerUseTest {
         assertEquals("enter a verification code", Cu.wallKind("Verify", "Enter the verification code"))
         assertEquals("enter payment details", Cu.wallKind("Payment", "Card number\nCVV"))
         // No dialog, no wall: the stop milestone is simply reached.
-        val calm = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "SCROLL_DOWN")).also { it.milestoneScript = listOf(0.9, 0.95); it.pageTextFn = { "Your Order (1)" } }
+        val calm = FakeBrowser(tmp(), listOf("CLICK", "CLICK", "DONE")).also { it.milestoneScript = listOf(null, 0.9, null); it.pageTextFn = { "Your Order (1)" } }
         assertEquals(UseStatus.DONE, flow(calm, FakeTabs(), mutableListOf(), plan = stopPlan).runComputerUse(UseRequest("order", maxSteps = 8)).status)
     }
 
@@ -2570,7 +2639,7 @@ class ComputerUseTest {
         assertTrue(flow(pay, FakeTabs(), mutableListOf()).runComputerUse(UseRequest("t")).blocker!!.question!!.contains("enter payment details"))
         // Through an ordinary last milestone too (not only a stop one).
         val ordinary = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"g","milestones":["Page open","Item in the cart"],"type_values":[]}"""
-        val m = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "SCROLL_DOWN")).also { it.milestoneScript = listOf(0.9, 0.9); it.shotModalLabel = "Sign in"; it.pageTextFn = { "Sign in\nEmail" } }
+        val m = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "CLICK", "SCROLL_DOWN")).also { it.milestoneScript = listOf(0.9, null, 0.9); it.shotModalLabel = "Sign in"; it.pageTextFn = { "Sign in\nEmail" } }
         assertEquals(UseStatus.NEEDS_INPUT, flow(m, FakeTabs(), mutableListOf(), plan = ordinary).runComputerUse(UseRequest("t", maxSteps = 8)).status)
         // A dialog that is not a wall (a cookie notice) does not stop a done.
         val cookie = FakeBrowser(tmp(), listOf("DONE")).also { it.shotModalLabel = "Cookie settings"; it.pageTextFn = { "We use cookies" } }
@@ -2894,5 +2963,493 @@ class ComputerUseTest {
         val inline = kotlinx.serialization.json.buildJsonObject { put("data_base64", "A".repeat(5000)) }
         assertFalse(RecordingTools.summarise("other", inline).contains("AAAA"))
         assertTrue(JsonArray(emptyList()).isEmpty())
+    }
+
+    // ---- set of marks, look, milestones (D5) ----
+
+    private val menuElements = """[
+        {"id":"m1","role":"button","tag":"button","label":"ADD","rect":{"x":900,"y":300,"w":80,"h":32},"disabled":false,"covered":false,"context":"Eggless Classic Tres Leches ₹470","editable":false},
+        {"id":"m2","role":"button","tag":"button","label":"ADD","rect":{"x":900,"y":420,"w":80,"h":32},"disabled":true,"covered":false,"context":"Brownie ₹250","editable":false},
+        {"id":"m3","role":"searchbox","tag":"input","label":"Search","value_kind":"empty","rect":{"x":100,"y":20,"w":400,"h":36},"disabled":false,"covered":false,"context":"","editable":true},
+        {"id":"m4","role":"link","tag":"a","label":"Privacy","rect":{"x":10,"y":700,"w":60,"h":20},"disabled":false,"covered":true,"context":"","editable":false,"href_host":"zomato.com"}]"""
+    private val marksPlan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"Add Tres Leches from Magnolia Bakery to the cart","entities":["Magnolia Bakery","Tres Leches"],"stop_when":"login or payment step","type_values":[]}"""
+    /** A box centred on m1 (900..980 x 300..332 css px of the 1120 x 780 viewport). */
+    private val boxOnM1 = """{"top":0.385,"bottom":0.43,"left":0.805,"right":0.875}"""
+
+    private fun refCount(e: kotlinx.serialization.json.JsonElement): Int = when (e) {
+        is JsonPrimitive -> if (e.isString && e.content == Cu.SHOT_REF) 1 else 0
+        is JsonObject -> e.values.sumOf { refCount(it) }
+        is JsonArray -> e.sumOf { refCount(it) }
+        else -> 0
+    }
+
+    private fun looking(script: List<String>, setup: FakeBrowser.() -> Unit = {}) = FakeBrowser(tmp(), script).also {
+        it.lookSupported = true; it.lookElements = menuElements; it.realImages = true; it.setup()
+    }
+
+    @Test
+    fun `the request for a look has options keyed by mark id with context and state, NONE, and one image reference`() {
+        val marks = Marks.visible(Marks.parseMarks(json("""{"e":$menuElements}""")["e"]!!.jsonArray))
+        assertEquals(listOf("m1", "m2", "m3"), marks.map { it.id }) // the covered link is not offered
+        val args = Cu.decideArgs("typesafe/jev-1.14", "Add Tres Leches", "https://z.example/", "Z", emptyList(), "/x/shot-marks.jpg", marks = marks, stopWhen = "login or payment step")
+        val q = args["questions"]!!.jsonObject
+        assertEquals(setOf("operation", "click_target", "type_target", "target", "scroll"), q.keys)
+        val click = q["click_target"]!!.jsonObject
+        assertEquals("choice", click["type"]!!.jsonPrimitive.content)
+        val criteria = click["criteria"]!!.jsonObject.mapValues { it.value.jsonPrimitive.content }
+        assertEquals(setOf("m1", "m2", Marks.NONE), criteria.keys)
+        assertEquals("[1] button 'ADD' — Eggless Classic Tres Leches ₹470", criteria["m1"])
+        assertEquals("[2] button 'ADD' — Brownie ₹250 · disabled", criteria["m2"])
+        val type = q["type_target"]!!.jsonObject["criteria"]!!.jsonObject.mapValues { it.value.jsonPrimitive.content }
+        assertEquals(setOf("m3", Marks.NONE), type.keys)
+        assertEquals("[3] searchbox 'Search' · empty", type["m3"])
+        // The box question stays, as a fallback and a check.
+        assertEquals("box", q["target"]!!.jsonObject["type"]!!.jsonPrimitive.content)
+        assertTrue(q["operation"]!!.jsonObject["criteria"]!!.jsonObject["CLICK"]!!.jsonPrimitive.content.contains("click_target"))
+        assertTrue(q["operation"]!!.jsonObject["criteria"]!!.jsonObject.containsKey("NEEDS_INPUT"))
+        // The image is one asset, named once: by the state, never again by a question.
+        assertEquals(1, refCount(args["state"]!!) + refCount(q))
+        assertEquals(setOf(Cu.SHOT_REF), args["assets"]!!.jsonObject.keys)
+        assertEquals("/x/shot-marks.jpg", args["assets"]!!.jsonObject[Cu.SHOT_REF]!!.jsonObject["path"]!!.jsonPrimitive.content)
+        val state = args["state"]!!.jsonObject
+        assertEquals(3, state["marks"]!!.jsonObject["count"]!!.jsonPrimitive.content.toInt())
+        assertEquals("login or payment step", state["stop_when"]!!.jsonPrimitive.content)
+        // Page text is data, in the question's own words.
+        assertTrue(click["instructions"]!!.jsonPrimitive.content.contains("untrusted page data"))
+        // No candidate, no question: only fields marked means no click_target, and no marks at all means the box alone.
+        val onlyField = Cu.decideArgs("m", "g", "u", "t", emptyList(), "/x.jpg", marks = marks.filter { it.id == "m3" })["questions"]!!.jsonObject
+        assertEquals(setOf("operation", "type_target", "target", "scroll"), onlyField.keys)
+        val plain = Cu.decideArgs("m", "g", "u", "t", emptyList(), "/x.jpg")
+        assertEquals(setOf("operation", "target", "scroll"), plain["questions"]!!.jsonObject.keys)
+        assertNull(plain["state"]!!.jsonObject["marks"])
+        assertEquals(Cu.OPERATIONS["CLICK"], plain["questions"]!!.jsonObject["operation"]!!.jsonObject["criteria"]!!.jsonObject["CLICK"]!!.jsonPrimitive.content)
+    }
+
+    private fun mark(i: Int, role: String = "button", context: String = "row $i") = Mark("m$i", role, role, "L$i", null, Cu.Rect(0.0, i.toDouble(), 10.0, i + 10.0), false, false, context, false, null)
+
+    @Test
+    fun `a question never has more than 255 options, and navigation links are dropped first`() {
+        val many = (1..100).map { mark(it, "link", "") } + (101..260).map { mark(it, "button") }
+        val shown = Marks.visible(many)
+        assertEquals(254, shown.size) // 255 with NONE
+        assertEquals(160, shown.count { it.role == "button" }) // every card button stays
+        assertEquals(94, shown.count { it.role == "link" })
+        // A link inside a row or card is not chrome: it is kept in preference to the bare ones.
+        val mixed = (1..200).map { mark(it, "link", "") } + (201..400).map { mark(it, "link", "Card $it") }
+        assertTrue(Marks.visible(mixed).count { it.context.isNotBlank() } == 200)
+        val args = Cu.decideArgs("m", "g", "u", "t", emptyList(), "/x.jpg", marks = Marks.visible(many))
+        assertEquals(255, args["questions"]!!.jsonObject["click_target"]!!.jsonObject["criteria"]!!.jsonObject.size)
+        assertEquals(10, Marks.visible((1..10).map { mark(it) }).size)
+    }
+
+    @Test
+    fun `an option reads kind, label, context and state, and a typed value is never in it`() {
+        fun m(label: String = "Go", valueKind: String? = null, disabled: Boolean = false, context: String = "", host: String? = null, role: String = "button") =
+            Mark("m7", role, role, label, valueKind, Cu.Rect(0.0, 0.0, 1.0, 1.0), disabled, false, context, false, host)
+        assertEquals("[7] button 'Go'", Marks.optionText(m()))
+        assertEquals("[7] checkbox 'Eggless' · unchecked", Marks.optionText(m("Eggless", "unchecked", role = "checkbox")))
+        assertEquals("[7] combobox 'Size' · selected Large", Marks.optionText(m("Size", "selected:Large", role = "combobox")))
+        assertEquals("[7] textbox 'Name' · has text", Marks.optionText(m("Name", "text", role = "textbox")))
+        assertEquals("[7] link 'Menu' · link to zomato.com", Marks.optionText(m("Menu", host = "zomato.com", role = "link")))
+        assertEquals("[7] button 'Go' — a   b\nc", Marks.optionText(m(context = "a b c")).replace("a b c", "a   b\nc"))
+        // Long text is cut.
+        assertTrue(Marks.optionText(m(label = "x".repeat(300), context = "y".repeat(300))).length < 200)
+    }
+
+    private fun decision(op: VisionOp = VisionOp.CLICK, click: String? = "m1", type: String? = null, box: Box? = Box(0.385, 0.43, 0.805, 0.875), p: Double = 0.9) =
+        VisionDecision(op, p, box, 0.8, null, 0.0, clickChoice = click, typeChoice = type)
+
+    @Test
+    fun `the chosen mark is used, the box only checks it and lowers the confidence when it points elsewhere`() {
+        val marks = Marks.parseMarks(json("""{"e":$menuElements}""")["e"]!!.jsonArray)
+        // The box centre (940, 316) is inside m1: used, nothing changes.
+        val ok = Marks.reconcile(decision(), marks, 1120, 780)
+        assertEquals("m1", ok.mark!!.id)
+        assertFalse(ok.boxDisagreed)
+        assertEquals(0.9, ok.confidence)
+        // Just outside the element but inside its rect grown by 10% (8 px of 80): still the same target.
+        val near = Marks.reconcile(decision(box = Box(0.385, 0.43, (980 + 7 - 20) / 1120.0, (980 + 7 + 20) / 1120.0)), marks, 1120, 780)
+        assertFalse(near.boxDisagreed, near.toString())
+        // Far away: the mark still wins, with confidence x 0.8 and a flag.
+        val far = Marks.reconcile(decision(box = Box(0.8, 0.9, 0.1, 0.2)), marks, 1120, 780)
+        assertEquals("m1", far.mark!!.id)
+        assertTrue(far.boxDisagreed)
+        assertEquals(0.9 * 0.8, far.confidence, 1e-9)
+        // No box to compare: the mark is used, no disagreement.
+        val noBox = Marks.reconcile(decision(box = null), marks, 1120, 780)
+        assertEquals("m1", noBox.mark!!.id); assertFalse(noBox.boxDisagreed)
+        // NONE, an id that is not on the page, a covered element, or an operation that clicks nothing: the box decides.
+        assertNull(Marks.reconcile(decision(click = Marks.NONE), marks, 1120, 780).mark)
+        assertNull(Marks.reconcile(decision(click = "m99"), marks, 1120, 780).mark)
+        assertNull(Marks.reconcile(decision(click = "m4"), marks, 1120, 780).mark)
+        assertNull(Marks.reconcile(decision(click = null), marks, 1120, 780).mark)
+        assertNull(Marks.reconcile(decision(op = VisionOp.SCROLL_DOWN), marks, 1120, 780).mark)
+        // TYPE_TEXT reads type_target, not click_target.
+        assertEquals("m3", Marks.reconcile(decision(op = VisionOp.TYPE_TEXT, click = "m1", type = "m3", box = Box(0.02, 0.06, 0.1, 0.4)), marks, 1120, 780).mark!!.id)
+        // The answers are read from the reply.
+        val d = Cu.parseDecision(json("""{"response":{"answers":{"operation":{"type":"choice","choice":"CLICK","probabilities":{"CLICK":0.9}},"click_target":{"type":"choice","choice":"m1","probabilities":{"m1":0.8}},"type_target":{"type":"choice","choice":"NONE"}}}}"""))
+        assertEquals("m1", d.clickChoice); assertEquals("NONE", d.typeChoice); assertNull(d.box)
+    }
+
+    @Test
+    fun `look results are read from under look, with the dialog and popups at either level`() {
+        val body = Marks.body(json("""{"ok":true,"popups":[{"id":"t1#popup-1","open":true}],"look":{"screenshot":{"path":"/x/s.jpg","width":560,"height":390,"css_width":1120,"css_height":780,"dpr":2,"modal":{"label":"Login"},"content_hash":"c1"},""" +
+            """"located":{"Tres Leches":{"found":true,"count":2,"in_view":false,"direction":"down","screens":1.5}},"elements":$menuElements,"page_text":"Menu"}}"""))!!
+        val look = Marks.parseLook(body)!!
+        assertEquals("/x/s.jpg", look.shot.path); assertEquals("Login", look.shot.modal); assertEquals("c1", look.shot.contentHash)
+        assertEquals(1.5, look.located.getValue("Tres Leches").screens); assertEquals("down", look.located.getValue("Tres Leches").direction)
+        assertEquals(4, look.marks.size); assertEquals("Menu", look.pageText)
+        val m2 = look.marks[1]
+        assertTrue(m2.disabled); assertTrue(look.marks[3].covered); assertTrue(look.marks[2].editable)
+        assertEquals(Cu.Rect(900.0, 420.0, 980.0, 452.0), m2.rect)
+        assertNotNull(body["popups"])
+        // A plain result is returned as it is.
+        assertEquals(json("""{"ok":true}"""), Marks.body(json("""{"ok":true}""")))
+        assertNull(Marks.body(null))
+        // The call: one JSON string of options, 1100 px at quality 0.7.
+        val step = Cu.lookStep("t1", listOf("Tres Leches", "Magnolia Bakery"), pageText = false, ensureVisible = true)
+        val action = step["action"]!!.jsonObject
+        assertEquals("look", action["type"]!!.jsonPrimitive.content)
+        val opts = json(action["value"]!!.jsonPrimitive.content)
+        assertEquals(1100, opts["max_side"]!!.jsonPrimitive.content.toInt())
+        assertEquals(0.7, opts["quality"]!!.jsonPrimitive.content.toDouble())
+        assertEquals(listOf("Tres Leches", "Magnolia Bakery"), opts["locate"]!!.jsonArray.map { it.jsonPrimitive.content })
+        assertEquals("true", opts["elements"]!!.jsonPrimitive.content); assertEquals("true", opts["ensure_visible"]!!.jsonPrimitive.content); assertEquals("false", opts["page_text"]!!.jsonPrimitive.content)
+        // The activity line says look, not its options; a click by element says which.
+        assertEquals("look tab t1", RecordingTools.summarise(ToolNames.STEP, step))
+        assertTrue(RecordingTools.summarise(ToolNames.STEP, Cu.step("t1", "click_at", "940,316", element = "m1")).contains("element m1"))
+        assertEquals("m1", Cu.step("t1", "click_at", "940,316", element = "m1")["action"]!!.jsonObject["element"]!!.jsonPrimitive.content)
+        assertNull(Cu.step("t1", "click_at", "1,2")["action"]!!.jsonObject["element"])
+    }
+
+    @Test
+    fun `the marks are drawn on a copy of the screenshot, outlined and numbered, with covered ones left out`() {
+        val dir = tmp()
+        val src = File(dir, "shot-1.jpg")
+        javax.imageio.ImageIO.write(java.awt.image.BufferedImage(560, 390, java.awt.image.BufferedImage.TYPE_INT_RGB).also { img -> img.createGraphics().apply { color = java.awt.Color.WHITE; fillRect(0, 0, 560, 390); dispose() } }, "jpg", src)
+        val shot = Shot(src.absolutePath, 560, 390, 1120, 780, 2.0)
+        val marks = Marks.visible(Marks.parseMarks(json("""{"e":$menuElements}""")["e"]!!.jsonArray))
+        val out = File(MarkImage.render(shot, marks)!!)
+        assertEquals("shot-1-marks.jpg", out.name)
+        assertFalse(out.readBytes().contentEquals(src.readBytes()))
+        File("build/reports/visual").also { it.mkdirs() }.let { out.copyTo(File(it, "marks-sample.jpg"), overwrite = true) }
+        val img = javax.imageio.ImageIO.read(out)
+        assertEquals(560, img.width); assertEquals(390, img.height)
+        // m1's outline: its top edge is at css y 300 = image y 150, x from 450.
+        fun dark(x: Int, y: Int) = java.awt.Color(img.getRGB(x, y)).let { it.red + it.green + it.blue < 600 }
+        assertTrue((148..152).any { dark(470, it) }, "no outline for m1")
+        // m2 is disabled: grey, but marked. The covered link m4 (css 10..70 x 700..720 = image 5..35 x 350..360) is not.
+        assertTrue((208..212).any { dark(470, it) }, "no outline for the disabled m2")
+        assertFalse((348..362).any { dark(20, it) }, "a covered element is marked")
+        // The original is never touched; nothing to draw, nothing written.
+        assertNull(MarkImage.render(shot, emptyList()))
+        assertNull(MarkImage.render(shot.copy(path = "/nowhere.jpg"), marks))
+    }
+
+    @Test
+    fun `a run with look takes one look per decision, asks Jev in one call with the marked image, and clicks the picked mark by id`() = runTest {
+        val b = looking(listOf("CLICK", "DONE")) { clickPick = "m1"; boxJson = boxOnM1 }
+        val run = UseRun("add tres leches")
+        val report = flow(b, FakeTabs(), mutableListOf(), plan = marksPlan).runComputerUse(UseRequest("add tres leches", maxSteps = 6), run)
+        assertEquals(UseStatus.DONE, report.status, report.error)
+        // One look and one decision each; no screenshot, locate_text or page_text call per step (page_text is read once, for the report).
+        assertEquals(2, b.lookArgs.size)
+        assertEquals(b.jevArgs.size, b.lookArgs.size)
+        assertEquals(0, b.stepArgs("screenshot").size)
+        assertEquals(0, b.stepArgs("locate_text").size)
+        assertEquals(1, b.stepArgs("page_text").size)
+        // The look asks for what the decision needs.
+        val first = b.lookArgs[0]
+        assertEquals(listOf("Magnolia Bakery", "Tres Leches"), first["locate"]!!.jsonArray.map { it.jsonPrimitive.content }.take(2))
+        assertEquals("true", first["elements"]!!.jsonPrimitive.content); assertEquals("1100", first["max_side"]!!.jsonPrimitive.content); assertEquals("true", first["page_text"]!!.jsonPrimitive.content)
+        // Jev sees the marked copy, once, with the elements as options.
+        val sent = b.jevArgs[0]
+        val path = sent["assets"]!!.jsonObject[Cu.SHOT_REF]!!.jsonObject["path"]!!.jsonPrimitive.content
+        assertTrue(path.endsWith("-marks.jpg") && File(path).exists(), path)
+        assertEquals(1, refCount(sent["state"]!!) + refCount(sent["questions"]!!))
+        assertEquals(setOf("m1", "m2", Marks.NONE), sent["questions"]!!.jsonObject["click_target"]!!.jsonObject["criteria"]!!.jsonObject.keys)
+        assertEquals("login or payment step", sent["state"]!!.jsonObject["stop_when"]!!.jsonPrimitive.content)
+        assertTrue(run.log.entries.value.any { it.name == "render marks" && it.image == path })
+        assertTrue(run.log.entries.value.any { it.name == "rpa_step" && it.args.startsWith("look") && it.result.contains("4 elements") })
+        // The click goes by element id, at the element's centre, with no snap box.
+        val click = b.stepArgs("click_at").single()["action"]!!.jsonObject
+        assertEquals("m1", click["element"]!!.jsonPrimitive.content)
+        assertEquals("940,316", click["value"]!!.jsonPrimitive.content)
+        assertNull(click["snap"])
+        val step = report.steps.first { it.op == VisionOp.CLICK }
+        assertEquals("button 'ADD'", step.target)
+        assertNull(step.note)
+        assertEquals(0.9, step.confidence)
+        assertEquals("button 'ADD'", Cu.recentAction(step)["element"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `typing goes to the picked field by id, and NONE falls back to the box with snap`() = runTest {
+        val typing = looking(listOf("TYPE_TEXT", "DONE")) { typePick = "m3"; boxJson = """{"top":0.0,"bottom":0.1,"left":0.1,"right":0.4}""" }
+        val r = flow(typing, FakeTabs(), mutableListOf(), plan = marksPlan.replace("\"type_values\":[]", "\"type_values\":[\"Palo Alto\"]")).runComputerUse(UseRequest("t", maxSteps = 6))
+        assertEquals(UseStatus.DONE, r.status, r.error)
+        val c = typing.stepArgs("click_at").single()["action"]!!.jsonObject
+        assertEquals("m3", c["element"]!!.jsonPrimitive.content)
+        assertEquals("300,38", c["value"]!!.jsonPrimitive.content)
+        assertEquals(1, typing.stepArgs("type_text").size)
+        // NONE: the box, as before, with its snap and no element.
+        val none = looking(listOf("CLICK", "DONE")) { clickPick = null }
+        flow(none, FakeTabs(), mutableListOf(), plan = marksPlan).runComputerUse(UseRequest("t", maxSteps = 6))
+        val a = none.stepArgs("click_at").single()["action"]!!.jsonObject
+        assertEquals("560,195", a["value"]!!.jsonPrimitive.content)
+        assertNotNull(a["snap"])
+        assertNull(a["element"])
+        // An id the page does not have (stale or invented) is the same.
+        val ghost = looking(listOf("CLICK", "DONE")) { clickPick = "m99" }
+        flow(ghost, FakeTabs(), mutableListOf(), plan = marksPlan).runComputerUse(UseRequest("t", maxSteps = 6))
+        assertNull(ghost.stepArgs("click_at").single()["action"]!!.jsonObject["element"])
+        // No marks on the page: no mark questions, the box alone.
+        val bare = looking(listOf("CLICK", "DONE")) { lookElements = "[]" }
+        flow(bare, FakeTabs(), mutableListOf(), plan = marksPlan).runComputerUse(UseRequest("t", maxSteps = 6))
+        assertEquals(setOf("operation", "target", "scroll"), bare.questionKeys.first())
+        assertEquals(0, bare.stepArgs("click_at").single()["action"]!!.jsonObject.keys.count { it == "element" })
+    }
+
+    @Test
+    fun `when the box points elsewhere than the mark the mark is still clicked, with lower confidence and a note`() = runTest {
+        val b = looking(listOf("CLICK", "DONE")) { clickPick = "m1"; boxJson = """{"top":0.8,"bottom":0.9,"left":0.1,"right":0.2}""" }
+        val report = flow(b, FakeTabs(), mutableListOf(), plan = marksPlan).runComputerUse(UseRequest("t", maxSteps = 6))
+        assertEquals("m1", b.stepArgs("click_at").single()["action"]!!.jsonObject["element"]!!.jsonPrimitive.content)
+        val step = report.steps.first { it.op == VisionOp.CLICK }
+        assertEquals(0.9 * 0.8, step.confidence, 1e-9)
+        assertEquals("box disagreed", step.note)
+        assertFalse(step.failed)
+        // The lower confidence counts: under consult_below it is stuck, like any unsure decision.
+        val unsure = looking(listOf("CLICK")) { clickPick = "m1"; boxJson = """{"top":0.8,"bottom":0.9,"left":0.1,"right":0.2}""" }
+        val stuck = flow(unsure, FakeTabs(), mutableListOf(), plan = marksPlan).runComputerUse(UseRequest("t", maxSteps = 6, consultBelow = 0.75))
+        assertEquals(UseStatus.NEEDS_INPUT, stuck.status)
+    }
+
+    @Test
+    fun `a click on a disabled or covered element is a note for the next decision, not an action and not a failure`() = runTest {
+        val b = looking(listOf("CLICK", "CLICK", "DONE")) { clickPick = "m2"; boxJson = boxOnM1 }
+        b.clickErrors += "'ADD' is disabled"
+        val report = flow(b, FakeTabs(), mutableListOf(), plan = marksPlan).runComputerUse(UseRequest("t", maxSteps = 8))
+        assertEquals(UseStatus.DONE, report.status, report.error)
+        val refused = report.steps.first { it.op == VisionOp.CLICK }
+        assertTrue(refused.refused); assertFalse(refused.failed)
+        assertEquals("ADD is disabled", refused.note)
+        // Jev's next look has it among the recent actions, with the reason.
+        val next = b.jevArgs[1]["state"]!!.jsonObject["recent_actions"]!!.jsonArray.single().jsonObject
+        assertEquals("ADD is disabled", next["error"]!!.jsonPrimitive.content)
+        assertEquals("button 'ADD'", next["element"]!!.jsonPrimitive.content)
+        // Not an action: it never feeds "3 actions left the page where it was", never credits a milestone, and two in a row are not "two actions failed".
+        assertNull(Cu.noProgress(List(2) { refused.copy(before = seen()) }, seen()))
+        assertFalse(Cu.mayCredit("Tres Leches is visible on the menu", false, listOf(refused)))
+        val twice = looking(listOf("CLICK", "CLICK", "DONE")) { clickPick = "m2" }
+        twice.clickErrors += "'ADD' is disabled"; twice.clickErrors += "'ADD' is covered by Login dialog"
+        val two = flow(twice, FakeTabs(), mutableListOf(), plan = marksPlan).runComputerUse(UseRequest("t", maxSteps = 8))
+        assertEquals(UseStatus.DONE, two.status, two.error)
+        assertEquals(listOf("ADD is disabled", "ADD is covered by Login dialog"), two.steps.filter { it.refused }.map { it.note })
+        // The same refusal three times is a stuck run, said as such.
+        val loop = looking(listOf("CLICK")) { clickPick = "m2" }
+        repeat(3) { loop.clickErrors += "'ADD' is disabled" }
+        val stuck = flow(loop, FakeTabs(), mutableListOf(), plan = marksPlan).runComputerUse(UseRequest("t", maxSteps = 10))
+        assertEquals(UseStatus.NEEDS_INPUT, stuck.status)
+        assertTrue(stuck.error!!.contains("refused"), stuck.error)
+        // Only the engine's two refusals are read so; any other failure stays a failure.
+        assertEquals("ADD is disabled", Marks.refusal("'ADD' is disabled"))
+        assertEquals("ADD is covered by Login", Marks.refusal("'ADD' is covered by Login"))
+        assertNull(Marks.refusal("the click is outside the viewport"))
+        assertNull(Marks.refusal(null))
+    }
+
+    @Test
+    fun `an engine without look is asked once, then the run uses screenshot, locate_text and page_text, with the box`() = runTest {
+        val b = FakeBrowser(tmp(), listOf("CLICK", "SCROLL_DOWN", "DONE"))
+        val report = flow(b, FakeTabs(), mutableListOf(), plan = marksPlan).runComputerUse(UseRequest("t", maxSteps = 8))
+        assertEquals(UseStatus.DONE, report.status, report.error)
+        assertEquals(1, b.stepArgs("look").size)
+        assertTrue(b.stepArgs("screenshot").size >= 3)
+        assertTrue(b.stepArgs("locate_text").isNotEmpty())
+        // The first look call came first, and what Jev got is the old request: a box, no mark questions.
+        assertEquals("look", b.stepTypes().first { it != "cu_end" })
+        assertTrue(b.questionKeys.all { it == setOf("operation", "target", "scroll") })
+        assertEquals(1, b.stepArgs("click_at").size)
+        assertNull(b.stepArgs("click_at").single()["action"]!!.jsonObject["element"])
+        // What counts as "no such verb": an error that says so, not a dead tab or a refused call.
+        assertTrue(Cu.lookUnsupported(ToolReply("""{"ok":false,"error":"Unknown action type look"}""", false)))
+        assertTrue(Cu.lookUnsupported(ToolReply("""{"error":{"code":"BAD_ARGS","message":"unsupported action type: look"}}""", true)))
+        assertFalse(Cu.lookUnsupported(ToolReply("""{"error":{"code":"NO_BROWSER","message":"unknown action type"}}""", true)))
+        assertFalse(Cu.lookUnsupported(ToolReply("""{"ok":false,"error":"A browser dialog is waiting","dialog":{"type":"alert","message":"x"}}""", false)))
+        assertFalse(Cu.lookUnsupported(ToolReply("""{"ok":true,"look":{}}""", false)))
+        assertFalse(Cu.lookUnsupported(ToolReply("""{"ok":false,"error":"the tab is gone"}""", false)))
+    }
+
+    @Test
+    fun `a milestone Jev says is reached is credited and its own decision is acted on, with no extra look`() = runTest {
+        val plan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"g","milestones":["The menu is open","Tres Leches is visible"],"type_values":[]}"""
+        val b = looking(listOf("CLICK", "SCROLL_DOWN", "DONE")) { clickPick = "m1"; boxJson = boxOnM1; milestoneScript = listOf(0.9, null, 0.8) }
+        val report = flow(b, FakeTabs(), mutableListOf(), plan = plan).runComputerUse(UseRequest("t", maxSteps = 8))
+        assertEquals(UseStatus.DONE, report.status, report.error)
+        // Look 1: the milestone is credited and the click it was decided with happens; no look was taken for the credit.
+        assertEquals(listOf(VisionOp.MILESTONE, VisionOp.CLICK), report.steps.take(2).map { it.op })
+        assertEquals(1, b.stepArgs("click_at").size)
+        assertEquals(b.jevArgs.size, b.lookArgs.size)
+        // DONE is the exception: nothing to act on, so it looks again.
+        assertEquals(UseStatus.DONE, report.status)
+        // NEEDS_INPUT never credits a milestone.
+        val ask = looking(listOf("NEEDS_INPUT")) { milestoneScript = listOf(0.95) }
+        val r = flow(ask, FakeTabs(), mutableListOf(), plan = plan).runComputerUse(UseRequest("t", maxSteps = 4))
+        assertEquals(UseStatus.NEEDS_INPUT, r.status)
+        assertTrue(r.steps.none { it.op == VisionOp.MILESTONE })
+    }
+
+    @Test
+    fun `a state left over from before the run is not credited, a cart from an earlier session is the run 85f5 case`() = runTest {
+        // The cart already holds the cake: every look says "Tres Leches is in the cart" at 0.9, but the run only scrolls.
+        val plan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"Order Tres Leches","milestones":["Magnolia Bakery's Order Online menu is open","Tres Leches is in the cart"],"type_values":[]}"""
+        val leftover = looking(listOf("SCROLL_DOWN")) { reportScroll = true; milestoneScript = List(8) { 0.9 }; contentHash = { "same" } }
+        val r = flow(leftover, FakeTabs(), mutableListOf(), plan = plan).runComputerUse(UseRequest("t", maxSteps = 6))
+        // The first (a page reached by navigation) is credited; the cart is not, however sure Jev is.
+        assertEquals(1, r.steps.count { it.op == VisionOp.MILESTONE })
+        assertEquals(1, r.milestonesDone)
+        assertEquals(UseStatus.BUDGET, r.status)
+        // A click that changed nothing on the page does not corroborate it either (same content hash)...
+        val noChange = looking(listOf("SCROLL_DOWN", "CLICK", "SCROLL_DOWN")) { reportScroll = true; milestoneScript = List(8) { 0.9 }; contentHash = { "same" } }
+        val still = flow(noChange, FakeTabs(), mutableListOf(), plan = plan).runComputerUse(UseRequest("t", maxSteps = 6))
+        assertEquals(1, still.milestonesDone)
+        assertEquals(UseStatus.BUDGET, still.status)
+        // ...and a click that changed the content does: the cart is then Jev's doing.
+        var n = 0
+        val changed = looking(listOf("SCROLL_DOWN", "CLICK", "SCROLL_DOWN")) { reportScroll = true; milestoneScript = List(8) { 0.9 }; contentHash = { if (++n <= 2) "before" else "after" } }
+        val ok = flow(changed, FakeTabs(), mutableListOf(), plan = plan).runComputerUse(UseRequest("t", maxSteps = 8))
+        assertEquals(UseStatus.DONE, ok.status, ok.error)
+        assertEquals(2, ok.milestonesDone)
+        // A DONE for it is refused the same way, and three of them end the run as blocked rather than done.
+        val doneOnly = looking(listOf("DONE")) { contentHash = { "same" } }
+        val d = flow(doneOnly, FakeTabs(), mutableListOf(), plan = plan).runComputerUse(UseRequest("t", maxSteps = 10))
+        assertEquals(UseStatus.BLOCKED, d.status)
+        assertTrue(d.error!!.contains("left over"))
+        assertEquals(1, d.steps.count { it.op == VisionOp.MILESTONE })
+        assertTrue(d.steps.any { it.op == VisionOp.REPLAN && it.note!!.startsWith("DONE was not accepted") })
+    }
+
+    @Test
+    fun `the rule for crediting a milestone, by what the run did since the last one`() {
+        fun step(op: VisionOp, failed: Boolean = false, refused: Boolean = false, contentChanged: Boolean? = null, changed: Boolean? = null, note: String? = null) =
+            UseStep(1, op, confidence = 1.0, ms = 0, failed = failed, refused = refused, contentChanged = contentChanged, changed = changed, note = note)
+        val plain = "Tres Leches is visible on the menu"
+        val cart = "Tres Leches is in the cart"
+        // The first one: a state reached by navigation.
+        assertTrue(Cu.mayCredit(plain, true, emptyList()))
+        // A later one needs an action: scrolls and waits are not.
+        assertFalse(Cu.mayCredit(plain, false, emptyList()))
+        assertFalse(Cu.mayCredit(plain, false, listOf(step(VisionOp.SCROLL_DOWN), step(VisionOp.WAIT), step(VisionOp.COLLECT))))
+        assertTrue(Cu.mayCredit(plain, false, listOf(step(VisionOp.CLICK))))
+        assertTrue(Cu.mayCredit(plain, false, listOf(step(VisionOp.TYPE_TEXT))))
+        assertTrue(Cu.mayCredit(plain, false, listOf(step(VisionOp.PRESS_ENTER))))
+        // A replan's navigation counts for a state of the page, not for a cart.
+        assertTrue(Cu.mayCredit(plain, false, listOf(step(VisionOp.REPLAN, note = "replanned: https://x/"))))
+        assertFalse(Cu.mayCredit(plain, false, listOf(step(VisionOp.REPLAN, note = "advised: scroll"))))
+        // A failed or refused click did nothing.
+        assertFalse(Cu.mayCredit(plain, false, listOf(step(VisionOp.CLICK, failed = true), step(VisionOp.CLICK, refused = true))))
+        // Cart, added, selected, checked: a click or typing whose effect changed the content, even for the first milestone.
+        assertTrue(Cu.isStatefulMilestone(cart))
+        assertTrue(Cu.isStatefulMilestone("The item is added"))
+        assertTrue(Cu.isStatefulMilestone("Eggless is selected"))
+        assertTrue(Cu.isStatefulMilestone("The box is checked"))
+        assertFalse(Cu.isStatefulMilestone("Magnolia Bakery's Order Online menu is open"))
+        assertFalse(Cu.mayCredit(cart, true, emptyList()))
+        assertFalse(Cu.mayCredit(cart, false, listOf(step(VisionOp.CLICK, contentChanged = false))))
+        assertFalse(Cu.mayCredit(cart, false, listOf(step(VisionOp.SCROLL_DOWN, contentChanged = true))))
+        assertTrue(Cu.mayCredit(cart, false, listOf(step(VisionOp.CLICK, contentChanged = true))))
+        // Without the engine's content hash, the pixels stand in.
+        assertTrue(Cu.mayCredit(cart, false, listOf(step(VisionOp.CLICK, changed = true))))
+        assertFalse(Cu.mayCredit(cart, false, listOf(step(VisionOp.CLICK, changed = false))))
+    }
+
+    @Test
+    fun `the planner's entities and stop_when are read, and the stop is no milestone`() {
+        val p = Cu.parsePlan("""{"open":[],"jev_goal":"g","milestones":["Menu open","Tres Leches in the cart"],"entities":["Magnolia Bakery"," Tres Leches ","","${"x".repeat(80)}"],"stop_when":"login or payment step"}""", "t")
+        assertEquals(listOf("Magnolia Bakery", "Tres Leches"), p.entities)
+        assertEquals("login or payment step", p.stopWhen)
+        assertEquals(listOf("Menu open", "Tres Leches in the cart"), p.milestones)
+        assertEquals(emptyList(), Cu.parsePlan("""{"open":[],"jev_goal":"g"}""", "t").entities)
+        assertNull(Cu.parsePlan("""{"open":[],"jev_goal":"g"}""", "t").stopWhen)
+        // A single "stop" milestone is not turned into nothing.
+        assertEquals(listOf("Stop at the login step"), Cu.parsePlan("""{"open":[],"jev_goal":"g","milestones":["Stop at the login step"]}""", "t").milestones)
+        assertTrue(Cu.PLAN_SYSTEM.contains("entities") && Cu.REPLAN_SYSTEM.contains("stop_when"))
+        // The run log keeps both.
+        val run = UseRun("t").also { it.plan.value = p }
+        val rec = RunLogStore(tmp()).record(run)["plan"]!!.jsonObject
+        assertEquals(listOf("Magnolia Bakery", "Tres Leches"), rec["entities"]!!.jsonArray.map { it.jsonPrimitive.content })
+        assertEquals("login or payment step", rec["stop_when"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `targets are the plan's entities, those the milestone names first, then the milestone's own names, never n-grams of its prose`() {
+        val ents = listOf("Magnolia Bakery", "Tres Leches")
+        assertEquals(listOf("Tres Leches", "Magnolia Bakery"), Cu.targetPhrasesFor("Tres Leches is in the cart", "Order", "https://z/", ents))
+        assertEquals(listOf("Magnolia Bakery", "Tres Leches", "Zomato"), Cu.targetPhrasesFor("Magnolia Bakery's Zomato page is open", "Order", "https://z/", ents))
+        assertEquals(ents, Cu.targetPhrasesFor(null, "Order", "https://z/", ents))
+        // The milestone's names: quoted phrases and runs of capitalised words, not the words around them.
+        assertEquals(listOf("Magnolia Bakery", "Zomato"), Cu.milestonePhrases("Magnolia Bakery's Zomato page is open"))
+        assertEquals(listOf("Tres Leches"), Cu.milestonePhrases("Tres Leches is in the cart"))
+        assertEquals(listOf("Add to cart"), Cu.milestonePhrases("the \"Add to cart\" button is shown"))
+        assertEquals(emptyList(), Cu.milestonePhrases("the cart shows one item and a total"))
+        assertEquals(emptyList(), Cu.milestonePhrases("The page is open"))
+        // At most MAX_TARGETS, without a phrase inside another.
+        assertTrue(Cu.targetPhrasesFor("Tres Leches", "g", "", listOf("A One", "B Two", "C Three", "D Four", "E Five")).size == Cu.MAX_TARGETS)
+        assertEquals(listOf("Tres Leches"), Cu.targetPhrasesFor("Tres Leches is in the cart", "g", "", listOf("Tres Leches", "tres leches")))
+    }
+
+    @Test
+    fun `the look locates the entities, and a scroll goes toward the one the milestone names, though others were found too`() = runTest {
+        val plan = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"Add Tres Leches","milestones":["Tres Leches is visible on the menu"],"entities":["Magnolia Bakery","Tres Leches"],"type_values":[]}"""
+        val b = looking(listOf("SCROLL_DOWN", "DONE")) {
+            reportScroll = true
+            locateReply = { phrase -> if (phrase == "Tres Leches") locatedReply(true, false, "down", 4.0) else locatedReply(true, true) }
+        }
+        val report = flow(b, FakeTabs(), mutableListOf(), plan = plan).runComputerUse(UseRequest("t", maxSteps = 5))
+        // The milestone names Tres Leches, so it is asked about first.
+        assertEquals(listOf("Tres Leches", "Magnolia Bakery"), b.lookArgs[0]["locate"]!!.jsonArray.map { it.jsonPrimitive.content }.take(2))
+        // Both were found, one in view: the off-screen one is walked to, min(4.0 - 0.5, 3) = 3 screens of 780 px (not "small").
+        assertEquals("2340", b.stepArgs("scroll_by").single()["action"]!!.jsonObject["value"]!!.jsonPrimitive.content)
+        assertEquals("amount 3.0 screens toward 'Tres Leches' (it was 4.0 screens away)", report.steps.first { it.op == VisionOp.SCROLL_DOWN }.note)
+        // Jev is told where each is.
+        val targets = b.jevArgs[0]["state"]!!.jsonObject["targets"]!!.jsonArray.associate { it.jsonObject["text"]!!.jsonPrimitive.content to it.jsonObject["where"]!!.jsonPrimitive.content }
+        assertEquals("in view", targets["Magnolia Bakery"]); assertEquals("4.0 screens below", targets["Tres Leches"])
+        // Off-screen entities that the milestone does not name are not scrolled to.
+        val other = """{"open":[{"url":"https://sample.com/"}],"jev_goal":"g","milestones":["The menu is open"],"entities":["Magnolia Bakery"],"type_values":[]}"""
+        val o = looking(listOf("SCROLL_DOWN", "DONE")) { reportScroll = true; locateReply = { locatedReply(true, false, "up", 5.0) } }
+        flow(o, FakeTabs(), mutableListOf(), plan = other).runComputerUse(UseRequest("t", maxSteps = 5))
+        assertEquals("390", o.stepArgs("scroll_by").single()["action"]!!.jsonObject["value"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `waiting for a popup is at most one short recheck, not 1_5 seconds, and a late tab is caught before the next look`() = runTest {
+        // The default timings: one check right after the action and one 150 ms later.
+        val quiet = FakeBrowser(tmp(), listOf("CLICK", "DONE"))
+        val q = FakeTabs().also { it.now = mapOf("t1" to "Main") }
+        ComputerUseFlow(quiet, { gateway(mutableListOf(), plan, typedJson) }, q, openWaitsMs = listOf(0), settleMs = 0).runComputerUse(UseRequest("t", maxSteps = 5))
+        assertEquals(150L, testScheduler.currentTime) // the whole run: no 1.5 s, no 250 ms settle per step
+        // A tab that shows up in that window is followed.
+        val b = FakeBrowser(tmp(), listOf("CLICK", "DONE", "DONE"))
+        val tabs = FakeTabs().also { it.now = mapOf("t1" to "Main") }
+        tabs.onSnapshot = { n -> if (n >= 5) tabs.now = mapOf("t1" to "Main", "t2" to "Sign in") }
+        val start = testScheduler.currentTime
+        val r = ComputerUseFlow(b, { gateway(mutableListOf(), plan, typedJson) }, tabs, openWaitsMs = listOf(0), settleMs = 0).runComputerUse(UseRequest("t", maxSteps = 5))
+        assertEquals(150L, testScheduler.currentTime - start)
+        assertTrue(r.steps.first().popup!!.startsWith("Switched to popup 'Sign in'"), r.steps.first().popup)
+        assertEquals("t2", r.tabs.last().tabId)
+        // One that comes later still is caught by the check before the next look, with no wait of its own.
+        val late = FakeBrowser(tmp(), listOf("CLICK", "DONE", "DONE"))
+        val lt = FakeTabs().also { it.now = mapOf("t1" to "Main") }
+        lt.onSnapshot = { n -> if (n >= 6) lt.now = mapOf("t1" to "Main", "t2" to "Sign in") }
+        val s2 = testScheduler.currentTime
+        val lr = ComputerUseFlow(late, { gateway(mutableListOf(), plan, typedJson) }, lt, openWaitsMs = listOf(0), settleMs = 0).runComputerUse(UseRequest("t", maxSteps = 5))
+        assertEquals(150L, testScheduler.currentTime - s2)
+        assertTrue(lr.steps.first().popup!!.startsWith("Switched to popup 'Sign in'"), lr.steps.first().popup)
+        // Nothing that is not an action waits at all: a scroll does not look for a tab.
+        val sc = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "DONE"))
+        val s3 = testScheduler.currentTime
+        ComputerUseFlow(sc, { gateway(mutableListOf(), plan, typedJson) }, FakeTabs().also { it.now = mapOf("t1" to "Main") }, openWaitsMs = listOf(0), settleMs = 0).runComputerUse(UseRequest("t", maxSteps = 5))
+        assertEquals(0L, testScheduler.currentTime - s3)
     }
 }
