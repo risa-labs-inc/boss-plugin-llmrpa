@@ -255,12 +255,14 @@ internal object Cu {
 
     // ---- rpa_step (contract C) ----
 
-    fun step(tabId: String, type: String, value: String? = null, pointer: String? = null, snapBox: String? = null): JsonObject = buildJsonObject {
+    fun step(tabId: String, type: String, value: String? = null, pointer: String? = null, snapBox: String? = null, ensureVisible: Boolean = false): JsonObject = buildJsonObject {
         put("tab_id", tabId)
         putJsonObject("action") {
             put("type", type); value?.let { put("value", it) }
             // RPA Engine moves a click that misses an interactive element to the one that best overlaps this box (CSS px: left,top,right,bottom).
             snapBox?.let { b -> putJsonObject("snap") { put("box", b) } }
+            // A page in a hidden tab is painted late or not at all: the engine brings the tab to the front and waits before it captures.
+            if (ensureVisible) put("ensure_visible", true)
         }
         pointer?.let { label -> putJsonObject("pointer") { put("label", pointerLabel(label)) } }
     }
@@ -362,6 +364,14 @@ internal object Cu {
         fun str(k: String) = (sn[k] as? JsonPrimitive)?.contentOrNull.orEmpty()
         return Snapped(str("from"), str("to"), str("tag"), str("label"))
     }
+
+    /** `revealed` (the tab was brought to the front) and `visible` (the page is shown) from a screenshot result, top-level or in `screenshot`. */
+    fun screenFlags(reply: JsonObject?): Pair<Boolean?, Boolean?> {
+        fun flag(k: String) = ((reply?.get(k) ?: (reply?.get("screenshot") as? JsonObject)?.get(k)) as? JsonPrimitive)?.booleanOrNull
+        return flag("revealed") to flag("visible")
+    }
+
+    const val HIDDEN_REASON = "the tab is not visible, so the screen can't be read"
 
     fun parseFocused(reply: JsonObject): Focused? {
         val f = reply["focused"] as? JsonObject ?: return null
@@ -881,6 +891,8 @@ internal data class UseReport(
     /** The LLM's answer from the collected text, when `extract` was on. */
     val answer: String? = null,
     val extract: Boolean = false,
+    /** How many times the tab had to be brought back to the front during the run. */
+    val tabRevealed: Int = 0,
     val runId: String? = null,
     /** Tabs the run drove: the one it opened or was given, and popups it followed. */
     val tabs: List<TabUse> = emptyList(),
@@ -911,6 +923,7 @@ internal data class UseReport(
         screenshotPath?.let { put("screenshot_path", it) }
         tabId?.let { put("tab_id", it) }
         runId?.let { put("run_id", it) }
+        if (tabRevealed > 0) put("tab_revealed", tabRevealed)
         if (tabs.isNotEmpty()) putJsonArray("tabs") { tabs.forEach { t -> add(buildJsonObject { put("tab_id", t.tabId); put("title", t.title); put("kind", t.kind) }) } }
         blocker?.let { b ->
             putJsonObject("blocker") {

@@ -89,6 +89,7 @@ internal class LlmrpaMcpToolProvider(
                     "and the result reports what happened plus the final page text. Use it to research or operate a website. " +
                     "The user sees the run: the tab is opened or brought to the front in the space on screen and a labelled pointer moves over it. " +
                     "It opens a new tab at the planned page (or url), or acts on tab_id; only tabs in the space on screen can be driven. " +
+                    "The run keeps its tab in front while it works: if the tab is hidden the screenshot brings it back first (a hidden tab's screen is stale), so the user should not switch away. " +
                     "It never waits for a person. When it is stuck (no progress, Jev blocked or unsure) it stops with status needs_input and a blocker, leaving the tab open: " +
                     "call it again with the same tab_id, task and inputs (named values such as phone or code) to continue where it stopped; with on_stuck consult it asks the planner chat model what to do first. " +
                     "Information on the pages it passes is saved in collected[]. " +

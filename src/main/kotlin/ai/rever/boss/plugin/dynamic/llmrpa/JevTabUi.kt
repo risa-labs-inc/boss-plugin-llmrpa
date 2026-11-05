@@ -92,7 +92,7 @@ internal fun JevTab(component: LlmrpaComponent) {
 @Composable
 private fun JevIntro(component: LlmrpaComponent) {
     Text(
-        "Ask for something on the web. A chat model picks the page, then Jev works the page from screenshots with a visible pointer, and a report with what happened and the final page's text lands here.",
+        "Ask for something on the web. A chat model picks the page, then Jev works the page from screenshots with a visible pointer, and a report with what happened and the final page's text lands here. Jev keeps its tab in front while it works.",
         color = RpaTokens.TextSecondary, fontSize = 12.sp,
     )
     JEV_EXAMPLES.forEach { (title, text) ->

@@ -300,6 +300,8 @@ class ComputerUseTest {
         /** Tabs whose calls fail as closed. */
         val deadTabs = mutableSetOf<String>()
         var jevDelayMs = 0L
+        /** One entry per screenshot call, in order: (revealed, visible) as the engine reports them; none = the plain reply. */
+        val screenshotFlags = ArrayDeque<Pair<Boolean?, Boolean?>>()
         var pageTextFn: (() -> String)? = null
 
         override suspend fun invoke(toolName: String, arguments: JsonElement): ToolReply {
@@ -334,7 +336,7 @@ class ComputerUseTest {
                         "cu_end" -> ToolReply("""{"ok":true}""", false)
                         "screenshot" -> {
                             val f = File(dir, "shot-${if (frozen) 0 else shots++}.jpg").also { it.writeText("shot ${if (frozen) 0 else shots}") }
-                            ToolReply("""{"ok":true,"screenshot":{"path":"${f.absolutePath}","width":560,"height":390,"css_width":1120,"css_height":780,"dpr":2${if (shotMeta) ""","url":"$pageUrl","title":"Shot title"""" else ""}${if (reportScroll) ""","scroll":{"x":0,"y":$scrollY,"max_y":5000}""" else ""}${contentHash?.invoke()?.let { ""","content_hash":"$it"""" }.orEmpty()}}$dlg}""", false)
+                            ToolReply("""{"ok":true,"screenshot":{"path":"${f.absolutePath}","width":560,"height":390,"css_width":1120,"css_height":780,"dpr":2${if (shotMeta) ""","url":"$pageUrl","title":"Shot title"""" else ""}${if (reportScroll) ""","scroll":{"x":0,"y":$scrollY,"max_y":5000}""" else ""}${contentHash?.invoke()?.let { ""","content_hash":"$it"""" }.orEmpty()}}${screenshotFlags.removeFirstOrNull()?.let { (r, v) -> listOfNotNull(r?.let { ""","revealed":$it""" }, v?.let { ""","visible":$it""" }).joinToString("") }.orEmpty()}$dlg}""", false)
                         }
                         "focused" -> ToolReply("""{"ok":true,"focused":$focused}""", false)
                         "page_text" -> ToolReply("""{"ok":true,"text":"${pageTextFn?.invoke() ?: pageTexts[pageUrl] ?: if (pageUrl == "https://sample.com/") "Best: A, B, C" else "Text of $pageUrl"}"}""", false)
@@ -1835,6 +1837,98 @@ class ComputerUseTest {
         assertTrue(second.contains("now in popup window 'Sign in' (separate window for this step)"), second.toString())
         val third = browser.jevArgs[2]["state"]!!.jsonObject["recent_actions"]!!.jsonArray.map { it.jsonObject["result"]?.jsonPrimitive?.content }
         assertTrue(third.contains("back on 'Main'"), third.toString())
+    }
+
+    // ---- a hidden tab's screenshot is stale ----
+
+    private fun shotActions(b: FakeBrowser) = b.stepArgs("screenshot")
+
+    @Test
+    fun `screenshots of a tab ask the engine to make it visible, popup windows are left out`() = runTest {
+        val tabs = FakeTabs().also { it.now = mapOf("t1" to "Main") }
+        val browser = FakeBrowser(tmp(), listOf("CLICK", "CLICK", "DONE")).also { b ->
+            var opened = false
+            var closed = false
+            b.onAction = { type, tab ->
+                if (type == "click_at" && tab == "t1" && !opened) { opened = true; b.popupsJson = popupOpen }
+                else if (type == "click_at" && tab == "t1#popup-1" && !closed) { closed = true; b.popupsJson = popupClosed }
+                else if (closed && type == "screenshot") b.popupsJson = null
+            }
+        }
+        flow(browser, tabs, mutableListOf()).runComputerUse(UseRequest("t", maxSteps = 10))
+        val shots = shotActions(browser)
+        assertTrue(shots.size >= 3)
+        shots.forEach { a ->
+            val action = a["action"]!!.jsonObject
+            val popup = "#popup-" in a["tab_id"]!!.jsonPrimitive.content
+            assertEquals(!popup, "ensure_visible" in action, a.toString())
+            if (!popup) assertTrue(action["ensure_visible"]!!.jsonPrimitive.content.toBoolean())
+        }
+        assertTrue(shots.any { "#popup-" in it["tab_id"]!!.jsonPrimitive.content })
+        // Only screenshots carry it.
+        assertTrue(browser.stepArgs("click_at").none { "ensure_visible" in it["action"]!!.jsonObject })
+    }
+
+    @Test
+    fun `a revealed tab is noted on the step and counted for the run`() = runTest {
+        val browser = FakeBrowser(tmp(), listOf("SCROLL_DOWN", "SCROLL_DOWN", "SCROLL_DOWN", "DONE")).also {
+            it.screenshotFlags += (true to true)   // brought back before the first decision
+            it.screenshotFlags += (false to true)
+            it.screenshotFlags += (true to true)   // and again before the third
+        }
+        val report = flow(browser, FakeTabs(), mutableListOf()).runComputerUse(UseRequest("t", maxSteps = 10))
+        assertEquals(UseStatus.DONE, report.status)
+        assertEquals("brought the tab back to the front", report.steps[0].note!!.split("; ").first { it.startsWith("brought") })
+        assertFalse(report.steps[1].note.orEmpty().contains("brought the tab"))
+        assertTrue(report.steps[2].note!!.contains("brought the tab back to the front"))
+        assertEquals(2, report.tabRevealed)
+        assertEquals(2, report.toJson()["tab_revealed"]!!.jsonPrimitive.content.toInt())
+        // Never revealed: no field.
+        val calm = flow(FakeBrowser(tmp(), listOf("DONE")), FakeTabs(), mutableListOf()).runComputerUse(UseRequest("t"))
+        assertFalse("tab_revealed" in calm.toJson())
+    }
+
+    @Test
+    fun `a hidden screenshot is not shown to Jev, it is retaken once, and a second one is stuck`() = runTest {
+        // Hidden once, then fine: one more screenshot, one Jev call on the good image.
+        val once = FakeBrowser(tmp(), listOf("DONE")).also { it.screenshotFlags += (false to false) }
+        val ok = flow(once, FakeTabs(), mutableListOf()).runComputerUse(UseRequest("t"))
+        assertEquals(UseStatus.DONE, ok.status)
+        assertEquals(2, shotActions(once).size)
+        assertEquals(1, once.jevCalls)
+        // Hidden twice: Jev is never asked about the stale image, and the run is stuck with the reason.
+        val twice = FakeBrowser(tmp(), listOf("DONE")).also { it.screenshotFlags += (false to false); it.screenshotFlags += (false to false) }
+        val stuck = flow(twice, FakeTabs(), mutableListOf()).runComputerUse(UseRequest("t"))
+        assertEquals(UseStatus.NEEDS_INPUT, stuck.status)
+        assertEquals(Cu.HIDDEN_REASON, stuck.blocker!!.reason)
+        assertEquals("the tab is not visible, so the screen can't be read", stuck.error)
+        assertEquals(2, shotActions(twice).size)
+        assertEquals(0, twice.jevCalls)
+        assertEquals(1, twice.calls.count { it.first == ToolNames.STEP && it.second["action"]!!.jsonObject["type"]!!.jsonPrimitive.content == "cu_end" })
+    }
+
+    @Test
+    fun `a hidden tab under consult mode asks the chat model without an image and goes on`() = runTest {
+        consultReplies = ArrayDeque(listOf("""{"hint":"the tab is back"}"""))
+        gatewayCaps = setOf(AiGatewayAPI.CAPABILITY_VISION)
+        val requests = mutableListOf<AiRequest>()
+        val browser = FakeBrowser(tmp(), listOf("DONE")).also { it.screenshotFlags += (false to false); it.screenshotFlags += (false to false) }
+        val report = try { flow(browser, FakeTabs(), requests).runComputerUse(UseRequest("t", onStuck = OnStuck.CONSULT)) } finally { gatewayCaps = emptySet() }
+        assertEquals(UseStatus.DONE, report.status, report.error)
+        val consult = requests.single { it.system.startsWith("You help a browser agent") }
+        assertEquals(0, consult.messages.single().images.size)
+        assertTrue(consult.messages.single().text.contains("Why Jev is stuck: the tab is not visible"))
+        assertEquals(1, browser.jevCalls) // asked once the tab was readable
+        assertEquals(VisionOp.CONSULT, report.steps.single().op)
+    }
+
+    @Test
+    fun `the descriptions say a run keeps its tab in front`() {
+        val provider = LlmrpaMcpToolProvider("p", component = { null },
+            headless = HeadlessRunner(FakeTools { _, _ -> error("unused") }, { null }, { null }, tabs = { emptyList() }, activeTabId = { null }, drivable = { true },
+                openTab = { _, _ -> null }, reveal = { }, locks = TabLocks(), runs = RunHistory(), runLog = testRunLog()),
+            runs = RunHistory(), runLog = testRunLog())
+        assertTrue(provider.tools().first { it.name == "browser_use" }.description.contains("keeps its tab in front while it works"))
     }
 
     // ---- popup windows that are not tabs ----

@@ -80,6 +80,7 @@ internal class RecordingTools(
     /** Dialogs RPA Engine answered by itself (`dialog_auto` in a result), as step notes waiting for the next step. */
     private val autoNotes = java.util.concurrent.ConcurrentLinkedQueue<String>()
     fun drainAutoNotes(): List<String> = generateSequence { autoNotes.poll() }.toList()
+    fun addNote(note: String) { autoNotes += note }
 
     /** A popup window (a pseudo tab id `<tab>#popup-<n>`) that opened or closed, as `popups` in a result said. */
     data class PopupEvent(val id: String, val url: String, val title: String, val open: Boolean)
@@ -324,6 +325,8 @@ internal class UseRun(val task: String, val startedAt: Long = System.currentTime
     internal val snapshotted = mutableSetOf<String>()
     /** Page states (address and content hash) whose text was saved while passing. */
     internal val contentSeen = mutableSetOf<String>()
+    /** How often the tab was brought back to the front. */
+    internal var revealed = 0
     internal val advice = mutableListOf<String>()
     internal var tabId: String? = null
     internal var priorMs = 0L
@@ -531,7 +534,19 @@ internal class ComputerUseFlow(
                 if (steps.isNotEmpty()) steps[steps.lastIndex] = steps.last().let { it.copy(popup = listOfNotNull(it.popup, note).joinToString("; ")) }
                 mark = steps.size; publish()
             }
-            val shotReply = tools.invoke(ToolNames.STEP, Cu.step(tab, "screenshot"))
+            // The engine brings a hidden tab to the front and waits before capturing (a hidden tab's paint-only changes never show); popup
+            // windows are not tabs and are left out.
+            suspend fun takeShot() = tools.invoke(ToolNames.STEP, Cu.step(tab, "screenshot", ensureVisible = !isPopupId(tab)))
+            var shotReply = takeShot()
+            var flags = Cu.screenFlags(shotReply.json)
+            if (flags.first == true) { run.revealed++; tools.addNote("brought the tab back to the front") }
+            // Not visible: the image is stale, so Jev is not asked about it. One more try.
+            if (flags.second == false) {
+                shotReply = takeShot()
+                flags = Cu.screenFlags(shotReply.json)
+                if (flags.first == true) { run.revealed++; tools.addNote("brought the tab back to the front") }
+            }
+            val hidden = flags.second == false
             // A call on a popup window that fails means it is gone.
             if (isPopupId(tab) && (shotReply.isError || ((shotReply.json?.get("ok") as? JsonPrimitive)?.booleanOrNull == false && tools.dialogFor(tab) == null))) {
                 val back = popBackFromPopup(run, st, tab)
@@ -542,11 +557,11 @@ internal class ComputerUseFlow(
                 }
             }
             if (shotReply.isError) return Outcome(UseStatus.ERROR, noBrowser(shotReply))
-            val fresh = shotReply.json?.let(Cu::parseShot)
+            val fresh = if (hidden) null else shotReply.json?.let(Cu::parseShot)
             // While a dialog waits, RPA Engine refuses every verb (the screenshot too) and attaches the dialog: the answer comes
             // next, judged on the last screenshot taken.
             val waiting = tools.dialogFor(tab) != null
-            val shot = fresh ?: if (waiting) (st.lastShotObj ?: Shot("", 0, 0, 1120, 780, 1.0)) else
+            val shot = fresh ?: if (waiting || hidden) (st.lastShotObj ?: Shot("", 0, 0, 1120, 780, 1.0)) else
                 return Outcome(UseStatus.ERROR, "The screenshot failed: ${shotReply.json?.get("error")?.let { (it as? JsonPrimitive)?.contentOrNull } ?: "RPA Engine returned no image (does it support the screenshot action?)"}")
             val h: String
             if (fresh != null) {
@@ -562,12 +577,16 @@ internal class ComputerUseFlow(
             val dlg = tools.dialogFor(tab)
             // The screenshot result carries the address and title (observe fails on popup windows): observe only when it does not.
             val (url, title) = when {
-                dlg != null -> run.pageUrl.value.orEmpty() to ""
+                dlg != null || hidden -> run.pageUrl.value.orEmpty() to ""
                 fresh?.url != null -> fresh.url to fresh.title.orEmpty()
                 else -> observe(tools, tab)
             }
             // The dialog drawn on the last screenshot: what Jev and a consulted model get to look at.
-            val shotView = if (dlg != null && shot.path.isNotEmpty()) renderDialogShot(run, shot, dlg) else shot
+            val shotView = when {
+                hidden -> shot.copy(path = "") // a stale image is shown to no one
+                dlg != null && shot.path.isNotEmpty() -> renderDialogShot(run, shot, dlg)
+                else -> shot
+            }
             if (dlg == null) {
                 run.pageUrl.value = url
                 if (run.visited.lastOrNull()?.url != url) run.visited += PageVisit(url, title, steps.size)
@@ -576,7 +595,7 @@ internal class ComputerUseFlow(
 
             // The content changed after an action (a scroll that loaded more, a click that opened a panel): save what is on the page, so the
             // collected text covers everything the run passed, even when Jev never picks COLLECT.
-            if (dlg == null && fresh != null && shot.contentHash != null) {
+            if (dlg == null && !hidden && fresh != null && shot.contentHash != null) {
                 if (steps.isNotEmpty() && prevContent != null && shot.contentHash != prevContent) {
                     val text = runCatching { readPageText(tools, tab) }.getOrNull().orEmpty()
                     // What the last step did to the page, in a line Jev can remember it by.
@@ -588,7 +607,7 @@ internal class ComputerUseFlow(
             }
 
             // Stuck before asking Jev again: the page is where it was.
-            var stuck: String? = if (dlg != null) null else Cu.noProgress(steps.drop(mark), now)
+            var stuck: String? = if (hidden) Cu.HIDDEN_REASON else if (dlg != null) null else Cu.noProgress(steps.drop(mark), now)
             var d: VisionDecision? = null
             var dd: DialogDecision? = null
             var targets: List<Cu.Target> = emptyList()
@@ -1127,7 +1146,7 @@ internal class ComputerUseFlow(
             llmTokens = run.log.llmTokens.takeIf { it > 0 }, jevModel = req.jevModel, llmModel = llm.label,
             confidences = Cu.confidenceStats(steps.filter { it.op != VisionOp.CONSULT }), screenshotPath = st.lastShot, error = o.error,
             tabId = tab, blocker = blocker, collected = run.store.list, pagesVisited = run.visited.toList(), answer = answer, extract = req.extract,
-            runId = run.id, tabs = run.tabsUsed.map { t -> t.copy(title = t.title.ifBlank { st.known[t.tabId].orEmpty() }) },
+            runId = run.id, tabRevealed = run.revealed, tabs = run.tabsUsed.map { t -> t.copy(title = t.title.ifBlank { st.known[t.tabId].orEmpty() }) },
         )
         run.report.value = report
         run.endedAt = clock()
