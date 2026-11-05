@@ -288,6 +288,8 @@ class LlmrpaComponent(
         _showSettings.value = !_showSettings.value
     }
 
+    fun showError(message: String) { _errorMessage.value = message }
+
     fun clearError() {
         _errorMessage.value = null
     }
@@ -535,6 +537,102 @@ class LlmrpaComponent(
         _readiness.value = blocker()
     }
 
+    // ---- Jev tab: computer use ----
+
+    enum class PanelTab { TASK, JEV }
+
+    private val _panelTab = MutableStateFlow(PanelTab.TASK)
+    val panelTab: StateFlow<PanelTab> = _panelTab
+    fun selectPanelTab(t: PanelTab) { _panelTab.value = t }
+
+    private val _useRun = MutableStateFlow<UseRun?>(null)
+    /** The current or most recent Jev request, or null before the first. */
+    internal val useRun: StateFlow<UseRun?> = _useRun
+
+    private val _useInput = MutableStateFlow("")
+    val useInput: StateFlow<String> = _useInput
+    fun updateUseInput(text: String) { _useInput.value = text }
+
+    private val _jevModelId = MutableStateFlow(Cu.VISION_DEFAULT_MODEL)
+    /** The Jev model that reads screenshots; must accept images and boxes. */
+    val jevModelId: StateFlow<String> = _jevModelId
+    fun selectJevModel(id: String) { _jevModelId.value = id }
+
+    private val _plannerModel = MutableStateFlow<ModelOption?>(null)
+    /** The chat model that plans and writes the report; null = the one selected in Settings. */
+    val plannerModel: StateFlow<ModelOption?> = _plannerModel
+    fun selectPlanner(option: ModelOption?) { _plannerModel.value = option }
+
+    private val _pointerLabel = MutableStateFlow("Jev")
+    val pointerLabel: StateFlow<String> = _pointerLabel
+    fun setPointerLabel(label: String) { _pointerLabel.value = label.take(24) }
+
+    private var useJob: Job? = null
+    val isUsing: Boolean get() = useJob?.isActive == true
+
+    /** Jev models the picker offers: from `jev_decide`'s own schema, vision-capable ones first. */
+    fun jevModels(): List<String> {
+        val ids = ModelDirectory.jevModelIds(tools.inputSchema(ToolNames.JEV_DECIDE)).ifEmpty { listOf(Cu.VISION_DEFAULT_MODEL) }
+        return ids.sortedByDescending { Cu.supportsVision(it) }
+    }
+
+    /** What stops a Jev request from starting, or null. */
+    fun useBlocker(): String? = when {
+        !tools.has(ToolNames.OBSERVE) || !tools.has(ToolNames.STEP) -> Blocker.ENGINE.detail
+        !tools.has(ToolNames.JEV_DECIDE) -> Blocker.JEV.detail
+        Cu.visionProblem(_jevModelId.value, tools.inputSchema(ToolNames.JEV_DECIDE)) != null ->
+            Cu.visionProblem(_jevModelId.value, tools.inputSchema(ToolNames.JEV_DECIDE))
+        !aiAvailable() -> "Planning and the report need a chat model. " + Blocker.AI.detail
+        else -> null
+    }
+
+    /** Starts a request in the Jev tab on the target tab (or a new one). Returns why it did not start, or null. */
+    fun startUse(): String? {
+        val task = _useInput.value.trim()
+        if (task.isEmpty()) return "Type what you want done first"
+        if (isUsing) return "A request is already running"
+        useBlocker()?.let { return it }
+        val tab = _selectedTab.value.takeIf { !_newTab.value }
+        if (tab != null && !canDrive(tab.tabId)) return NO_BROWSER_HINT
+        val provider = activeTabsProvider
+        if (tab == null && provider == null) return Blocker.TAB.detail
+        val create: suspend (String, String) -> String? = { url, title ->
+            // On Main: the host adds the tab to its split view state.
+            provider?.let { withContext(Dispatchers.Main) { it.createBrowserTab(url, title) } }
+        }
+        val flow = ComputerUseFlow(
+            tools, aiGateway, LockedTabs(tabLocks, TabLocks.Owner.PANEL, create),
+            openWaitsMs = baseLimits.openWaitsMs, settleMs = baseLimits.navSettleMs, stepSettleMs = baseLimits.stepSettleMs,
+        )
+        val run = UseRun(task)
+        val request = UseRequest(
+            task = task, tabId = tab?.tabId, jevModel = _jevModelId.value, llm = _plannerModel.value,
+            pointerLabel = _pointerLabel.value.ifBlank { "Jev" }, maxSteps = 25, timeoutMs = 10 * 60_000L,
+            confirm = { _, _ -> run.question.value?.answer?.await() ?: true },
+        )
+        _useRun.value = run
+        _errorMessage.value = null
+        useJob = scope.launch {
+            try {
+                withContext(work) { flow.runComputerUse(request, run) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                run.phase.value = UsePhase.FINISHED
+                _errorMessage.value = "The run failed: ${e.message ?: e::class.simpleName}"
+            }
+        }.also { job -> job.invokeOnCompletion { scope.launch { probeDrivable() } } }
+        return null
+    }
+
+    /** Answers the question a Jev request is waiting on. */
+    fun answerUse(go: Boolean) { _useRun.value?.question?.value?.answer?.complete(go) }
+
+    fun stopUse() {
+        answerUse(false)
+        useJob?.cancel()
+    }
+
     // ---- Running ----
 
     private val _maxSteps = MutableStateFlow(RunLimits().maxSteps)
@@ -614,7 +712,7 @@ class LlmrpaComponent(
                     claim = { tabLocks.tryAcquire(it, TabLocks.Owner.PANEL) })
             } ?: return Blocker.TAB.detail
         }
-        val r = TaskRunner(tools, decider, tab?.tabId, instruction, baseLimits.copy(maxSteps = _maxSteps.value), newTab = opener) { asker.ask(it) }
+        val r = TaskRunner(tools, decider, tab?.tabId, instruction, baseLimits.copy(maxSteps = _maxSteps.value), newTab = opener, pointerLabel = _pointerLabel.value.ifBlank { "Jev" }) { asker.ask(it) }
         // After the runner is built, as in HeadlessRunner, so nothing can throw between taking and handing over the lock.
         tab?.let { t -> tabLocks.tryAcquire(t.tabId, TabLocks.Owner.PANEL)?.let { return it } }
         _errorMessage.value = null

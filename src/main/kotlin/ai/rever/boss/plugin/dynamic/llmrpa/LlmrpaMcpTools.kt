@@ -80,6 +80,33 @@ internal class LlmrpaMcpToolProvider(
             },
         ),
         McpToolDefinition(
+            name = BROWSER_USE,
+            description =
+                "Do a task in the user's real, logged-in browser by looking at the page, like a person: a chat model plans the goal and " +
+                    "the page to open, Jev (a vision decision model) then clicks, types and scrolls from screenshots with a visible pointer, " +
+                    "and the result reports what happened and the answer found on the final page. Use it to research or operate a website. " +
+                    "It opens a new tab at the planned page (or url), or acts on tab_id; only tabs in the space on screen can be driven. " +
+                    "It never waits for a person: it proceeds when unsure and returns status blocked when stuck. " +
+                    "Returns JSON {ok, status (done|blocked|error|budget), summary, answer, url, title, page_text, steps, seconds, jev_calls, " +
+                    "llm_calls, tool_calls, cost_usd, confidences, screenshot_path}; ok only means Jev reached its goal, so judge the answer from page_text.",
+            inputSchema = BROWSER_USE_SCHEMA,
+            readOnly = false,
+            handler = McpToolHandler { args ->
+                val a = BrowserUseArgs.parse(args.raw).getOrElse { return@McpToolHandler McpToolResult(it.message ?: "Invalid arguments", isError = true) }
+                val timeoutMs = a.timeoutS * 1000L
+                val result = if (a.mode == "dom") {
+                    headless.browserUseDom(a.task, a.tabId, a.newTab, a.url, a.model, a.maxSteps.coerceAtMost(50), timeoutMs, a.includeText).map { it.toString() }
+                } else {
+                    headless.browserUse(a.task, a.tabId, a.newTab, a.url, a.model, a.plannerModel, a.displayName, a.maxSteps, timeoutMs)
+                        .map { it.toJson(a.includeText).toString() }
+                }
+                result.fold(
+                    onSuccess = { McpToolResult(it) },
+                    onFailure = { McpToolResult(it.message ?: "Could not run the task", isError = true) },
+                )
+            },
+        ),
+        McpToolDefinition(
             name = "llmrpa_status",
             description =
                 "Report the LLM RPA panel's state: the live run (status, steps, summary, model calls per step) and the last drafted plan. " +
@@ -176,6 +203,22 @@ internal class LlmrpaMcpToolProvider(
         McpToolResult("Open the LLM RPA panel first (no active instance).", isError = true)
 
     companion object {
+        internal const val BROWSER_USE = "browser_use"
+
+        internal const val BROWSER_USE_SCHEMA = """{"type":"object","additionalProperties":false,"properties":{""" +
+            """"task":{"type":"string","description":"What to do or find, in plain language, e.g. find the top 10 restaurants in Palo Alto"},""" +
+            """"url":{"type":"string","description":"http(s) address to open in a new tab; replaces the page the planner would choose (the goal is still planned)"},""" +
+            """"tab_id":{"type":"string","description":"Browser tab to act on; defaults to a new tab when url or new_tab is given, else the focused tab"},""" +
+            """"new_tab":{"type":"boolean","default":false,"description":"Open the planned page in a new tab"},""" +
+            """"mode":{"type":"string","enum":["vision","dom"],"default":"vision","description":"vision: Jev works from screenshots; dom: the text-list runner of llmrpa_execute"},""" +
+            """"model":{"type":"string","description":"Jev model; vision needs one that takes images and boxes (default typesafe/jev-1.14). In dom mode, any model id of llmrpa_execute"},""" +
+            """"planner_model":{"type":"string","description":"Chat model id (from Settings → AI Providers) that plans and writes the report; defaults to the selected one"},""" +
+            """"display_name":{"type":"string","default":"Jev","description":"Label on the on-page pointer"},""" +
+            """"max_steps":{"type":"integer","minimum":1,"maximum":60,"default":25},""" +
+            """"timeout_s":{"type":"integer","minimum":10,"maximum":600,"default":180},""" +
+            """"include_text":{"type":"boolean","default":true,"description":"Include the final page's text (up to 20000 characters) as page_text"}""" +
+            """},"required":["task"]}"""
+
         private fun parse(raw: String): JsonObject? = runCatching { Json.parseToJsonElement(raw.ifBlank { "{}" }) as JsonObject }.getOrNull()
 
         private fun includeCalls(root: JsonObject?): Boolean =
@@ -284,6 +327,53 @@ internal class LlmrpaMcpToolProvider(
             val stepless = state.modelCalls.filter { c -> state.steps.none { it.index == c.step } }
             if (stepless.isNotEmpty()) put("other_model_calls", buildJsonArray { stepless.forEach { c -> add(buildJsonObject { put("step", c.step); callSummary(c).forEach { (k, v) -> put(k, v) } }) } })
             if (includeCalls) put("calls", buildJsonArray { state.modelCalls.forEach { add(callDetail(it)) } })
+        }
+    }
+}
+
+/** `browser_use` arguments, validated: an unknown key or a wrong type is refused, ranges are clamped. */
+internal data class BrowserUseArgs(
+    val task: String,
+    val url: String?,
+    val tabId: String?,
+    val newTab: Boolean,
+    val mode: String,
+    val model: String?,
+    val plannerModel: String?,
+    val displayName: String,
+    val maxSteps: Int,
+    val timeoutS: Int,
+    val includeText: Boolean,
+) {
+    companion object {
+        private val KEYS = setOf("task", "url", "tab_id", "new_tab", "mode", "model", "planner_model", "display_name", "max_steps", "timeout_s", "include_text")
+
+        fun parse(raw: String): Result<BrowserUseArgs> = runCatching {
+            val root = Json.parseToJsonElement(raw.ifBlank { "{}" }) as? JsonObject ?: error("Arguments must be a JSON object")
+            val unknown = root.keys - KEYS
+            require(unknown.isEmpty()) { "Unknown argument ${unknown.sorted().joinToString()}. Allowed: ${KEYS.sorted().joinToString()}" }
+            fun str(k: String): String? {
+                val v = root[k] ?: return null
+                val p = v as? JsonPrimitive
+                require(p != null && p.isString) { "'$k' must be a string" }
+                return p.content.takeIf { it.isNotBlank() }
+            }
+            fun bool(k: String, default: Boolean): Boolean {
+                val v = root[k] ?: return default
+                return (v as? JsonPrimitive)?.booleanOrNull ?: error("'$k' must be a boolean")
+            }
+            fun int(k: String, default: Int, min: Int, max: Int): Int {
+                val v = root[k] ?: return default
+                return ((v as? JsonPrimitive)?.intOrNull ?: error("'$k' must be an integer")).coerceIn(min, max)
+            }
+            val mode = str("mode") ?: "vision"
+            require(mode == "vision" || mode == "dom") { "'mode' must be vision or dom" }
+            BrowserUseArgs(
+                task = str("task") ?: error("Missing required argument: task"),
+                url = str("url"), tabId = str("tab_id"), newTab = bool("new_tab", false), mode = mode,
+                model = str("model"), plannerModel = str("planner_model"), displayName = str("display_name") ?: "Jev",
+                maxSteps = int("max_steps", 25, 1, 60), timeoutS = int("timeout_s", 180, 10, 600), includeText = bool("include_text", true),
+            )
         }
     }
 }

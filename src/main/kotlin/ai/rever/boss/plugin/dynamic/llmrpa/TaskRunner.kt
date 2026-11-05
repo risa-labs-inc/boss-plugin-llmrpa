@@ -130,6 +130,8 @@ class TaskRunner(
     private val limits: RunLimits = RunLimits(),
     clock: () -> Long = System::currentTimeMillis,
     private val newTab: NewTab? = null,
+    /** Label of the on-page pointer RPA Engine draws while acting; null draws none. */
+    private val pointerLabel: String? = null,
     private val ask: suspend (PendingQuestion) -> Answer,
 ) {
     init { require(tabId != null || newTab != null) { "A run needs a tab or a way to open one" } }
@@ -499,6 +501,7 @@ class TaskRunner(
             put("tab_id", checkNotNull(tabId) { "No tab to act on" })
             // RPA Engine refuses typing into a sensitive field without this; older engines ignore it.
             if (allowSensitive) put("allow_sensitive", true)
+            pointerLabel?.takeIf { it.isNotBlank() }?.let { l -> putJsonObject("pointer") { put("label", l) } }
             putJsonObject("action") {
                 put("type", action.type)
                 action.selector?.let { s -> putJsonObject("selector") { put("type", s.type); s.value?.let { put("value", it) } } }
