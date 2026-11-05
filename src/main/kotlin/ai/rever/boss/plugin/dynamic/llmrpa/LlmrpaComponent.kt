@@ -625,6 +625,9 @@ class LlmrpaComponent(
         return null
     }
 
+    /** Shows [run] in the Jev tab without starting one; for tests and previews. */
+    internal fun showUse(run: UseRun?) { _useRun.value = run }
+
     /** Answers the question a Jev request is waiting on. */
     fun answerUse(go: Boolean) { _useRun.value?.question?.value?.answer?.complete(go) }
 

@@ -115,15 +115,15 @@ private fun Composer(component: LlmrpaComponent, input: String, active: Boolean,
             input, component::updateUseInput, Modifier.fillMaxWidth(),
             placeholder = "e.g. Find the top 10 restaurants in Palo Alto", label = "Request for Jev", minHeight = 44, readOnly = active,
         )
-        ModelRow(component, enabled = !active)
+        if (!active) ModelRow(component, enabled = true)
         if (blocker != null && input.isNotBlank() && !active) Notice(blocker, Tone.WARNING)
         error?.let { Notice(it, Tone.ERROR, onDismiss = component::clearError) }
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-            if (active) OutlineButton("Stop", component::stopUse, tone = Tone.ERROR)
-            else BossPrimaryButton("Send", onClick = { component.startUse()?.let { component.showError(it) } },
+        if (active) OutlineButton("Stop", component::stopUse, tone = Tone.ERROR)
+        else {
+            BossPrimaryButton("Send", onClick = { component.startUse()?.let { component.showError(it) } },
                 modifier = Modifier.height(34.dp), enabled = input.isNotBlank() && blocker == null, icon = Icons.Outlined.PlayArrow)
             Text("Every step sends a screenshot of the page to OpenRouter (Jev), and the page text to the chat model.",
-                color = RpaTokens.TextMuted, fontSize = 11.sp, modifier = Modifier.weight(1f))
+                color = RpaTokens.TextMuted, fontSize = 11.sp)
         }
     }
 }
@@ -218,7 +218,7 @@ private fun JevRunView(component: LlmrpaComponent, run: UseRun, active: Boolean)
     if (!active) {
         report?.let { ReportCard(it) } ?: Text("Stopped before a report was written.", color = RpaTokens.TextSecondary, fontSize = 12.sp)
     }
-    ActivitySection(activity)
+    ActivitySection(activity, active)
 }
 
 @Composable
@@ -261,7 +261,7 @@ private fun ReportCard(r: UseReport) {
                 Text(a, color = RpaTokens.Text, fontSize = 13.sp)
             }
         }
-        r.error?.takeIf { r.status != UseStatus.DONE }?.let { Text(it, color = RpaTokens.Error, fontSize = 12.sp) }
+        r.error?.takeIf { r.status != UseStatus.DONE }?.let { Text(it, color = if (r.status == UseStatus.ERROR) RpaTokens.Error else RpaTokens.Warning, fontSize = 12.sp) }
         FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Pill("%.1f s".format(r.seconds))
             Pill("${r.steps.size} steps")
@@ -286,8 +286,10 @@ private fun ReportCard(r: UseReport) {
 
 /** Every tool call of the request, newest last, live. */
 @Composable
-private fun ActivitySection(entries: List<ActivityEntry>) {
-    var open by remember { mutableStateOf(true) }
+private fun ActivitySection(entries: List<ActivityEntry>, active: Boolean) {
+    // Open while the request runs; folded once the report is in, where the answer matters more.
+    var open by remember { mutableStateOf(active) }
+    androidx.compose.runtime.LaunchedEffect(active) { if (!active) open = false }
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
         Row(
             Modifier.fillMaxWidth().clickable(role = Role.Button) { open = !open }.pointerHoverIcon(PointerIcon.Hand).padding(vertical = 4.dp),
