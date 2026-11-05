@@ -557,9 +557,11 @@ class AgentLoopTest {
         say("""{"type":"type","element":"m1","text":"hi","submit":true,"irreversible":true}""")
         assertEquals(UseStatus.NEEDS_INPUT, loop(b).run(AgentRequest("x", tabId = "t1")).status)
         assertTrue(b.actions("key").isEmpty() && b.actions("type_text").isEmpty())
-        listOf("Pay", "Pay now", "Pay ₹470", "Submit payment", "Confirm and pay", "Buy now", "Place order", "Place your order").forEach { assertTrue(AgentPrompt.isPayment(it), it) }
+        // The owner's standing rule: every final-commit phrasing asks.
+        listOf("Pay", "Pay now", "Pay ₹470", "Submit payment", "Confirm and pay", "Buy now", "Place order", "Place your order",
+            "Confirm order", "Confirm your order", "Complete order", "Complete purchase", "Submit order", "Make payment", "Make a payment", "Proceed to pay", "Proceed to payment").forEach { assertTrue(AgentPrompt.isPayment(it), it) }
         // The model judges these: a review page often follows.
-        listOf("Checkout", "Check out", "Proceed to checkout", "Add to cart", "View cart", "Payment options", "Next", "Save contact", "Book").forEach { assertFalse(AgentPrompt.isPayment(it), it) }
+        listOf("Checkout", "Check out", "Proceed to checkout", "Add to cart", "View cart", "Payment options", "Next", "Save", "Save contact", "Book", "Book a table", "Order history", "Confirm subscription").forEach { assertFalse(AgentPrompt.isPayment(it), it) }
         assertTrue("\"irreversible\":true" in AgentPrompt.system("Jev"))
     }
 

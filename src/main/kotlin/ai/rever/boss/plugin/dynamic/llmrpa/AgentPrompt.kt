@@ -251,7 +251,7 @@ Rules:
     // ---- the only enforced guardrails ----
 
     /** The wording backstop behind the model's own `irreversible` flag. */
-    private val PAYMENT = Regex("""(?i)\b(pay(\s+now|\s+₹|\s+\$|\s+rs)?|place\s+(your\s+)?order|buy\s+now|confirm\s+and\s+pay|submit\s+payment)\b""")
+    private val PAYMENT = Regex("""(?i)\b(pay(\s+now|\s+₹|\s+\$|\s+rs)?|place\s+(your\s+)?order|buy\s+now|confirm\s+(and\s+pay|(your\s+)?order)|complete\s+(your\s+)?(order|purchase)|submit\s+(payment|(your\s+)?order)|make\s+(a\s+)?payment|proceed\s+to\s+pay(ment)?)\b""")
 
     /** Whether a click on [label] (with [context]) would pay or place an order. */
     fun isPayment(label: String, context: String = ""): Boolean = PAYMENT.containsMatchIn(label) || (label.length <= 3 && PAYMENT.containsMatchIn(context))
